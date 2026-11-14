@@ -32,6 +32,17 @@
 | 会话层 | kagent session + A2A task（现有 TaskStore） | 按需：每个 Assignment 一个 task |
 | 进程层 | substrate actor（DSH BYO / workspace-agent） | 按需：任务落定即挂起候选（0005） |
 
+### 2.1.1 架构不变式：presence/cognition split（渠道分类，G10）
+
+**Source 永远住编排器（presence 层），worker actor 永远可挂起（cognition 层）**——渠道连接绝不下沉进 actor。渠道按消息送达方式分两族：
+
+| 渠道族 | 例子 | 落位 |
+|---|---|---|
+| webhook 族（入站 POST 可驱动一切） | GitHub webhook、飞书事件回调、Teams/Google Chat | Source 收 POST，无需常驻连接 |
+| socket 族（持久连接，挂起即死） | 飞书长连接、Slack Socket Mode、WhatsApp/Signal/Matrix | 编排器内 Source 插件持常驻连接 |
+
+扩展新渠道 = 编排器加一个 Source 插件，**零架构变化**；绝不造第二个 presence 网关，也绝不让 worker 持 socket。（来源：agent-substrate/always-on-agent 的 presence/cognition split 参考实现 + openclaw monolithic 反例；0004 互证表。）
+
 ### 2.2 组件图
 
 ```mermaid
@@ -105,7 +116,7 @@ flowchart TB
 | Assignment（Ticket↔Executor 绑定） | **一个 A2A task**（SendMessage 到 worker agent）；pending→running→ended 跟随 task 生命周期 | Store.assignments.task_id |
 | Subscription（Ticket↔Thread 多对多） | 编排器记录；订阅 Thread 上的消息**免评估**直送 Ticket 作上下文 | Store.subscriptions |
 | Channel（写侧） | Outbox 的 Channel 适配器：GitHub 评论/review 回复、飞书话题回复 | 代码 |
-| Report（progress/waiting/ready/blocked/failed/dropped） | worker agent 的**结构化报告约定**（prompt 约定 + 代码解析；P0 可从 task 终态+文本提取） | Dispatcher/代码 |
+| Report（progress/waiting/ready/blocked/failed/dropped） | worker agent 的**结构化报告约定**（prompt 约定 + 代码解析；P0 可从 task 终态+文本提取）；约定含一条：声明 ready 前无在途后台任务（P0 prompt 约定，G8；P2 信号机制） | Dispatcher/代码 |
 | Attention（等人的问题） | worker 的 input-required → Attention bridge → 飞书卡片/panel | ATT 组件 |
 
 **沿用两条关键谓词**（superagent 验证过的状态一致性规则）：`waitsForPerson`（最近 Assignment blocked/failed 且此后无人发言 → 自动输入挂起）；`followupOwners`（还欠人回复的 Ticket 持有 Thread 上的 follow-up，Engine 只许 stop）。
@@ -200,6 +211,7 @@ sequenceDiagram
 - **Engine 是唯一写者**（superagent 铁律）：全部状态迁移在单事务内完成；外部副作用（发消息、派工）以 **effect** 在事务内入队、提交后由适配器执行——崩溃重启后 Pass 重放未完成 effect，靠 receipt 幂等。
 - **Outbox receipt**：每个外发消息存 receipt（channel, address, 幂等键）；GitHub 评论用确定性 marker、飞书用消息 ID——重复投递可检出。
 - **Trigger 幂等**：`(source, deterministic_id)` 唯一约束；cursor 回拨产生的重叠天然去重。
+- **Assignment deadline（G7）**：派发即记 started_deadline（可配窗口）；Pass 对"已派发但超期仍未进入终态"的 Assignment 转 needs-attention——task 受理与执行之间必须有期限、滞留必须有显式释放者，不自动重放。（教训源自 claude-managed-agents lease 模型：ack 后永不心跳的 item 永不回收。）
 - **TaskStore 对账**：push 是优化不是正确性依赖——Pass 周期把 running Assignment 与 TaskStore 真实终态对账（D2）。
 
 ## 7. 安全与授权
@@ -216,6 +228,7 @@ sequenceDiagram
 | worker task 崩溃于远程工具调用中 | 不确定结局 → Assignment 标 `unresolved`，**不自动重放**；Ticket 进 needs-attention，人决策后续（重试=新 Assignment，但被扣住的调用是否已生效由人核） |
 | orchestrator 崩溃 | Store 事务已提交的状态无损；启动恢复：中断 Assignment 重派（带恢复注记+未读 Inputs）；已发未确认消息靠 receipt 去重 |
 | push 丢失 | Pass 对账兜底（D2）；终态以 TaskStore 为准 |
+| task 受理后不启动（Gateway 投递丢失/actor 供给失败） | Assignment 超 started_deadline 仍非终态 → needs-attention（G7 滞留检测），不自动重放 |
 | Policy 收紧 | 不撤销已授 Mandate、不杀进行中工单；变更记入 Ticket，ended Ticket 恢复前重验（002 语义） |
 | agent 长挂 | worker 侧 substrate 快照/挂起是常态（0005）；编排器只看 task 状态，不管理进程 |
 | 审批丢失（actor 被替换） | 沿用 bridge 显式失败语义（0009 §4：非活任务引用被拒），编排器转 needs-attention |
