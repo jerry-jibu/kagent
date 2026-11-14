@@ -57,7 +57,7 @@ func TestHTTPTransportDispatch(t *testing.T) {
 
 	t.Run("Given a gateway answering ReturnImmediately with a submitted task, when ticket work is dispatched, assert that the task identity comes back and the request registers the push receiver", func(t *testing.T) {
 		rec, tr := newGateway(t, func(w http.ResponseWriter, r *http.Request, params recordedParams) {
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"x","result":{"id":"task-9","contextId":"ctx-9","status":{"state":"TASK_STATE_SUBMITTED"}}}`))
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"x","result":{"task":{"id":"task-9","contextId":"ctx-9","status":{"state":"TASK_STATE_SUBMITTED"}}}}`))
 		})
 
 		result, err := tr.Dispatch(ctx, a2a.DispatchRequest{
@@ -95,7 +95,7 @@ func TestHTTPTransportDispatch(t *testing.T) {
 
 	t.Run("Given a continuation dispatch carrying the ticket session's contextId, when it is sent, assert that the contextId travels on the message", func(t *testing.T) {
 		rec, tr := newGateway(t, func(w http.ResponseWriter, r *http.Request, params recordedParams) {
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"x","result":{"id":"task-10","contextId":"ctx-9","status":{"state":"TASK_STATE_SUBMITTED"}}}`))
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"x","result":{"task":{"id":"task-10","contextId":"ctx-9","status":{"state":"TASK_STATE_SUBMITTED"}}}}`))
 		})
 
 		result, err := tr.Dispatch(ctx, a2a.DispatchRequest{Agent: "kagent/worker", Message: "continue", ContextID: "ctx-9"})
@@ -147,7 +147,7 @@ func TestHTTPTransportTaskState(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			raw, _ := json.Marshal(body.Params)
 			_ = json.Unmarshal(raw, &gotParams)
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"x","result":{"id":"task-9","contextId":"ctx-9","status":{"state":"TASK_STATE_COMPLETED","message":{"role":"ROLE_AGENT","parts":[{"text":"{\"kind\":\"report\",\"state\":\"ready\"}"}],"messageId":"m9"}}}}`))
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"x","result":{"task":{"id":"task-9","contextId":"ctx-9","status":{"state":"TASK_STATE_COMPLETED","message":{"role":"ROLE_AGENT","parts":[{"text":"{\"kind\":\"report\",\"state\":\"ready\"}"}],"messageId":"m9"}}}}}`))
 		}))
 		defer srv.Close()
 		tr := a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: srv.URL})

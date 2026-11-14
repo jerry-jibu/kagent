@@ -122,8 +122,8 @@ func (t *HTTPTransport) Dispatch(ctx context.Context, req DispatchRequest) (Disp
 		return DispatchResult{}, err
 	}
 
-	var task wireTask
-	if err := json.Unmarshal(result, &task); err != nil || task.ID == "" {
+	task, err := taskFromResult(result)
+	if err != nil {
 		return DispatchResult{}, fmt.Errorf("agent %s dispatch returned no task identity: %w", req.Agent, err)
 	}
 	return DispatchResult{
@@ -148,8 +148,8 @@ func (t *HTTPTransport) TaskState(ctx context.Context, agent, taskID string) (Ta
 		return Task{}, err
 	}
 
-	var task wireTask
-	if err := json.Unmarshal(result, &task); err != nil {
+	task, err := taskFromResult(result)
+	if err != nil {
 		return Task{}, fmt.Errorf("task %s snapshot is not an A2A Task: %w", taskID, err)
 	}
 	return Task{
@@ -220,6 +220,24 @@ func pushConfigFor(req DispatchRequest, route string) *pushConfig {
 		ID:     req.PushID,
 		Tenant: route,
 	}
+}
+
+// taskFromResult unwraps the gateway's result envelope: a Task-carrying
+// result nests the task under "task" ({"task": {...}}, the a2a-go
+// SendMessageResponse/GetTaskResponse shape) — the flat task was an imagined
+// shape the real gateway never sends.
+func taskFromResult(result json.RawMessage) (wireTask, error) {
+	var wrapper struct {
+		Task *wireTask `json:"task,omitempty"`
+	}
+	var task wireTask
+	if err := json.Unmarshal(result, &wrapper); err != nil {
+		return task, fmt.Errorf("result is not an A2A Task envelope: %w", err)
+	}
+	if wrapper.Task == nil || wrapper.Task.ID == "" {
+		return task, fmt.Errorf("result carries no task")
+	}
+	return *wrapper.Task, nil
 }
 
 // extractResponseText pulls the final answer text out of a SendMessage
