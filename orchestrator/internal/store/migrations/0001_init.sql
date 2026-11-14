@@ -62,7 +62,8 @@ CREATE TABLE outbox (
 );
 
 CREATE TABLE policy (
-    version    TEXT        PRIMARY KEY, -- SHA256 hash of the canonical policy content
+    id         BIGSERIAL   PRIMARY KEY, -- insertion order for "latest" queries
+    version    TEXT        NOT NULL UNIQUE, -- SHA256 hash of the canonical policy content
     content    JSONB       NOT NULL,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

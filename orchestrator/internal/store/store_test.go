@@ -138,3 +138,70 @@ func TestTryAcquireInstanceLock(t *testing.T) {
 		}
 	})
 }
+
+func TestRecordPolicyVersion(t *testing.T) {
+	t.Run("Given a policy version hash, when recorded twice, assert that the policy table holds a single row for that version", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate failed: %v", err)
+		}
+
+		hash := store.ContentHash([]byte("policy-content"))
+		if err := s.RecordPolicyVersion(ctx, hash, []byte(`{"repositories":[]}`)); err != nil {
+			t.Fatalf("first record failed: %v", err)
+		}
+		if err := s.RecordPolicyVersion(ctx, hash, []byte(`{"repositories":[]}`)); err != nil {
+			t.Fatalf("second record failed: %v", err)
+		}
+
+		latest, err := s.LatestPolicyVersion(ctx)
+		if err != nil {
+			t.Fatalf("latest policy version failed: %v", err)
+		}
+		if latest.Version != hash {
+			t.Fatalf("want version %s, got %s", hash, latest.Version)
+		}
+		if latest.AppliedAt.IsZero() {
+			t.Fatal("applied timestamp must be set")
+		}
+	})
+
+	t.Run("Given two distinct policy versions, when both are recorded, assert that latest returns the newer hash", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate failed: %v", err)
+		}
+
+		old := store.ContentHash([]byte("policy-v1"))
+		new := store.ContentHash([]byte("policy-v2"))
+		if err := s.RecordPolicyVersion(ctx, old, []byte(`{}`)); err != nil {
+			t.Fatalf("record old failed: %v", err)
+		}
+		if err := s.RecordPolicyVersion(ctx, new, []byte(`{}`)); err != nil {
+			t.Fatalf("record new failed: %v", err)
+		}
+
+		latest, err := s.LatestPolicyVersion(ctx)
+		if err != nil {
+			t.Fatalf("latest policy version failed: %v", err)
+		}
+		if latest.Version != new {
+			t.Fatalf("want latest version %s, got %s", new, latest.Version)
+		}
+	})
+
+	t.Run("Given no policy recorded yet, when latest is queried, assert that it reports not-found instead of an error", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate failed: %v", err)
+		}
+
+		_, err := s.LatestPolicyVersion(ctx)
+		if !errors.Is(err, store.ErrPolicyNotFound) {
+			t.Fatalf("want ErrPolicyNotFound, got: %v", err)
+		}
+	})
+}

@@ -17,6 +17,7 @@ import (
 	"io/fs"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,6 +29,17 @@ var migrationsFS embed.FS
 // ErrInstanceLocked is returned when another orchestrator instance already
 // holds the instance lock (docs/designs/0001 §9: P0 is single-replica).
 var ErrInstanceLocked = errors.New("instance lock held by another orchestrator")
+
+// ErrPolicyNotFound is returned by LatestPolicyVersion when no policy
+// version has been recorded yet.
+var ErrPolicyNotFound = errors.New("no policy version recorded")
+
+// PolicySnapshot is the latest recorded policy version.
+type PolicySnapshot struct {
+	Version   string
+	Content   []byte
+	AppliedAt time.Time
+}
 
 // Config configures a Store connection.
 type Config struct {
@@ -248,6 +260,39 @@ func (s *Store) TryAcquireInstanceLock(ctx context.Context) error {
 	}
 	s.lockConn = conn
 	return nil
+}
+
+// RecordPolicyVersion persists a policy version hash (idempotent on the
+// version). Every later Gate decision and Mandate references this hash
+// (docs/designs/0001 §5: 策略分发).
+func (s *Store) RecordPolicyVersion(ctx context.Context, version string, content []byte) error {
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO policy (version, content)
+		VALUES ($1, $2)
+		ON CONFLICT (version) DO NOTHING`,
+		version, content); err != nil {
+		return fmt.Errorf("failed to record policy version %s: %w", version, err)
+	}
+	return nil
+}
+
+// LatestPolicyVersion returns the most recently recorded policy version.
+// "Most recent" is decided by insertion order, not wall-clock timestamps,
+// because two versions can be applied within the same microsecond.
+func (s *Store) LatestPolicyVersion(ctx context.Context) (PolicySnapshot, error) {
+	var snap PolicySnapshot
+	err := s.pool.QueryRow(ctx, `
+		SELECT version, content, applied_at
+		FROM policy
+		ORDER BY id DESC
+		LIMIT 1`).Scan(&snap.Version, &snap.Content, &snap.AppliedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PolicySnapshot{}, ErrPolicyNotFound
+	}
+	if err != nil {
+		return PolicySnapshot{}, fmt.Errorf("failed to read latest policy version: %w", err)
+	}
+	return snap, nil
 }
 
 // lockKey derives the advisory-lock key from the schema name, so isolated
