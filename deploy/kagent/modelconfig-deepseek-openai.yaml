@@ -1,0 +1,17 @@
+# ModelConfig: DeepSeek via OpenAI 兼容网关（worker 专用配对，0002 A1 注记）
+# DSH BYO 桥的 config guard 要求 OpenAI-compatible ModelConfig（内部 bridge/config
+# Parse 只接受 model.openai）；evaluator 走 Anthropic 变体（modelconfig-deepseek.yaml）。
+# 同一把 DeepSeek API key 同时服务两种协议（DeepSeek 官方双协议）——复用 Secret
+# kagent-deepseek 的 ANTHROPIC_API_KEY 字段值（键名只是字段名，值即 DeepSeek key）。
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata:
+  name: deepseek-openai
+  namespace: kagent
+spec:
+  provider: OpenAI
+  model: deepseek-chat
+  apiKeySecret: kagent-deepseek
+  apiKeySecretKey: ANTHROPIC_API_KEY
+  openAI:
+    baseUrl: https://api.deepseek.com/v1

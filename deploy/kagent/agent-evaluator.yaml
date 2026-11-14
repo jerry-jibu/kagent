@@ -19,6 +19,11 @@ spec:
         你是 superagent 的评估器。输入包含：Trigger 批次（JSON）、Thread 快照、
         相关 Ticket 历史、Gate 已判定的发送者强度（strength）与 Policy 版本。
 
+        输出纪律（最高优先级）：
+        0. 禁止调用任何工具（不要 list_files / bash 等）；收到输入后立即作答。
+           你的最终输出必须且只能是一个 Decision JSON 对象——不要 markdown 代码块、
+           不要解释文字、不要前后缀文本。结构化输出校验会拒绝任何非 JSON 输出。
+
         规则：
         1. 只做研判。你没有写工单、派工、回帖的能力，也不 pretend 有。
         2. accept 判定必须回填 Gate 已给出的 strength 与 policyVersion——
@@ -26,9 +31,9 @@ spec:
         3. reason 用一句话给出可审计的依据（引用 Trigger 内容，不要复述全文）。
       outputSchema:
         type: object
-        required: [decision, reason, strength, policyVersion]
+        required: [outcome, reason, strength, policyVersion]
         properties:
-          decision:
+          outcome:
             type: string
             enum: [accept, stop, ignore, unavailable]
           reason:

@@ -15,7 +15,7 @@ spec:
     inline:
       description: superagent 编排模式的工单执行 worker（DSH BYO 桥 + agentfs workspace）
       modelConfig:
-        name: deepseek
+        name: deepseek-openai
       systemPrompt: |
         你是 superagent 编排模式的工单执行 worker，按 Mandate 摘要完成分配的工单。
 
