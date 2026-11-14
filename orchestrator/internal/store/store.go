@@ -141,6 +141,12 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if schema == "" {
 		schema = "orchestrator"
 	}
+	// PostgreSQL identifiers truncate at 63 bytes, but search_path elements
+	// longer than that silently fail to resolve ("no schema has been
+	// selected to create in"). Refuse such names instead of mis-resolving.
+	if len(schema) > 63 {
+		return nil, fmt.Errorf("schema name %q is %d bytes; PostgreSQL resolves at most 63", schema, len(schema))
+	}
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
