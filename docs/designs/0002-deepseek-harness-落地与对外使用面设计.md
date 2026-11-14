@@ -32,6 +32,41 @@
 *   **1006 红线**：学习系列编号（substrate 凭证注入篇）——bridge 沙箱内零外部凭证。
 *   **superagent**：工单驱动的主动式编排 agent 模式（监听外部事件→评估→派工→回话，0001 从 dsh-superagent-prototype 提炼）。
 
+### 组件来源与视角（谁是谁）
+
+一句话：**orchestrator 是我们全新开发的 Go 服务——不是 kagent 的组件，也不是 superagent 的代码移植；superagent 在本架构中是"规格书"，kagent 是"执行引擎"，orchestrator 是把规格翻译到引擎上的新代码。**
+
+| 来源 | 角色 | 本文对应 |
+|---|---|---|
+| superagent（dsh-superagent-prototype，TS 原型） | **规格书**：领域模型/谓词/铁律已被原型验证；零代码复用 | §1 语义、0001 §3 映射 |
+| 本设计 → 新 Go 代码 | **编排层**：Sources/Gate/Engine/Dispatcher/Outbox/Attention bridge，独立 Deployment + 自有 PG schema | 0001 全文 |
+| kagent v1.0.1（现成，零改动） | **执行引擎**：A2A/会话/HITL/substrate actor/agentfs/egress | 本文全部 file:line 锚点 |
+| byo-ext PR #2（pr-2 分支） | worker 运行时镜像源 | A4 |
+
+以 superagent 视角看一个 issue 的生命周期（每个环节标注归宿）：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub（外部世界）
+    participant ORC as orchestrator〔我们开发〕<br/>superagent 的 Sources/Gate/Engine/Dispatcher/Outbox
+    participant EV as evaluator Agent〔kagent 现成跑〕
+    participant GW as Gateway/TaskStore〔kagent 现成〕
+    participant WK as worker actor〔kagent 拉起〕<br/>DSH BYO = bridge + DSH 进程
+
+    GH-->>ORC: ① issue @agent（Sources 轮询 60s/cursor 回拨去重）
+    ORC->>ORC: ② Intake 去重 → Gate（名单+admission，纯代码）
+    ORC->>EV: ③ Assessment：A2A invoke（superagent 的 Eval，执行外包）
+    EV-->>ORC: Decision: accept（strength/policyVersion 须与 Gate 一致）
+    ORC->>ORC: ④ Engine 建 Ticket+Mandate（唯一写者，单事务）
+    ORC->>GW: ⑤ Dispatcher: SendMessage + PushConfig（Assignment ≡ 一个 A2A task）
+    GW->>WK: actor 拉起 DSH（superagent 的 Worker Session 被 actor 整体替代，零开发）
+    WK->>WK: agentfs workspace 干活、本地 commit、出 patch（不持 git 推送凭证）
+    WK-->>GW: Report（六态）或 input-required
+    GW--)ORC: ⑥ push 终态 POST（Pass 2s 对账兜底）
+    ORC->>GH: ⑦ Outbox：push 代码 + 建 PR + 回评论（GitHub 写凭证只在编排器）
+```
+
 ## The Problem
 
 两个缺口：
@@ -242,6 +277,31 @@ sequenceDiagram
 *   **Pros**: 模型表单一等公民；discovery 可特化。
 *   **Cons**: API 类型 + telemetry 映射 + UI 表单三处波及；Anthropic-baseUrl 已工作（`docs/env.md:61-62`）。
 *   **Reason for Rejection**: Rejected by author——无功能增益的 API 面扩大。
+
+### Alternative E: Go wrapper 包裹 superagent 原型本体（跑 TS 引擎 + Go 适配 kagent）
+
+*   **Pros**: 语义零漂移（引擎即 superagent 本人）；原型演进自动跟进。
+*   **Cons**: wrapper 不薄——superagent 的执行边界（本地 DSH inbox、单机守护治理 pid/lock/日志滚动）与 kagent runtime（actor 沙箱/HITL/agentfs/egress）在同一个边界上整体互斥，适配 executor/attention/channel 三个边界 = 两边都写全量代码，且一半写在原型级 TS 里；Node 运行时进编排器部署、双状态源、单机进程治理假设与 k8s Deployment 冲突；代码级兼容是幻觉（原型 churn 的是代码，稳定的是规格）。
+*   **Reason for Rejection**: Rejected by author——superagent 的稳定产出是其领域规格（docs 001/002/003/007），不是代码；规格级兼容可测可得，代码级兼容不可得也无必要。替代：下方兼容策略。
+
+--------------------------------------------------------------------------------
+
+## 与 superagent 的兼容策略（钉规格，不包代码）
+
+兼容分层与手段：
+
+| 兼容层 | 保 | 手段 |
+|---|---|---|
+| 语义/行为（Trigger 确定性、cursor -5s、admission strength、waitsForPerson/followupOwners、Engine 唯一写者、Outbox receipt） | ✅ | 规格钉版 + 符合性测试：每条不变量落成 Go 测试（given-when-assert-that），测试名即规格条款 |
+| 外部表面（GitHub 评论 marker、飞书消息语义、deterministic trigger ID 方案） | ✅ | 沿用原型约定——同一 Thread 历史可被任一实现消费 |
+| 代码/内部状态（TS 实现、Store schema、DSH inbox 进程接口） | ❌ | 正是被 kagent 替代的机制，刻意不保 |
+
+机制落点：
+
+1. **规格钉版**：语义锚定 superagent docs 001/002/003/007 当前版本；上游演进 = 显式 spec review 并更新本节，不静默漂移。
+2. **符合性测试**：上述不变量在 orchestrator 单测中逐条对应（进 P0 验证计划）。
+3. **外部 marker 对齐**：trigger ID 方案与评论 marker 沿用原型格式（P0 Source 实现时核对原型常量）。
+4. **差分测试（P2 可选）**：同脚本触发场景喂原型与 Go 实现，diff Ticket 状态机——原型具备无头 harness 时才做。
 
 --------------------------------------------------------------------------------
 
