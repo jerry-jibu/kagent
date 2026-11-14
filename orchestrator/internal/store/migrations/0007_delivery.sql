@@ -14,10 +14,17 @@
 --                            浅克隆基线 = issue 指向分支 HEAD), recorded by the
 --                            materializer; the deliverer re-clones this exact
 --                            commit so the diff never includes upstream drift.
+-- tickets.base_skipped    the paths the materializer could NOT transport into
+--                            the workspace (binary, oversized, symlink — the
+--                            agentfs bridge carries text only). The deliverer
+--                            excludes them from the deletion set: their
+--                            absence from the workspace means "never
+--                            materialized", not "worker deleted".
 
 ALTER TABLE tickets ADD COLUMN delivery_state TEXT NOT NULL DEFAULT ''
     CHECK (delivery_state IN ('', 'pending', 'delivered', 'failed'));
 ALTER TABLE tickets ADD COLUMN base_branch TEXT NOT NULL DEFAULT '';
 ALTER TABLE tickets ADD COLUMN base_commit TEXT NOT NULL DEFAULT '';
+ALTER TABLE tickets ADD COLUMN base_skipped JSONB NOT NULL DEFAULT '[]';
 
 CREATE INDEX tickets_delivery_idx ON tickets (delivery_state) WHERE delivery_state = 'pending';

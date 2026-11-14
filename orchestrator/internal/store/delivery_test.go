@@ -50,7 +50,7 @@ func TestDeliveryState(t *testing.T) {
 		s, ticketID, a := deliveryFixture(t)
 		ctx := context.Background()
 
-		if err := s.RecordTicketBaseline(ctx, ticketID, "main", "0123456789abcdef0123456789abcdef01234567"); err != nil {
+		if err := s.RecordTicketBaseline(ctx, ticketID, "main", "0123456789abcdef0123456789abcdef01234567", []string{"assets/logo.png", "LINK.md"}); err != nil {
 			t.Fatalf("RecordTicketBaseline failed: %v", err)
 		}
 
@@ -296,7 +296,7 @@ func TestDeliveryState(t *testing.T) {
 		}
 
 		// First ticket: ready then delivered.
-		if err := s.RecordTicketBaseline(ctx, ticketID, "main", "0123456789abcdef0123456789abcdef01234567"); err != nil {
+		if err := s.RecordTicketBaseline(ctx, ticketID, "main", "0123456789abcdef0123456789abcdef01234567", []string{"assets/logo.png", "LINK.md"}); err != nil {
 			t.Fatalf("RecordTicketBaseline failed: %v", err)
 		}
 		if _, err := s.ApplyAssignmentTerminal(ctx, readyPlan(a, ticketID)); err != nil {

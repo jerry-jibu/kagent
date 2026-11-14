@@ -19,11 +19,15 @@ const (
 // DeliveryCandidate is one ticket whose result is owed a PR and a result
 // comment: the delivery scan's work item. BaseBranch/BaseCommit are the
 // materialization baseline (0003 路线 A) — the deliverer re-clones this exact
-// commit so the workspace diff never includes upstream drift.
+// commit so the workspace diff never includes upstream drift. BaseSkipped
+// lists the paths materialization could not transport (binary, oversized,
+// symlink): they are excluded from the deletion set, since their absence from
+// the workspace means "never materialized", not "worker deleted".
 type DeliveryCandidate struct {
-	Ticket     Ticket
-	BaseBranch string
-	BaseCommit string
+	Ticket      Ticket
+	BaseBranch  string
+	BaseCommit  string
+	BaseSkipped []string
 }
 
 // PendingDeliveries returns the tickets with a pending result, creation order
@@ -33,7 +37,7 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, thread_source, thread_key, mandate, status, session_id,
 		       trigger_source, trigger_deterministic_id, created_at,
-		       base_branch, base_commit
+		       base_branch, base_commit, base_skipped
 		FROM tickets
 		WHERE delivery_state = $1
 		ORDER BY created_at, id`, DeliveryPending)
@@ -46,11 +50,11 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 	for rows.Next() {
 		var c DeliveryCandidate
 		var tk Ticket
-		var mandate []byte
+		var mandate, skipped []byte
 		var sessionID *string
 		if err := rows.Scan(&tk.ID, &tk.ThreadSource, &tk.ThreadKey, &mandate, &tk.Status, &sessionID,
 			&tk.TriggerSource, &tk.TriggerDeterministicID, &tk.CreatedAt,
-			&c.BaseBranch, &c.BaseCommit); err != nil {
+			&c.BaseBranch, &c.BaseCommit, &skipped); err != nil {
 			return nil, fmt.Errorf("failed to scan delivery candidate: %w", err)
 		}
 		if sessionID != nil {
@@ -59,6 +63,9 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 		if err := json.Unmarshal(mandate, &tk.Mandate); err != nil {
 			return nil, fmt.Errorf("ticket %s carries a mandate that does not decode: %w", tk.ID, err)
 		}
+		if err := json.Unmarshal(skipped, &c.BaseSkipped); err != nil {
+			return nil, fmt.Errorf("ticket %s carries a skipped list that does not decode: %w", tk.ID, err)
+		}
 		c.Ticket = tk
 		out = append(out, c)
 	}
@@ -66,15 +73,24 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 }
 
 // RecordTicketBaseline persists the materialization baseline of a ticket's
-// workspace (branch + the exact cloned HEAD). The materializer calls it right
-// after a successful materialization: without a baseline the workspace is
-// undeliverable, so a lost write here fails the materialization like any
-// other failure (the caller joins it with the ticket-failure transition).
-func (s *Store) RecordTicketBaseline(ctx context.Context, ticketID, branch, commit string) error {
+// workspace: the branch, the exact cloned HEAD, and the paths materialization
+// could not transport (the deletion set of the delivery diff excludes them).
+// The materializer calls it right after a successful materialization; without
+// a baseline the workspace is undeliverable, so a lost write here fails the
+// materialization like any other failure (the caller joins it with the
+// ticket-failure transition).
+func (s *Store) RecordTicketBaseline(ctx context.Context, ticketID, branch, commit string, skipped []string) error {
+	if skipped == nil {
+		skipped = []string{}
+	}
+	skippedJSON, err := json.Marshal(skipped)
+	if err != nil {
+		return fmt.Errorf("failed to encode the skipped list of ticket %s: %w", ticketID, err)
+	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE tickets
-		SET base_branch = $2, base_commit = $3, updated_at = now()
-		WHERE id = $1`, ticketID, branch, commit)
+		SET base_branch = $2, base_commit = $3, base_skipped = $4::jsonb, updated_at = now()
+		WHERE id = $1`, ticketID, branch, commit, skippedJSON)
 	if err != nil {
 		return fmt.Errorf("failed to record the baseline of ticket %s: %w", ticketID, err)
 	}

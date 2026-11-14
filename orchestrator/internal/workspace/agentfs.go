@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -104,7 +105,11 @@ func (b *AgentfsBackend) WriteFile(ctx context.Context, ws, path string, content
 	return nil
 }
 
-// ReadFile reads one file back by path.
+// ReadFile reads one file back by path. A path absent from the workspace
+// surfaces as ErrFileNotFound: the bridge reports missing files through its
+// isError channel ("file not found: <path>"), which is matched here — string
+// matching on the bridge's error text, hardened when the agentfs theme gives
+// the bridge typed errors.
 func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte, error) {
 	if err := validateWorkspacePath(path); err != nil {
 		return nil, err
@@ -118,9 +123,44 @@ func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte,
 		"path":      path,
 	})
 	if err != nil {
+		if isAgentfsFileNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", ErrFileNotFound, path)
+		}
 		return nil, fmt.Errorf("failed to read %s: %w", path, err)
 	}
 	return []byte(text), nil
+}
+
+// ListFiles lists the workspace-relative paths under prefix via the bridge's
+// agenticfs_list_files tool (newline-joined). The bridge reports an empty
+// listing as the literal "(empty)", which maps back to an empty slice. A
+// prefix filters by lexical prefix; "" lists the whole workspace.
+func (b *AgentfsBackend) ListFiles(ctx context.Context, ws, prefix string) ([]string, error) {
+	client, err := b.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	text, err := client.CallTool(ctx, "agenticfs_list_files", map[string]any{
+		"workspace": ws,
+		"path":      prefix,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workspace %s: %w", ws, err)
+	}
+	if text == "" || text == "(empty)" {
+		return nil, nil
+	}
+	paths := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // isAgentfsAlreadyExists recognizes the agentfs duplicate-workspace
@@ -132,4 +172,16 @@ func isAgentfsAlreadyExists(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "already exists") ||
 		strings.Contains(msg, "already in use")
+}
+
+// isAgentfsFileNotFound recognizes the bridge's missing-file refusal so
+// read-backs can distinguish absence from outage.
+func isAgentfsFileNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "file not found") ||
+		strings.Contains(msg, "no such file") ||
+		strings.Contains(msg, "does not exist")
 }
