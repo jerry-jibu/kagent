@@ -306,15 +306,33 @@ type wireMessage struct {
 func (m wireMessage) text() string {
 	var sb strings.Builder
 	for _, p := range m.Parts {
-		sb.WriteString(p.Text)
+		sb.WriteString(p.text())
 	}
 	return sb.String()
 }
 
 // wirePart mirrors a2a-go's flattened Part wire shape: a text part serializes
-// as {"text": "..."}.
+// as {"text": "..."}; a structured-output part (kagent harness outputSchema)
+// serializes as {"data": {...}, "mediaType": "application/json"}.
 type wirePart struct {
-	Text string `json:"text,omitempty"`
+	Text      string         `json:"text,omitempty"`
+	Data      map[string]any `json:"data,omitempty"`
+	MediaType string         `json:"mediaType,omitempty"`
+}
+
+// text is the part's text content. A structured part's text is its JSON
+// encoding: the evaluator's Decision travels as data, and the parse contract
+// expects a JSON object.
+func (p wirePart) text() string {
+	if p.Text != "" {
+		return p.Text
+	}
+	if len(p.Data) > 0 {
+		if raw, err := json.Marshal(p.Data); err == nil {
+			return string(raw)
+		}
+	}
+	return ""
 }
 
 // wireTask mirrors the Task fields the response extraction needs.
@@ -352,7 +370,7 @@ func (t wireTask) text() string {
 	for _, a := range t.Artifacts {
 		var sb strings.Builder
 		for _, p := range a.Parts {
-			sb.WriteString(p.Text)
+			sb.WriteString(p.text())
 		}
 		if sb.Len() > 0 {
 			return sb.String()
