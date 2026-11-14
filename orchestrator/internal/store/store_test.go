@@ -2,9 +2,11 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -41,6 +43,202 @@ func openTestStore(t *testing.T) *store.Store {
 	return s
 }
 
+func mustMigrate(t *testing.T, s *store.Store) {
+	t.Helper()
+	if err := s.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate failed: %v", err)
+	}
+}
+
+func TestIngestEvents(t *testing.T) {
+	// A scripted issue-comment sequence: two comments on one issue and one
+	// on another, in ascending occurrence order.
+	sequence := []store.Event{
+		{
+			ThreadKey:       "issue:42",
+			DeterministicID: "issue-comment:1001",
+			Payload:         []byte(`{"kind":"issue-comment","comment_id":1001}`),
+			OccurredAt:      time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			ThreadKey:       "issue:42",
+			DeterministicID: "issue-comment:1002",
+			Payload:         []byte(`{"kind":"issue-comment","comment_id":1002}`),
+			OccurredAt:      time.Date(2026, 11, 14, 10, 0, 5, 0, time.UTC),
+		},
+		{
+			ThreadKey:       "issue:7",
+			DeterministicID: "issue-comment:1003",
+			Payload:         []byte(`{"kind":"issue-comment","comment_id":1003}`),
+			OccurredAt:      time.Date(2026, 11, 14, 10, 0, 9, 0, time.UTC),
+		},
+	}
+	const source = "github:acme/api"
+
+	t.Run("Given a scripted issue-comment sequence, when ingested into a fresh store, assert that every event lands as exactly one trigger on its thread with the persisted payload", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		mustMigrate(t, s)
+
+		stats, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, sequence, 14*24*time.Hour)
+		if err != nil {
+			t.Fatalf("ingest failed: %v", err)
+		}
+		if stats.Ingested != 3 || stats.Duplicates != 0 || stats.Dropped != 0 {
+			t.Fatalf("want {3 0 0}, got %+v", stats)
+		}
+
+		triggers, err := s.Triggers(ctx, source)
+		if err != nil {
+			t.Fatalf("read triggers failed: %v", err)
+		}
+		if len(triggers) != 3 {
+			t.Fatalf("want 3 trigger rows, got %d: %+v", len(triggers), triggers)
+		}
+		wantThreads := map[string]string{
+			"issue-comment:1001": "issue:42",
+			"issue-comment:1002": "issue:42",
+			"issue-comment:1003": "issue:7",
+		}
+		for _, tr := range triggers {
+			if tr.Source != source {
+				t.Errorf("trigger %s: want source %s, got %s", tr.DeterministicID, source, tr.Source)
+			}
+			if wantThreads[tr.DeterministicID] != tr.ThreadKey {
+				t.Errorf("trigger %s: want thread %s, got %s", tr.DeterministicID, wantThreads[tr.DeterministicID], tr.ThreadKey)
+			}
+		}
+		byID := map[string]store.Trigger{}
+		for _, tr := range triggers {
+			byID[tr.DeterministicID] = tr
+		}
+		// Payload is stored as JSONB, which normalizes whitespace and key
+		// order: equality is semantic, not byte-for-byte.
+		var gotPayload, wantPayload map[string]any
+		if err := json.Unmarshal(byID["issue-comment:1001"].Payload, &gotPayload); err != nil {
+			t.Fatalf("stored payload is not JSON: %v", err)
+		}
+		if err := json.Unmarshal(sequence[0].Payload, &wantPayload); err != nil {
+			t.Fatalf("scripted payload is not JSON: %v", err)
+		}
+		if !reflect.DeepEqual(gotPayload, wantPayload) {
+			t.Errorf("trigger payload not persisted: got %s, want %s", byID["issue-comment:1001"].Payload, sequence[0].Payload)
+		}
+	})
+
+	t.Run("Given an already-ingested sequence, when the exact same sequence is replayed, assert that no new trigger rows appear and every event reports as duplicate", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		mustMigrate(t, s)
+
+		if _, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, sequence, 14*24*time.Hour); err != nil {
+			t.Fatalf("first ingest failed: %v", err)
+		}
+
+		stats, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, sequence, 14*24*time.Hour)
+		if err != nil {
+			t.Fatalf("replay ingest failed: %v", err)
+		}
+		if stats.Ingested != 0 || stats.Duplicates != 3 || stats.Dropped != 0 {
+			t.Fatalf("want {0 3 0}, got %+v", stats)
+		}
+
+		triggers, err := s.Triggers(ctx, source)
+		if err != nil {
+			t.Fatalf("read triggers failed: %v", err)
+		}
+		if len(triggers) != 3 {
+			t.Fatalf("replay must not add rows: want 3 trigger rows, got %d", len(triggers))
+		}
+	})
+
+	t.Run("Given a batch with an event missing its deterministic identity, when ingested, assert that the whole batch is rejected and nothing persists", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		mustMigrate(t, s)
+
+		bad := []store.Event{{
+			ThreadKey:       "issue:42",
+			DeterministicID: "",
+			Payload:         []byte(`{}`),
+			OccurredAt:      time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC),
+		}}
+		if _, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, bad, 14*24*time.Hour); err == nil {
+			t.Fatal("ingest must reject an event without a deterministic id")
+		}
+
+		triggers, err := s.Triggers(ctx, source)
+		if err != nil {
+			t.Fatalf("read triggers failed: %v", err)
+		}
+		if len(triggers) != 0 {
+			t.Fatalf("nothing may persist from a rejected batch, got %d rows", len(triggers))
+		}
+	})
+
+	t.Run("Given an ingested batch, when the persisted cursor is read back, assert that it equals the newest occurrence in the batch", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		mustMigrate(t, s)
+
+		if _, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, sequence, 14*24*time.Hour); err != nil {
+			t.Fatalf("ingest failed: %v", err)
+		}
+
+		cursor, ok, err := s.SourceCursor(ctx, source)
+		if err != nil {
+			t.Fatalf("read cursor failed: %v", err)
+		}
+		if !ok {
+			t.Fatal("cursor must be persisted after ingesting a batch")
+		}
+		want := sequence[2].OccurredAt
+		if !cursor.Equal(want) {
+			t.Fatalf("want cursor %s, got %s", want, cursor)
+		}
+	})
+
+	t.Run("Given an older batch followed by a newer one, when both are ingested, assert that the cursor only moves forward", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		mustMigrate(t, s)
+
+		if _, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, sequence, 14*24*time.Hour); err != nil {
+			t.Fatalf("first ingest failed: %v", err)
+		}
+		overlap := []store.Event{{
+			ThreadKey:       "issue:42",
+			DeterministicID: "issue-comment:1002", // duplicate inside the rewind window
+			Payload:         sequence[1].Payload,
+			OccurredAt:      sequence[1].OccurredAt,
+		}}
+		if _, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, overlap, 14*24*time.Hour); err != nil {
+			t.Fatalf("overlap ingest failed: %v", err)
+		}
+
+		cursor, _, err := s.SourceCursor(ctx, source)
+		if err != nil {
+			t.Fatalf("read cursor failed: %v", err)
+		}
+		if !cursor.Equal(sequence[2].OccurredAt) {
+			t.Fatalf("cursor must not regress: want %s, got %s", sequence[2].OccurredAt, cursor)
+		}
+	})
+
+	t.Run("Given a source never ingested, when its cursor is read, assert that it reports absent", func(t *testing.T) {
+		s := openTestStore(t)
+		mustMigrate(t, s)
+
+		_, ok, err := s.SourceCursor(context.Background(), source)
+		if err != nil {
+			t.Fatalf("read cursor failed: %v", err)
+		}
+		if ok {
+			t.Fatal("cursor must be absent before the first ingest")
+		}
+	})
+}
+
 func TestMigrate(t *testing.T) {
 	t.Run("Given a fresh empty schema, when migrations are applied, assert that all orchestrator tables exist and the migration is recorded", func(t *testing.T) {
 		s := openTestStore(t)
@@ -58,6 +256,7 @@ func TestMigrate(t *testing.T) {
 			"outbox",
 			"policy",
 			"schema_migrations",
+			"sources",
 			"threads",
 			"tickets",
 			"timers",
@@ -76,8 +275,9 @@ func TestMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("applied migrations failed: %v", err)
 		}
-		if len(versions) != 1 || versions[0] != "0001_init" {
-			t.Fatalf("expected [0001_init] recorded, got %v", versions)
+		wantVersions := []string{"0001_init", "0002_intake"}
+		if !reflect.DeepEqual(versions, wantVersions) {
+			t.Fatalf("expected %v recorded, got %v", wantVersions, versions)
 		}
 	})
 
@@ -96,8 +296,9 @@ func TestMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("applied migrations failed: %v", err)
 		}
-		if len(versions) != 1 {
-			t.Fatalf("expected migration recorded exactly once, got %v", versions)
+		wantVersions := []string{"0001_init", "0002_intake"}
+		if !reflect.DeepEqual(versions, wantVersions) {
+			t.Fatalf("re-run must not duplicate migrations: expected %v, got %v", wantVersions, versions)
 		}
 	})
 }
