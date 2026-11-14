@@ -26,17 +26,32 @@ type Materializer struct {
 	backend Backend
 	store   *store.Store
 	opts    MaterializeOptions
+	gitBase string
+	branch  string
+	token   string
 	log     *slog.Logger
 }
 
 // MaterializerOptions wires the materializer. Cloner, Backend and Store are
-// required; Log falls back to slog.Default().
+// required; Log falls back to slog.Default(). GitBaseURL/BaseBranch/Token
+// drive the MaterializePending scan's clone requests (the mandate scope repo
+// composes with the git base; the token stays in the orchestrator per the
+// credential-monotonicity red line).
 type MaterializerOptions struct {
 	Cloner  *Cloner
 	Backend Backend
 	Store   *store.Store
 	// Options tune the tree walk (e.g. IncludeGitDir).
 	Options MaterializeOptions
+	// GitBaseURL is the git remote base ("https://github.com") the mandate
+	// scope repo composes with for the scan's shallow clones.
+	GitBaseURL string
+	// BaseBranch is the branch the scan clones per ticket (P0: one
+	// deployment-level base branch; 0003: 浅克隆基线 = issue 指向分支 HEAD).
+	BaseBranch string
+	// Token is the orchestrator-held git credential; optional for local and
+	// public repos.
+	Token string
 	// Log receives run summaries and persistence failures.
 	Log *slog.Logger
 }
@@ -56,6 +71,9 @@ func NewMaterializer(o MaterializerOptions) *Materializer {
 		backend: o.Backend,
 		store:   o.Store,
 		opts:    o.Options,
+		gitBase: o.GitBaseURL,
+		branch:  o.BaseBranch,
+		token:   o.Token,
 		log:     log,
 	}
 }
@@ -131,4 +149,47 @@ func (m *Materializer) failTicket(ctx context.Context, ticketID, reason string) 
 	m.log.Warn("ticket failed during workspace materialization",
 		"ticket", ticketID, "reason", reason)
 	return nil
+}
+
+// MaterializeStats reports one MaterializePending scan.
+type MaterializeStats struct {
+	// Materialized counts tickets whose workspace landed this scan.
+	Materialized int
+	// Failed counts tickets the scan transitioned to failed (clone or
+	// materialization failure — the failure transition is the per-ticket
+	// semantics of MaterializeTicketWorkspace).
+	Failed int
+}
+
+// MaterializePending materializes the workspace of every live ticket that
+// still lacks its baseline (docs/designs 0003 路线 A: Engine accept 后、派工
+// 前物化). It is the service-side loop the orchestrator beats right after the
+// eval cycle commits accepts, and its rescan after a restart recovers a
+// crash between the accept commit and the materialization. One ticket's
+// failure transitions only its own row (MaterializeTicketWorkspace
+// semantics) and never blocks the others; the error return is reserved for a
+// broken scan (the store itself unreachable).
+func (m *Materializer) MaterializePending(ctx context.Context) (MaterializeStats, error) {
+	tickets, err := m.store.TicketsAwaitingMaterialization(ctx)
+	if err != nil {
+		return MaterializeStats{}, fmt.Errorf("failed to read tickets awaiting materialization: %w", err)
+	}
+
+	var stats MaterializeStats
+	for _, tk := range tickets {
+		req := CloneRequest{
+			RepoURL: ComposeRepoURL(m.gitBase, tk.Mandate.Scope.Repo),
+			Branch:  m.branch,
+			Token:   m.token,
+		}
+		if _, err := m.MaterializeTicketWorkspace(ctx, tk.ID, req); err != nil {
+			// The ticket is already failed with its audit row; keep the
+			// scan moving so one broken clone never starves the others.
+			stats.Failed++
+			m.log.Error("ticket materialization failed", "ticket", tk.ID, "error", err)
+			continue
+		}
+		stats.Materialized++
+	}
+	return stats, nil
 }

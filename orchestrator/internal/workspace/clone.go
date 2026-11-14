@@ -226,6 +226,13 @@ func isCommitSHA(s string) bool {
 	return true
 }
 
+// ComposeRepoURL joins a git remote base and a mandate-scope repo name into
+// the clone/push URL: base "https://github.com" and repo "o/r" become
+// "https://github.com/o/r.git".
+func ComposeRepoURL(base, repo string) string {
+	return strings.TrimSuffix(base, "/") + "/" + repo + ".git"
+}
+
 // ValidateRepoURL refuses clone URLs that embed credentials: a token inside
 // a URL would be persisted into the cloned repository's .git/config by git,
 // violating the worker-has-no-credentials contract (0002 A5).

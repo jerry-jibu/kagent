@@ -14,7 +14,11 @@
 // From T7 the delivery loop ships ready results as ticket branches, PRs and
 // result comments when --workspace-mcp-endpoint is set (Alternative E: the
 // patch is computed orchestrator-side from the workspace read-back — the
-// worker never touches git or github.com). From T8 the startup runs the
+// worker never touches git or github.com). From T9 the same endpoint starts
+// the materialize loop: after the eval cycle commits accepts, the
+// mandate-scope repo is shallow-cloned and materialized into the ticket
+// workspace BEFORE the Pass can dispatch it (the dispatch scan is gated on
+// the recorded baseline; docs/designs/0003 路线 A). From T8 the startup runs the
 // recovery manifest (装载未终结 Assignment; interrupted re-dispatch carries
 // the recovery annotation, committed effects replay under receipt dedup),
 // the Pass enforces waitsForPerson holds, the eval chain respects
@@ -81,6 +85,7 @@ type Config struct {
 	DispatchDeadline time.Duration
 
 	WorkspaceMCPEndpoint string
+	WorkspaceBaseBranch  string
 	GitHubGitBaseURL     string
 }
 
@@ -104,6 +109,7 @@ func parseConfig() Config {
 	flag.DurationVar(&cfg.PassInterval, "pass-interval", dispatch.DefaultPassInterval, "Pass beat interval (dispatch/reconcile/follow-up/outbox)")
 	flag.DurationVar(&cfg.DispatchDeadline, "dispatch-start-deadline", dispatch.DefaultStartDeadline, "how long a dispatched task may run without an outcome before the Pass marks it stuck (0 disables, negative disables)")
 	flag.StringVar(&cfg.WorkspaceMCPEndpoint, "workspace-mcp-endpoint", "", "agentfs MCP bridge endpoint materializing ticket workspaces; required for the delivery loop (empty disables delivery)")
+	flag.StringVar(&cfg.WorkspaceBaseBranch, "workspace-base-branch", "main", "branch the workspace materializer clones per ticket (P0: one deployment-level base branch)")
 	flag.StringVar(&cfg.GitHubGitBaseURL, "github-git-url", delivery.DefaultGitBaseURL, "git remote base the mandate-scope repo composes with for clone/push and PRs")
 	flag.Parse()
 	return cfg
@@ -197,6 +203,11 @@ func main() {
 	pollerCtx, cancelPoller := context.WithCancel(ctx)
 	var poller *source.Poller
 	var pushReceiver http.Handler
+	// materializeNotify fires after an eval cycle that accepted tickets:
+	// the materialize loop scans immediately instead of waiting one tick
+	// (docs/designs/0003 路线 A: Engine accept 后、派工前物化). Coalesced:
+	// one buffered slot, a scan already covers every awaiting ticket.
+	materializeNotify := make(chan struct{}, 1)
 	if cfg.GitHubSource != "" {
 		var startCursor time.Time
 		if cfg.GitHubStartCursor != "" {
@@ -241,7 +252,7 @@ func main() {
 			engine := eval.NewEngine(st, eval.NewEvaluator(
 				a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: cfg.A2AGatewayURL}),
 				cfg.EvaluatorAgent))
-			go runEvalLoop(pollerCtx, cfg.GitHubSource, engine, watcher, cfg.EvalInterval, log)
+			go runEvalLoop(pollerCtx, cfg.GitHubSource, engine, watcher, cfg.EvalInterval, materializeNotify, log)
 			log.Info("eval loop started",
 				"agent", cfg.EvaluatorAgent,
 				"gateway", cfg.A2AGatewayURL,
@@ -275,10 +286,14 @@ func main() {
 			}
 			workerTransport := a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: cfg.A2AGatewayURL})
 			dispatcher := dispatch.New(st, workerTransport, dispatch.Options{
-				WorkerAgent:    cfg.WorkerAgent,
-				PushBaseURL:    pushBase,
-				StartDeadline:  cfg.DispatchDeadline,
-				RecoveryCutoff: dbNow,
+				WorkerAgent:   cfg.WorkerAgent,
+				PushBaseURL:   pushBase,
+				StartDeadline: cfg.DispatchDeadline,
+				// With the workspace pipeline configured, a pending
+				// assignment waits for its ticket's materialization
+				// baseline (docs/designs/0003 路线 A: 派工前物化).
+				RequireWorkspace: cfg.WorkspaceMCPEndpoint != "",
+				RecoveryCutoff:   dbNow,
 			})
 			pushReceiver = dispatch.NewReceiver(dispatcher)
 			pass := dispatch.NewPass(st, dispatcher, outbox.New(st, ghTransport), dispatch.PassOptions{})
@@ -321,7 +336,10 @@ func main() {
 		} else if cfg.GitHubToken == "" {
 			log.Info("delivery loop disabled: --github-token is required for git push and PR creation")
 		} else {
-			deliverer := delivery.New(st, workspace.NewAgentfsBackend(cfg.WorkspaceMCPEndpoint), ghTransport, delivery.Options{
+			// One agentfs backend shared by the materialize and delivery
+			// loops: one MCP session to the bridge for the whole process.
+			backend := workspace.NewAgentfsBackend(cfg.WorkspaceMCPEndpoint)
+			deliverer := delivery.New(st, backend, ghTransport, delivery.Options{
 				GitBaseURL: cfg.GitHubGitBaseURL,
 				Token:      cfg.GitHubToken,
 				Log:        log,
@@ -330,6 +348,30 @@ func main() {
 			log.Info("delivery loop started",
 				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
 				"git_base_url", cfg.GitHubGitBaseURL,
+				"interval", cfg.PassInterval.String())
+
+			// Materialize loop (T9 wiring of the T5 library): after the
+			// eval cycle commits accepts, shallow-clone the mandate-scope
+			// repo and materialize the ticket workspace BEFORE the Pass can
+			// dispatch it (the dispatch scan is gated on the recorded
+			// baseline when the workspace pipeline is configured). The
+			// rescan also recovers a crash between the accept commit and
+			// the materialization — a restart re-materializes every live
+			// ticket still without a baseline.
+			materializer := workspace.NewMaterializer(workspace.MaterializerOptions{
+				Cloner:     workspace.NewCloner(workspace.ClonerOptions{}),
+				Backend:    backend,
+				Store:      st,
+				GitBaseURL: cfg.GitHubGitBaseURL,
+				BaseBranch: cfg.WorkspaceBaseBranch,
+				Token:      cfg.GitHubToken,
+				Log:        log,
+			})
+			go runMaterializeLoop(pollerCtx, materializer, cfg.PassInterval, materializeNotify, log)
+			log.Info("materialize loop started",
+				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
+				"git_base_url", cfg.GitHubGitBaseURL,
+				"base_branch", cfg.WorkspaceBaseBranch,
 				"interval", cfg.PassInterval.String())
 		}
 	} else {
@@ -371,9 +413,12 @@ func main() {
 // runEvalLoop judges pending triggers on the eval cadence. Errors are
 // logged per cycle and never stop the loop: a failing evaluator is retried
 // on the next tick, and the store's transactional guarantees keep every
-// retry safe (triggers are judged once).
+// retry safe (triggers are judged once). After a cycle that accepted
+// tickets it nudges materializeNotify so the freshly committed tickets are
+// materialized at once (docs/designs/0003 路线 A: accept 后、派工前物化).
 func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
-	watcher *policy.Watcher, interval time.Duration, log *slog.Logger) {
+	watcher *policy.Watcher, interval time.Duration, materializeNotify chan<- struct{},
+	log *slog.Logger) {
 
 	source := github.SourceName(repo)
 	ticker := time.NewTicker(interval)
@@ -387,6 +432,12 @@ func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
 		if stats.Evaluated > 0 {
 			log.Info("eval cycle judged", "source", source,
 				"evaluated", stats.Evaluated, "tickets", stats.Tickets, "outcomes", stats.Outcomes)
+		}
+		if stats.Tickets > 0 {
+			select {
+			case materializeNotify <- struct{}{}:
+			default:
+			}
 		}
 	}
 
@@ -480,6 +531,42 @@ func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interva
 			return
 		case <-ticker.C:
 			beat()
+		}
+	}
+}
+
+// runMaterializeLoop materializes the workspaces of freshly accepted tickets
+// (nudged through materializeNotify right after the eval cycle commits the
+// accepts) and rescans on the Pass cadence so a crash between the accept
+// commit and the materialization recovers on the next scan. A long clone
+// runs here — never inside the Pass tick — so the 2s reconciliation beat
+// stays responsive while workspaces are being prepared.
+func runMaterializeLoop(ctx context.Context, materializer *workspace.Materializer,
+	interval time.Duration, materializeNotify <-chan struct{}, log *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	scan := func() {
+		stats, err := materializer.MaterializePending(ctx)
+		if err != nil {
+			log.Error("materialize scan failed", "error", err)
+		}
+		if stats.Materialized+stats.Failed > 0 {
+			log.Info("materialize scan",
+				"materialized", stats.Materialized,
+				"failed", stats.Failed)
+		}
+	}
+
+	scan()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			scan()
+		case <-materializeNotify:
+			scan()
 		}
 	}
 }

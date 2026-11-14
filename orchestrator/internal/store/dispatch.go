@@ -75,16 +75,29 @@ type FollowupCandidate struct {
 // legitimate path back to a pending assignment is the admin retry, which
 // flips the ticket to running atomically with the mint (T8 issue #9: 自动
 // 挂起输入 absorbs automation).
-func (s *Store) PendingDispatches(ctx context.Context) ([]DispatchCandidate, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT `+assignmentJoinColumns+`,
+//
+// requireWorkspace gates the scan on the materialization baseline
+// (docs/designs 0003 路线 A: accept 后、派工前物化): a worker dispatched to a
+// workspace that has not been materialized would find it empty, so when the
+// orchestrator runs the workspace pipeline only tickets whose baseline has
+// landed are dispatchable. Callers that run no workspace pipeline pass
+// false and keep the ungated scan.
+func (s *Store) PendingDispatches(ctx context.Context, requireWorkspace bool) ([]DispatchCandidate, error) {
+	query := `
+		SELECT ` + assignmentJoinColumns + `,
 		       tk.id, tk.thread_source, tk.thread_key, tk.mandate, tk.status, tk.session_id,
 		       tk.trigger_source, tk.trigger_deterministic_id, tk.created_at
 		FROM assignments a
 		JOIN tickets tk ON tk.id = a.ticket_id
-		WHERE a.status = $1 AND tk.status NOT IN ($2, $3, $4)
-		ORDER BY a.created_at, a.id`,
-		AssignmentStatusPending, TicketStatusFailed, TicketStatusEnded, TicketStatusNeedsAttention)
+		WHERE a.status = $1 AND tk.status NOT IN ($2, $3, $4)`
+	args := []any{AssignmentStatusPending, TicketStatusFailed, TicketStatusEnded, TicketStatusNeedsAttention}
+	if requireWorkspace {
+		query += ` AND tk.base_commit <> ''`
+	}
+	query += `
+		ORDER BY a.created_at, a.id`
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pending dispatches: %w", err)
 	}

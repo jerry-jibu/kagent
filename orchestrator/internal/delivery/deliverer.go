@@ -259,7 +259,7 @@ func (d *Deliverer) retryTransient(ctx context.Context, ticketID string, cause e
 
 // repoURL composes the git remote of a mandate-scope repo.
 func (d *Deliverer) repoURL(repo string) string {
-	return strings.TrimSuffix(d.gitBase(), "/") + "/" + repo + ".git"
+	return workspace.ComposeRepoURL(d.gitBase(), repo)
 }
 
 func (d *Deliverer) gitBase() string {

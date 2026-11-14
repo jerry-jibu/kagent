@@ -72,6 +72,35 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 	return out, rows.Err()
 }
 
+// TicketsAwaitingMaterialization returns the live tickets whose workspace has
+// no materialization baseline yet, oldest first — the materialize scan's work
+// items (docs/designs 0003 路线 A: accept 后、派工前物化; the scan also
+// recovers a crash between the accept commit and the materialization).
+// Failed and ended tickets are terminal: their workspaces are never
+// materialized.
+func (s *Store) TicketsAwaitingMaterialization(ctx context.Context) ([]Ticket, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, thread_source, thread_key, mandate, status, session_id,
+		       trigger_source, trigger_deterministic_id, created_at
+		FROM tickets
+		WHERE base_commit = '' AND status NOT IN ($1, $2)
+		ORDER BY created_at, id`, TicketStatusFailed, TicketStatusEnded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tickets awaiting materialization: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Ticket
+	for rows.Next() {
+		tk, err := scanTicket(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tk)
+	}
+	return out, rows.Err()
+}
+
 // RecordTicketBaseline persists the materialization baseline of a ticket's
 // workspace: the branch, the exact cloned HEAD, and the paths materialization
 // could not transport (the deletion set of the delivery diff excludes them).

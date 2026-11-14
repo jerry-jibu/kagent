@@ -97,7 +97,7 @@ func TestRecordDispatchFailure(t *testing.T) {
 			t.Fatalf("RecordDispatchFailure failed: %v", err)
 		}
 
-		pending, err := s.PendingDispatches(ctx)
+		pending, err := s.PendingDispatches(ctx, false)
 		if err != nil {
 			t.Fatalf("PendingDispatches failed: %v", err)
 		}
@@ -409,6 +409,62 @@ func TestTriggerColumns(t *testing.T) {
 		}
 		if tk.TriggerSource != "github:acme/api" || tk.TriggerDeterministicID != "issue-comment:7003" {
 			t.Fatalf("trigger identity = %s/%s, want the creating trigger", tk.TriggerSource, tk.TriggerDeterministicID)
+		}
+	})
+}
+
+func TestPendingDispatchesWorkspaceGate(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Given an accepted ticket whose workspace has no materialization baseline, when the dispatch scan requires a workspace, assert that the pending assignment is withheld until the baseline lands", func(t *testing.T) {
+		s, ticketID := dispatchFixture(t)
+
+		gated, err := s.PendingDispatches(ctx, true)
+		if err != nil {
+			t.Fatalf("PendingDispatches(true) failed: %v", err)
+		}
+		if len(gated) != 0 {
+			t.Fatalf("gated scan returned %+v, want nothing before materialization", gated)
+		}
+
+		// The same state stays visible to the ungated scan: the gate is the
+		// caller's pipeline decision, not a hidden store policy.
+		ungated, err := s.PendingDispatches(ctx, false)
+		if err != nil {
+			t.Fatalf("PendingDispatches(false) failed: %v", err)
+		}
+		if len(ungated) != 1 || ungated[0].Ticket.ID != ticketID {
+			t.Fatalf("ungated scan = %+v, want the pending assignment", ungated)
+		}
+	})
+
+	t.Run("Given a ticket whose materialization baseline was recorded, when the dispatch scan requires a workspace, assert that the pending assignment is dispatchable", func(t *testing.T) {
+		s, ticketID := dispatchFixture(t)
+		if err := s.RecordTicketBaseline(ctx, ticketID, "main", "0123456789abcdef0123456789abcdef01234567", nil); err != nil {
+			t.Fatalf("RecordTicketBaseline failed: %v", err)
+		}
+
+		gated, err := s.PendingDispatches(ctx, true)
+		if err != nil {
+			t.Fatalf("PendingDispatches(true) failed: %v", err)
+		}
+		if len(gated) != 1 || gated[0].Ticket.ID != ticketID {
+			t.Fatalf("gated scan = %+v, want the pending assignment after materialization", gated)
+		}
+	})
+
+	t.Run("Given a failed ticket without a baseline, when the dispatch scan requires a workspace, assert that the dead ticket never becomes dispatchable", func(t *testing.T) {
+		s, ticketID := dispatchFixture(t)
+		if err := s.FailTicket(ctx, ticketID, "materialization failed"); err != nil {
+			t.Fatalf("FailTicket failed: %v", err)
+		}
+
+		gated, err := s.PendingDispatches(ctx, true)
+		if err != nil {
+			t.Fatalf("PendingDispatches(true) failed: %v", err)
+		}
+		if len(gated) != 0 {
+			t.Fatalf("gated scan = %+v, want nothing for a failed ticket", gated)
 		}
 	})
 }

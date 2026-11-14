@@ -51,6 +51,11 @@ type Options struct {
 	// carries the restart recovery annotation. Zero disables the restart
 	// arm — dispatch-failure retries keep annotating via the ledger.
 	RecoveryCutoff time.Time
+	// RequireWorkspace gates the dispatch scan on the materialization
+	// baseline (docs/designs 0003 路线 A: accept 后、派工前物化): set it when
+	// the orchestrator runs the workspace pipeline so a pending assignment
+	// waits until its ticket's workspace has been materialized.
+	RequireWorkspace bool
 }
 
 func (o Options) maxFollowups() int {
@@ -105,7 +110,7 @@ type DispatchStats struct {
 // recovery annotation — a dispatch that never landed a task is safe to
 // replay, unlike a task with an uncertain outcome (docs/designs/0001 §8).
 func (d *Dispatcher) DispatchPending(ctx context.Context) (DispatchStats, error) {
-	candidates, err := d.store.PendingDispatches(ctx)
+	candidates, err := d.store.PendingDispatches(ctx, d.opts.RequireWorkspace)
 	if err != nil {
 		return DispatchStats{}, fmt.Errorf("failed to read pending dispatches: %w", err)
 	}
