@@ -1,7 +1,8 @@
 // Command orchestrator is the superagent-on-kagent P0 control plane service
 // skeleton (T1): it connects to PostgreSQL, applies schema migrations, takes
 // the single-instance lock, hot-reloads gating policy from a ConfigMap
-// mount, and serves healthz/admin endpoints.
+// mount, and serves healthz/admin endpoints. From T2 it also runs the
+// GitHub source poller (trigger ingestion chain) when --github-source is set.
 //
 // Startup failure semantics (T1 AC): an unreachable database, a held
 // instance lock, failed migrations, or a broken initial policy all refuse
@@ -20,8 +21,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jerry-jibu/kagent/orchestrator/internal/github"
+	"github.com/jerry-jibu/kagent/orchestrator/internal/intake"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/policy"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/server"
+	"github.com/jerry-jibu/kagent/orchestrator/internal/source"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/store"
 )
 
@@ -32,6 +36,12 @@ type Config struct {
 	PolicyDir          string
 	ListenAddr         string
 	PolicyPollInterval time.Duration
+
+	GitHubSource       string
+	GitHubToken        string
+	GitHubAPIURL       string
+	GitHubPollInterval time.Duration
+	GitHubStartCursor  string
 }
 
 func parseConfig() Config {
@@ -41,6 +51,11 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.PolicyDir, "policy-dir", "/etc/orchestrator/policy", "directory mounted from the policy ConfigMap")
 	flag.StringVar(&cfg.ListenAddr, "listen-addr", ":8080", "healthz/admin HTTP listen address")
 	flag.DurationVar(&cfg.PolicyPollInterval, "policy-poll-interval", 5*time.Second, "policy reload poll interval")
+	flag.StringVar(&cfg.GitHubSource, "github-source", "", "GitHub repository (owner/name) to poll for issue comments; empty disables the GitHub source")
+	flag.StringVar(&cfg.GitHubToken, "github-token", "", "GitHub bearer token (mounted from a Secret)")
+	flag.StringVar(&cfg.GitHubAPIURL, "github-api-url", "https://api.github.com", "GitHub REST API base URL")
+	flag.DurationVar(&cfg.GitHubPollInterval, "github-poll-interval", source.DefaultPollInterval, "GitHub source poll interval")
+	flag.StringVar(&cfg.GitHubStartCursor, "github-start-cursor", "", "RFC3339 position a fresh GitHub source starts reading from (default: the repository origin)")
 	flag.Parse()
 	return cfg
 }
@@ -126,6 +141,47 @@ func main() {
 	state.policyLoaded = true
 	log.Info("policy version recorded", "version", current.Version, "dir", cfg.PolicyDir)
 
+	// GitHub source (T2): one repository inbox per process, poll cadence
+	// with a 5s cursor rewind; ingestion is atomic in the store.
+	pollerCtx, cancelPoller := context.WithCancel(ctx)
+	var poller *source.Poller
+	if cfg.GitHubSource != "" {
+		var startCursor time.Time
+		if cfg.GitHubStartCursor != "" {
+			startCursor, err = time.Parse(time.RFC3339, cfg.GitHubStartCursor)
+			if err != nil {
+				log.Error("--github-start-cursor must be RFC3339", "error", err)
+				cancelPoller()
+				watcher.Stop()
+				st.Close()
+				os.Exit(1)
+			}
+		}
+		transport := github.NewTransport(github.TransportConfig{
+			BaseURL: cfg.GitHubAPIURL,
+			Token:   cfg.GitHubToken,
+		})
+		poller, err = source.New(transport, intake.New(st), source.Source{
+			Repo:         cfg.GitHubSource,
+			PollInterval: cfg.GitHubPollInterval,
+			StartCursor:  startCursor,
+		})
+		if err != nil {
+			log.Error("failed to configure GitHub source; refusing to start", "error", err)
+			cancelPoller()
+			watcher.Stop()
+			st.Close()
+			os.Exit(1)
+		}
+		go poller.Run(pollerCtx, log)
+		log.Info("github source started",
+			"repo", cfg.GitHubSource,
+			"poll_interval", cfg.GitHubPollInterval.String(),
+			"start_cursor", cfg.GitHubStartCursor)
+	} else {
+		log.Info("github source disabled (--github-source not set)")
+	}
+
 	handler := server.NewHandler(state.ready, func() (string, time.Time, bool) {
 		return watcher.Current().Version, watcher.LoadedAt(), true
 	})
@@ -153,6 +209,7 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	cancelPoller()
 	watcher.Stop()
 	st.Close()
 }

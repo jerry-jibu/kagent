@@ -57,6 +57,13 @@ spec:
             - /etc/orchestrator/policy
             - --listen-addr
             - :8080
+            # T2 摄入链：轮询该仓库的 issue 评论（删去这两行 = 关闭 Source）
+            - --github-source
+            - example/repo
+            - --github-poll-interval
+            - 60s
+            - --github-token
+            - $(GITHUB_TOKEN)
           ports:
             - name: http
               containerPort: 8080
@@ -66,6 +73,13 @@ spec:
                 secretKeyRef:
                   name: superagent-orchestrator-db
                   key: url
+            # GitHub token 只存在于编排器（0001 §7 凭证隔离）；无 token 也可匿名轮询公开仓库
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-github
+                  key: token
+                  optional: true
           readinessProbe:
             httpGet:
               path: /healthz
