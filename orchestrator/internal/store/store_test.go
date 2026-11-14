@@ -299,6 +299,7 @@ func TestMigrate(t *testing.T) {
 		want := []string{
 			"assignments",
 			"audit",
+			"decisions",
 			"outbox",
 			"policy",
 			"schema_migrations",
@@ -321,7 +322,7 @@ func TestMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("applied migrations failed: %v", err)
 		}
-		wantVersions := []string{"0001_init", "0002_audit", "0002_intake"}
+		wantVersions := []string{"0001_init", "0002_audit", "0002_intake", "0003_decisions"}
 		if !reflect.DeepEqual(versions, wantVersions) {
 			t.Fatalf("expected %v recorded, got %v", wantVersions, versions)
 		}
@@ -342,7 +343,7 @@ func TestMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("applied migrations failed: %v", err)
 		}
-		wantVersions := []string{"0001_init", "0002_audit", "0002_intake"}
+		wantVersions := []string{"0001_init", "0002_audit", "0002_intake", "0003_decisions"}
 		if !reflect.DeepEqual(versions, wantVersions) {
 			t.Fatalf("re-run must not duplicate migrations: expected %v, got %v", wantVersions, versions)
 		}

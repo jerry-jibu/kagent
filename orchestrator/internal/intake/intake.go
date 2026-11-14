@@ -34,6 +34,27 @@ type CommentPayload struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// DecodeCommentPayload decodes a stored trigger payload into the intake
+// contract. Evaluation stages (Gate, evaluator) decode trigger payloads
+// through this function: trigger rows are immutable audit data, so a
+// payload that no longer decodes into the contract is malformed durable
+// data and is rejected — never silently decoded into a zero value.
+func DecodeCommentPayload(payload []byte) (CommentPayload, error) {
+	var pl CommentPayload
+	if err := json.Unmarshal(payload, &pl); err != nil {
+		return CommentPayload{}, fmt.Errorf("payload is not a CommentPayload: %w", err)
+	}
+	switch {
+	case pl.Kind == "":
+		return CommentPayload{}, fmt.Errorf("payload kind is empty: not an intake payload")
+	case pl.Repo == "":
+		return CommentPayload{}, fmt.Errorf("payload repo is empty: not a CommentPayload")
+	case pl.Author == "":
+		return CommentPayload{}, fmt.Errorf("payload author is empty: not a CommentPayload")
+	}
+	return pl, nil
+}
+
 // Intake ingests transport events into the store.
 type Intake struct {
 	store     *store.Store
