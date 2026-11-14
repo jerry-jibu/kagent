@@ -31,6 +31,7 @@ type Fake struct {
 	lastAuth string
 	failCode int
 	failBody string
+	requests int
 }
 
 // NewFake starts a Fake GitHub server.
@@ -85,10 +86,26 @@ func (f *Fake) FailWith(status int, body string) {
 	f.failBody = body
 }
 
+// SetOK clears a failure previously configured with FailWith.
+func (f *Fake) SetOK() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failCode = 0
+	f.failBody = ""
+}
+
+// RequestCount returns the number of requests the fake has served.
+func (f *Fake) RequestCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests
+}
+
 func (f *Fake) handleListIssueComments(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	auth := r.Header.Get("Authorization")
 	f.lastAuth = auth
+	f.requests++
 	failCode, failBody := f.failCode, f.failBody
 	comments := append([]IssueComment(nil), f.comments...)
 	f.mu.Unlock()

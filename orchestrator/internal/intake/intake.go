@@ -83,3 +83,10 @@ func (i *Intake) IngestIssueComments(ctx context.Context, repo string, comments 
 	}
 	return stats, nil
 }
+
+// SourceCursor returns the persisted read position of a source. The poller
+// reads it once per cycle so a restart resumes from the store's checkpoint
+// instead of re-reading from the beginning.
+func (i *Intake) SourceCursor(ctx context.Context, repo string) (time.Time, bool, error) {
+	return i.store.SourceCursor(ctx, github.SourceName(repo))
+}
