@@ -108,7 +108,7 @@ func (e *Engine) EvaluateTrigger(ctx context.Context, source string, tr store.Tr
 
 	// Gate first: deterministic code owns admission; the evaluator never
 	// sees a trigger the Gate denied, so a denial costs no invoke
-	// (docs/designs/0001 §7: 门在编排器，不在模型).
+	// (docs/designs 0001 §7: 门在编排器，不在模型).
 	verdict := gate.Judge(pol, pl)
 	if !verdict.Allowed {
 		return e.record(ctx, source, tr.DeterministicID, store.DecisionInput{
@@ -116,6 +116,35 @@ func (e *Engine) EvaluateTrigger(ctx context.Context, source string, tr store.Tr
 			PolicyVersion: pol.Version,
 			Reason:        verdict.Reason,
 		})
+	}
+
+	// followupOwners guard (T8, docs/designs 0001 §3: 还欠人回复的 Ticket
+	// 持有 Thread 上的 follow-up，Engine 只许 stop; §4.2: 该 Thread 有活
+	// Ticket → 订阅扇出免评估). A thread with a live ticket has an owner:
+	// judging this trigger into a second ticket would fork the thread's
+	// work. P0 has no fan-out channel, so the gate-allowed message is
+	// recorded as the owner's follow-up input (it rides along on the
+	// owner's next recovery dispatch) and judged ignore — no evaluator
+	// invoke. A denied message never reaches this guard: input only
+	// matters if the Gate would have admitted it.
+	owner, owned, err := e.store.FollowupOwnerOfThread(ctx, source, tr.ThreadKey)
+	if err != nil {
+		return store.Decision{}, fmt.Errorf("failed to resolve the followup owner of %s/%s: %w",
+			source, tr.ThreadKey, err)
+	}
+	if owned {
+		dec, err := e.store.RecordFollowupInput(ctx, owner.ID, source, tr.DeterministicID, store.DecisionInput{
+			Outcome:       store.DecisionIgnore,
+			Strength:      verdict.Strength,
+			PolicyVersion: pol.Version,
+			Reason: fmt.Sprintf("thread %s/%s is owned by live ticket %s (followupOwners); recorded as its follow-up input",
+				source, tr.ThreadKey, owner.ID),
+		})
+		if err != nil {
+			return store.Decision{}, fmt.Errorf("failed to record the followup input for trigger %s/%s: %w",
+				source, tr.DeterministicID, err)
+		}
+		return dec, nil
 	}
 
 	in := Input{
@@ -272,8 +301,9 @@ func shortHash(version string) string {
 // Input is everything the evaluator needs to judge one trigger: the trigger
 // with its decoded payload, plus the Gate verdict the Decision must echo
 // (docs/designs/0001 §4.1: Assessment invoke = Trigger 批次 + Thread 快照 +
-// Ticket 历史 + Policy; P0 carries the single trigger — a thread holds no
-// live ticket before the accept, and the policy version pins the judgment).
+// Ticket 历史 + Policy; P0 carries the single trigger — the followupOwners
+// guard keeps a thread that holds a live ticket from ever reaching the
+// evaluator, so a judged trigger always runs against an unowned thread).
 type Input struct {
 	Source          string
 	DeterministicID string

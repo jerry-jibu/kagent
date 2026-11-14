@@ -621,8 +621,12 @@ func TestEngineEvaluatePending(t *testing.T) {
 		if stats.Evaluated != 1 {
 			t.Fatalf("evaluated = %d, want only the fresh trigger judged", stats.Evaluated)
 		}
-		if tickets := f.tickets(t); len(tickets) != 2 {
-			t.Fatalf("tickets = %d rows, want the first ticket and the new one", len(tickets))
+		// The fresh trigger shares the accepted trigger's thread: the live
+		// ticket owns it (followupOwners, docs/designs 0001 §3 — Engine 只许
+		// stop, no fork), so it is judged ignore as the owner's follow-up
+		// input instead of minting a second ticket.
+		if tickets := f.tickets(t); len(tickets) != 1 {
+			t.Fatalf("tickets = %d rows, want no fork of the owned thread", len(tickets))
 		}
 	})
 
