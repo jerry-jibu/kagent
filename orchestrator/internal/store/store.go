@@ -43,11 +43,6 @@ var ErrInboxLocked = errors.New("inbox already claimed by another worker")
 // ErrInvalidEvent rejects events that would create unrepresentable state.
 var ErrInvalidEvent = errors.New("invalid event")
 
-// TicketStatusEnded is the terminal ticket status used by the sightline
-// predicate. The Engine owns the full ticket status vocabulary; the sightline
-// only needs to distinguish a live ticket from an ended one.
-const TicketStatusEnded = "ended"
-
 // SourceRef identifies a Source instance (docs/designs/0001 §3: 读位置、bot
 // 身份的拥有者). Name is globally unique, e.g. "github:owner/repo".
 type SourceRef struct {

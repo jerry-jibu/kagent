@@ -69,55 +69,150 @@ func (t *HTTPTransport) InvokeAgent(ctx context.Context, agent, message string) 
 		return "", err
 	}
 
-	payload, err := json.Marshal(jsonrpcRequest{
-		JSONRPC: "2.0",
-		Method:  "SendMessage",
-		ID:      invokeID(),
-		Params: sendMessageParams{
-			Message: wireMessage{
-				Role:      "ROLE_USER",
-				Parts:     []wirePart{{Text: message}},
-				MessageID: newMessageID(),
-			},
+	result, err := t.rpc(ctx, route, "SendMessage", sendMessageParams{
+		Message: wireMessage{
+			Role:      "ROLE_USER",
+			Parts:     []wirePart{{Text: message}},
+			MessageID: newMessageID(),
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to encode the SendMessage request: %w", err)
+		return "", fmt.Errorf("invoke of agent %s failed: %w", agent, err)
+	}
+
+	text, err := extractResponseText(result)
+	if err != nil {
+		return "", fmt.Errorf("agent %s response carries no readable answer: %w", agent, err)
+	}
+	return text, nil
+}
+
+// Dispatch sends ticket work as a ReturnImmediately SendMessage with the
+// orchestrator's push receiver registered (docs/designs/0001 D2) and returns
+// the task identity the gateway minted. A response that carries no Task
+// (e.g. a bare Message) is refused: a dispatch without a task identity would
+// strand the assignment with nothing to reconcile against.
+func (t *HTTPTransport) Dispatch(ctx context.Context, req DispatchRequest) (DispatchResult, error) {
+	route, err := agentRoute(req.Agent)
+	if err != nil {
+		return DispatchResult{}, err
+	}
+
+	params := sendMessageParams{
+		Message: wireMessage{
+			Role:      "ROLE_USER",
+			Parts:     []wirePart{{Text: req.Message}},
+			MessageID: newMessageID(),
+			ContextID: req.ContextID,
+		},
+		Config: &sendMessageConfig{
+			ReturnImmediately: true,
+			PushConfig:        pushConfigFor(req, route),
+		},
+	}
+
+	result, err := t.rpc(ctx, route, "SendMessage", params)
+	if err != nil {
+		return DispatchResult{}, err
+	}
+
+	var task wireTask
+	if err := json.Unmarshal(result, &task); err != nil || task.ID == "" {
+		return DispatchResult{}, fmt.Errorf("agent %s dispatch returned no task identity: %w", req.Agent, err)
+	}
+	return DispatchResult{
+		TaskID:    task.ID,
+		ContextID: task.ContextID,
+		State:     task.Status.State,
+	}, nil
+}
+
+// TaskState fetches one task's current snapshot (docs/designs/0001 §4.3: the
+// Pass beat's reconcile source of truth). The gateway's task-not-found error
+// surfaces as ErrTaskNotFound — the red-line trigger, distinct from a
+// transport failure, which stays a plain error.
+func (t *HTTPTransport) TaskState(ctx context.Context, agent, taskID string) (Task, error) {
+	route, err := agentRoute(agent)
+	if err != nil {
+		return Task{}, err
+	}
+
+	result, err := t.rpc(ctx, route, "GetTask", getTaskParams{ID: taskID})
+	if err != nil {
+		return Task{}, err
+	}
+
+	var task wireTask
+	if err := json.Unmarshal(result, &task); err != nil {
+		return Task{}, fmt.Errorf("task %s snapshot is not an A2A Task: %w", taskID, err)
+	}
+	return Task{
+		ID:         task.ID,
+		ContextID:  task.ContextID,
+		State:      task.Status.State,
+		StatusText: task.Status.Message.text(),
+	}, nil
+}
+
+// rpc sends one JSON-RPC request to the agent route and returns the result
+// envelope. JSON-RPC errors surface with their code: -32001 maps to
+// ErrTaskNotFound, everything else stays a plain error.
+func (t *HTTPTransport) rpc(ctx context.Context, route, method string, params any) (json.RawMessage, error) {
+	payload, err := json.Marshal(jsonrpcRequest{
+		JSONRPC: "2.0",
+		Method:  method,
+		ID:      invokeID(),
+		Params:  params,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode the %s request: %w", method, err)
 	}
 
 	endpoint := t.base + "/agents/" + route
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("failed to build the request for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("failed to build the request for %s: %w", endpoint, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("invoke of agent %s failed: %w", agent, err)
+		return nil, fmt.Errorf("%s of agent %s failed: %w", method, route, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("invoke of agent %s failed: HTTP %d", agent, resp.StatusCode)
+		return nil, fmt.Errorf("%s of agent %s failed: HTTP %d", method, route, resp.StatusCode)
 	}
 
 	var wire jsonrpcResponse
 	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
-		return "", fmt.Errorf("failed to decode the response of agent %s: %w", agent, err)
+		return nil, fmt.Errorf("failed to decode the response of agent %s: %w", route, err)
 	}
 	if wire.Error != nil {
-		return "", fmt.Errorf("agent %s answered a JSON-RPC error %d: %s", agent, wire.Error.Code, wire.Error.Message)
+		if wire.Error.Code == codeTaskNotFound {
+			return nil, ErrTaskNotFound
+		}
+		return nil, fmt.Errorf("agent %s answered a JSON-RPC error %d: %s", route, wire.Error.Code, wire.Error.Message)
 	}
 	if len(wire.Result) == 0 {
-		return "", fmt.Errorf("agent %s answered without a result", agent)
+		return nil, fmt.Errorf("agent %s answered without a result", route)
 	}
+	return wire.Result, nil
+}
 
-	text, err := extractResponseText(wire.Result)
-	if err != nil {
-		return "", fmt.Errorf("agent %s response carries no readable answer: %w", agent, err)
+// pushConfigFor builds the push registration for a dispatch. Tenant is the
+// agent route — the gateway refuses a mismatched tenant
+// (go/core/internal/a2agateway push validation).
+func pushConfigFor(req DispatchRequest, route string) *pushConfig {
+	if req.PushURL == "" {
+		return nil
 	}
-	return text, nil
+	return &pushConfig{
+		URL:    req.PushURL,
+		ID:     req.PushID,
+		Tenant: route,
+	}
 }
 
 // extractResponseText pulls the final answer text out of a SendMessage
@@ -143,10 +238,10 @@ func extractResponseText(result json.RawMessage) (string, error) {
 
 // jsonrpcRequest is the JSON-RPC 2.0 client envelope.
 type jsonrpcRequest struct {
-	JSONRPC string            `json:"jsonrpc"`
-	Method  string            `json:"method"`
-	ID      string            `json:"id"`
-	Params  sendMessageParams `json:"params"`
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	ID      string `json:"id"`
+	Params  any    `json:"params"`
 }
 
 type jsonrpcResponse struct {
@@ -161,11 +256,35 @@ type jsonrpcError struct {
 	Message string `json:"message"`
 }
 
+// codeTaskNotFound is the JSON-RPC error code the A2A gateway answers a
+// GetTask for an unknown task with (a2a-go internal/jsonrpc codeToError).
+const codeTaskNotFound = -32001
+
 // sendMessageParams carries the SendMessageRequest's message (a2a-go
 // SendMessageRequest: tenant/configuration/metadata optional, message
 // required).
 type sendMessageParams struct {
-	Message wireMessage `json:"message"`
+	Message wireMessage        `json:"message"`
+	Config  *sendMessageConfig `json:"configuration,omitempty"`
+}
+
+// sendMessageConfig mirrors a2a-go's SendMessageConfig wire shape for the
+// fields the dispatcher uses (docs/designs/0004 §2 three-mode table).
+type sendMessageConfig struct {
+	ReturnImmediately bool        `json:"returnImmediately,omitempty"`
+	PushConfig        *pushConfig `json:"taskPushNotificationConfig,omitempty"`
+}
+
+// pushConfig mirrors a2a-go's PushConfig wire shape.
+type pushConfig struct {
+	URL    string `json:"url"`
+	ID     string `json:"id,omitempty"`
+	Tenant string `json:"tenant,omitempty"`
+}
+
+// getTaskParams mirrors a2a-go's GetTaskRequest wire shape.
+type getTaskParams struct {
+	ID string `json:"id"`
 }
 
 // wireMessage mirrors a2a-go's Message wire shape.
@@ -174,6 +293,7 @@ type wireMessage struct {
 	Parts     []wirePart `json:"parts"`
 	MessageID string     `json:"messageId"`
 	TaskID    string     `json:"taskId,omitempty"`
+	ContextID string     `json:"contextId,omitempty"`
 }
 
 func (m wireMessage) text() string {
@@ -192,8 +312,9 @@ type wirePart struct {
 
 // wireTask mirrors the Task fields the response extraction needs.
 type wireTask struct {
-	ID     string `json:"id"`
-	Status struct {
+	ID        string `json:"id"`
+	ContextID string `json:"contextId"`
+	Status    struct {
 		State   string       `json:"state"`
 		Message *wireMessage `json:"message,omitempty"`
 	} `json:"status"`

@@ -13,12 +13,23 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// Ticket and assignment statuses written by ticket creation. The Engine owns
-// the full status vocabulary; see migrations/0004_tickets.sql for the
-// CHECK-enforced list.
+// Ticket and assignment statuses. The Engine owns the full status
+// vocabularies; see migrations/0004_tickets.sql and 0001_init.sql for the
+// CHECK-enforced lists.
 const (
-	TicketStatusPending     = "pending"
-	AssignmentStatusPending = "pending"
+	TicketStatusPending        = "pending"
+	TicketStatusRunning        = "running"
+	TicketStatusNeedsAttention = "needs-attention"
+	TicketStatusFailed         = "failed"
+	TicketStatusEnded          = "ended"
+
+	AssignmentStatusPending    = "pending"
+	AssignmentStatusRunning    = "running"
+	AssignmentStatusEnded      = "ended"
+	AssignmentStatusUnresolved = "unresolved"
+
+	AssignmentKindInitial  = "initial"
+	AssignmentKindFollowup = "followup"
 )
 
 // ErrInvalidTicket rejects ticket creations that would create
@@ -59,25 +70,38 @@ type OutboxEffect struct {
 	Payload        []byte
 }
 
-// Ticket is one authorized work unit.
+// Ticket is one authorized work unit. SessionID is the A2A contextId of the
+// ticket's kagent session — set on the first successful dispatch and reused
+// verbatim by every continuation (同一 ticket 续发消息 contextId 不变). The
+// trigger identity is recorded at creation so the dispatch document can carry
+// the original request.
 type Ticket struct {
-	ID           string
-	ThreadSource string
-	ThreadKey    string
-	Mandate      Mandate
-	Status       string
-	CreatedAt    time.Time
+	ID                     string
+	ThreadSource           string
+	ThreadKey              string
+	Mandate                Mandate
+	Status                 string
+	SessionID              string
+	TriggerSource          string
+	TriggerDeterministicID string
+	CreatedAt              time.Time
 }
 
-// Assignment is one ticket↔executor binding. P0 dispatch (T6) sets TaskID
-// once, when the A2A task is sent.
+// Assignment is one ticket↔executor binding. Dispatch (T6) sets TaskID once,
+// when the A2A task is sent. Report carries the state of the report the
+// assignment settled under; DispatchAttempts/LastError are the dispatch
+// ledger a recovery redispatch annotates.
 type Assignment struct {
-	ID        string
-	TicketID  string
-	TaskID    *string
-	Status    string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID               string
+	TicketID         string
+	TaskID           *string
+	Status           string
+	Report           string
+	DispatchAttempts int
+	LastError        string
+	Kind             string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // TicketInput is one accept-to-ticket creation. Decision and Mandate must
@@ -189,9 +213,10 @@ func (s *Store) CreateTicket(ctx context.Context, in TicketInput) (CreatedTicket
 	}
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO tickets (id, thread_source, thread_key, mandate, status)
-		VALUES ($1, $2, $3, $4, $5)`,
-		ticketID, in.Source, in.ThreadKey, mandate, TicketStatusPending); err != nil {
+		INSERT INTO tickets (id, thread_source, thread_key, mandate, status, trigger_source, trigger_deterministic_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		ticketID, in.Source, in.ThreadKey, mandate, TicketStatusPending,
+		in.Source, in.DeterministicID); err != nil {
 		return CreatedTicket{}, fmt.Errorf("failed to insert ticket %s: %w", ticketID, err)
 	}
 
@@ -247,7 +272,8 @@ func duplicateAccept(err error) bool {
 // Ticket returns one ticket row.
 func (s *Store) Ticket(ctx context.Context, id string) (Ticket, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, thread_source, thread_key, mandate, status, created_at
+		SELECT id, thread_source, thread_key, mandate, status, session_id,
+		       trigger_source, trigger_deterministic_id, created_at
 		FROM tickets WHERE id = $1`, id)
 	return scanTicket(row)
 }
@@ -255,7 +281,8 @@ func (s *Store) Ticket(ctx context.Context, id string) (Ticket, error) {
 // Tickets returns all ticket rows, creation order first.
 func (s *Store) Tickets(ctx context.Context) ([]Ticket, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, thread_source, thread_key, mandate, status, created_at
+		SELECT id, thread_source, thread_key, mandate, status, session_id,
+		       trigger_source, trigger_deterministic_id, created_at
 		FROM tickets
 		ORDER BY created_at, id`)
 	if err != nil {
@@ -282,11 +309,16 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanTicket(row rowScanner) (Ticket, error) {
 	var tk Ticket
 	var mandate []byte
-	if err := row.Scan(&tk.ID, &tk.ThreadSource, &tk.ThreadKey, &mandate, &tk.Status, &tk.CreatedAt); err != nil {
+	var sessionID *string
+	if err := row.Scan(&tk.ID, &tk.ThreadSource, &tk.ThreadKey, &mandate, &tk.Status, &sessionID,
+		&tk.TriggerSource, &tk.TriggerDeterministicID, &tk.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Ticket{}, ErrTicketNotFound
 		}
 		return Ticket{}, fmt.Errorf("failed to scan ticket: %w", err)
+	}
+	if sessionID != nil {
+		tk.SessionID = *sessionID
 	}
 	if err := json.Unmarshal(mandate, &tk.Mandate); err != nil {
 		return Ticket{}, fmt.Errorf("ticket %s carries a mandate that does not decode: %w", tk.ID, err)
@@ -294,10 +326,31 @@ func scanTicket(row rowScanner) (Ticket, error) {
 	return tk, nil
 }
 
+// assignmentColumns is the shared SELECT list of the single-table assignment
+// scans; assignmentJoinColumns qualifies it for the candidate JOIN queries.
+const (
+	assignmentColumns = `
+	id, ticket_id, task_id, status, report, dispatch_attempts, last_error,
+	kind, created_at, updated_at`
+
+	assignmentJoinColumns = `
+	a.id, a.ticket_id, a.task_id, a.status, a.report, a.dispatch_attempts,
+	a.last_error, a.kind, a.created_at, a.updated_at`
+)
+
+func scanAssignment(row rowScanner) (Assignment, error) {
+	var a Assignment
+	if err := row.Scan(&a.ID, &a.TicketID, &a.TaskID, &a.Status, &a.Report,
+		&a.DispatchAttempts, &a.LastError, &a.Kind, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		return Assignment{}, fmt.Errorf("failed to scan assignment: %w", err)
+	}
+	return a, nil
+}
+
 // Assignments returns the assignments bound to a ticket, oldest first.
 func (s *Store) Assignments(ctx context.Context, ticketID string) ([]Assignment, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, ticket_id, task_id, status, created_at, updated_at
+		SELECT `+assignmentColumns+`
 		FROM assignments
 		WHERE ticket_id = $1
 		ORDER BY created_at, id`, ticketID)
@@ -308,9 +361,9 @@ func (s *Store) Assignments(ctx context.Context, ticketID string) ([]Assignment,
 
 	var out []Assignment
 	for rows.Next() {
-		var a Assignment
-		if err := rows.Scan(&a.ID, &a.TicketID, &a.TaskID, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan assignment: %w", err)
+		a, err := scanAssignment(rows)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, a)
 	}
