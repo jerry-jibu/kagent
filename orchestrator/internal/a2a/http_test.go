@@ -22,9 +22,10 @@ func TestHTTPTransportInvokeAgent(t *testing.T) {
 
 	// recordedRequest captures the request shape assertions need.
 	type recordedRequest struct {
-		Path   string
-		Method string
-		Body   struct {
+		Path       string
+		Method     string
+		A2AVersion string
+		Body       struct {
 			JSONRPC string          `json:"jsonrpc"`
 			Method  string          `json:"method"`
 			ID      string          `json:"id"`
@@ -45,6 +46,7 @@ func TestHTTPTransportInvokeAgent(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			rec.Path = r.URL.Path
 			rec.Method = r.Method
+			rec.A2AVersion = r.Header.Get("A2A-Version")
 			rec.Body.JSONRPC = body.JSONRPC
 			rec.Body.Method = body.Method
 			rec.Body.ID = body.ID
@@ -74,6 +76,9 @@ func TestHTTPTransportInvokeAgent(t *testing.T) {
 		}
 		if rec.Body.Method != "SendMessage" {
 			t.Fatalf("rpc method = %q, want SendMessage", rec.Body.Method)
+		}
+		if rec.A2AVersion != "1.0" {
+			t.Fatalf("A2A-Version header = %q, want the served protocol version 1.0 (the gateway rejects absent/0.3 with VERSION_NOT_SUPPORTED)", rec.A2AVersion)
 		}
 		if rec.Body.JSONRPC != "2.0" || rec.Body.ID == "" {
 			t.Fatalf("request envelope = %+v, want jsonrpc 2.0 with an id", rec.Body)

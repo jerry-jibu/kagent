@@ -44,6 +44,12 @@ func NewHTTPTransport(cfg HTTPConfig) *HTTPTransport {
 	}
 }
 
+// protocolVersion is the A2A protocol version this transport speaks, sent on
+// every request as the A2A-Version service parameter header (a2a-go
+// a2a.SvcParamVersion). The gateway serves "1.0" and rejects requests that
+// omit the header (it negotiates against the legacy default "0.3").
+const protocolVersion = "1.0"
+
 // agentRoute resolves the gateway route of an agent: "namespace/name" as-is,
 // a bare name under the default "kagent" namespace. The gateway binds the
 // tenant from the URL path (go/core/internal/a2agateway http.go).
@@ -174,6 +180,7 @@ func (t *HTTPTransport) rpc(ctx context.Context, route, method string, params an
 		return nil, fmt.Errorf("failed to build the request for %s: %w", endpoint, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("A2A-Version", protocolVersion)
 
 	resp, err := t.client.Do(req)
 	if err != nil {
