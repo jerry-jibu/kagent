@@ -1,0 +1,15 @@
+# ModelConfig: DeepSeek via Anthropic 兼容网关（A1/D8 变体，集群已验证先例 docs/env.md:61-62）
+# 字段名依据 v1.0.1: apiKeySecret/apiKeySecretKey (modelconfig_types.go:607-616), anthropic.baseUrl (:639,:132)
+# 前置: Secret kagent-deepseek (ns kagent, key ANTHROPIC_API_KEY) 已存在（env.md）
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata:
+  name: deepseek
+  namespace: kagent
+spec:
+  provider: Anthropic
+  model: deepseek-flash
+  apiKeySecret: kagent-deepseek
+  apiKeySecretKey: ANTHROPIC_API_KEY
+  anthropic:
+    baseUrl: https://api.deepseek.com/anthropic

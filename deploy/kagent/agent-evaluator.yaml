@@ -1,0 +1,42 @@
+# Agent: superagent 研判 evaluator（0002 §1-A2 / 0001 D1）
+# 必须用 kagent harness（内置 kagent-default，1.0.1 onboarding 自带）——
+# 结构化输出对非 kagent harness 被编译器拒绝 (translator/compiler.go:332-334)
+# outputSchema 是 AgentTemplateSpec 一等字段 (agenttemplate_types.go:194)
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: superagent-evaluator
+  namespace: kagent
+spec:
+  harnessRef:
+    name: kagent-default
+  template:
+    inline:
+      description: superagent 研判器：Trigger 批次 → 结构化 Decision（只研判，不写工单）
+      modelConfig:
+        name: deepseek
+      systemPrompt: |
+        你是 superagent 的评估器。输入包含：Trigger 批次（JSON）、Thread 快照、
+        相关 Ticket 历史、Gate 已判定的发送者强度（strength）与 Policy 版本。
+
+        规则：
+        1. 只做研判。你没有写工单、派工、回帖的能力，也不 pretend 有。
+        2. accept 判定必须回填 Gate 已给出的 strength 与 policyVersion——
+           你不得发明或提升授权；证据不足时用 ignore 或 unavailable，不要猜。
+        3. reason 用一句话给出可审计的依据（引用 Trigger 内容，不要复述全文）。
+      outputSchema:
+        type: object
+        required: [decision, reason, strength, policyVersion]
+        properties:
+          decision:
+            type: string
+            enum: [accept, stop, ignore, unavailable]
+          reason:
+            type: string
+          strength:
+            type: string
+            enum: [explicit, inferred, denied]
+            description: 回填 Gate 已判定的值；代码侧校验与输入一致
+          policyVersion:
+            type: string
+            description: 回填输入中的 Policy 版本哈希

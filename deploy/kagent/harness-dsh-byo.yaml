@@ -1,0 +1,23 @@
+# Harness: DSH BYO（0002 §1-A2/D7）——零 CRD 扩展，digest 钉死镜像 + 固定 command
+# 镜像源: kagent-dev/byo-ext PR #2（未合入 main），分支 pr-2 @ 19771c8
+#   构建: git fetch origin pull/2/head:pr-2 && docker build -f harnesses/deepseek/Dockerfile -t <registry>/kagent-dsh-byo .
+#   记录 源SHA → 镜像digest 对应关系（风险表：显式重同步，不自动漂移）
+# 占位符用 envsubst 代入后 apply（见 README.md）
+apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata:
+  name: dsh-byo
+  namespace: kagent
+spec:
+  byo: {}
+  workload:
+    # CEL 强制 digest 钉死: ^[^[:space:]@]+@sha256:[a-f0-9]{64}$ (harness_types.go:116-118)
+    image: ${DSH_BYO_IMAGE}   # 例: registry.example.com/kagent-dsh-byo@sha256:<64hex>
+    command: [/usr/local/bin/kagent-dsh-byo]
+  # 字段名依据 runtime_types.go:33-41（评审 IR-2）
+  substrate:
+    workerPoolRef:
+      name: kagent-default
+    snapshotPolicy:
+      location: ${SNAPSHOT_LOCATION}   # 按集群现状填：与既有 Harness 的快照位置约定一致
+  # Spec.Env P0 置空——bridge 沙箱零凭证（1006），模型凭证走 egress 注入
