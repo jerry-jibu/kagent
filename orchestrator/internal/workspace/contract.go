@@ -51,6 +51,12 @@ var ErrNotTransportable = errors.New("content not transportable over this backen
 // genuinely not in the workspace), never as an outage.
 var ErrFileNotFound = errors.New("file not found in workspace")
 
+// ErrIsDirectory marks a read of a workspace path that is a directory. The
+// real agentfs bridge lists IMMEDIATE children only (directories as bare
+// names) and refuses read_file on one with "is a directory"; the read-back
+// recurses through it via ListFiles.
+var ErrIsDirectory = errors.New("path is a directory in workspace")
+
 // validateWorkspacePath enforces workspace-relative, slash-separated paths
 // with no traversal, absolute reference, or NUL. The agentfs workspace also
 // enforces this (read_file/write_file containment); validating at the seam

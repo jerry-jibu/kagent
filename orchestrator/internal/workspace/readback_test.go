@@ -201,16 +201,56 @@ func TestAgentfsBackendListAndMissing(t *testing.T) {
 			}
 		}
 
+		// The real bridge lists IMMEDIATE children — directories as bare
+		// names — and refuses read_file on one with "is a directory",
+		// surfacing as ErrIsDirectory.
 		listing, err := backend.ListFiles(ctx, ws, "")
 		if err != nil {
 			t.Fatalf("ListFiles failed: %v", err)
 		}
-		if len(listing) != 2 || listing[0] != "README.md" || listing[1] != "src/agent.go" {
-			t.Fatalf("listing = %v, want the two written paths", listing)
+		if len(listing) != 2 || listing[0] != "README.md" || listing[1] != "src" {
+			t.Fatalf("listing = %v, want the immediate children README.md and src", listing)
+		}
+		if _, err := backend.ReadFile(ctx, ws, "src"); !errors.Is(err, workspace.ErrIsDirectory) {
+			t.Fatalf("directory path must read as ErrIsDirectory, got %v", err)
 		}
 
 		if _, err := backend.ReadFile(ctx, ws, "src/missing.go"); !errors.Is(err, workspace.ErrFileNotFound) {
 			t.Fatalf("missing path must read as ErrFileNotFound, got %v", err)
+		}
+	})
+
+	t.Run("Given a workspace holding files under directories, when the workspace state is read back, assert that the state collects every file path under the listed directories (real bridge semantics: one-level listing)", func(t *testing.T) {
+		_, backend := newTestAgentfsBackend(t)
+		ctx := context.Background()
+
+		const ws = "ticket-readback-dirs"
+		if err := backend.EnsureWorkspace(ctx, ws); err != nil {
+			t.Fatalf("EnsureWorkspace failed: %v", err)
+		}
+		want := map[string]string{
+			"README.md":           "# read\n",
+			"src/agent.go":        "package agent\n",
+			"src/deep/nested.txt": "nested content\n",
+		}
+		for path, content := range want {
+			if err := backend.WriteFile(ctx, ws, path, []byte(content)); err != nil {
+				t.Fatalf("WriteFile %s failed: %v", path, err)
+			}
+		}
+
+		state, err := workspace.ReadWorkspaceState(ctx, backend, ws)
+		if err != nil {
+			t.Fatalf("ReadWorkspaceState failed: %v", err)
+		}
+		if len(state) != len(want) {
+			t.Fatalf("state paths = %v, want exactly the %d files", pathsOf(state), len(want))
+		}
+		for path, content := range want {
+			got, ok := state[path]
+			if !ok || string(got) != content {
+				t.Fatalf("state[%s] = %q, want %q", path, got, content)
+			}
 		}
 	})
 
@@ -230,4 +270,13 @@ func TestAgentfsBackendListAndMissing(t *testing.T) {
 			t.Fatalf("listing = %v, want empty", listing)
 		}
 	})
+}
+
+func pathsOf(state map[string][]byte) []string {
+	out := make([]string, 0, len(state))
+	for p := range state {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }

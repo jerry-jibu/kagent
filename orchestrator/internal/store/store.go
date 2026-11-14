@@ -155,10 +155,25 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("failed to create connection pool: %w", err)
 	}
 
-	if _, err := pool.Exec(ctx, fmt.Sprintf(
-		`CREATE SCHEMA IF NOT EXISTS %s`, pgx.Identifier{schema}.Sanitize())); err != nil {
+	// Ensure the schema exists. PostgreSQL evaluates the CREATE privilege
+	// BEFORE the IF-NOT-EXISTS short-circuit, so a least-privilege runtime
+	// user (cert-auth deployments provision the schema with CREATE SCHEMA
+	// ... AUTHORIZATION) must not pay for the check: probe with
+	// to_regnamespace first and only create when it is genuinely missing. A
+	// create that then fails for lack of privilege is a real
+	// misconfiguration and refuses the start loudly.
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT to_regnamespace($1) IS NOT NULL`, schema).Scan(&exists); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("failed to create schema %s: %w", schema, err)
+		return nil, fmt.Errorf("failed to probe schema %s: %w", schema, err)
+	}
+	if !exists {
+		if _, err := pool.Exec(ctx, fmt.Sprintf(
+			`CREATE SCHEMA %s`, pgx.Identifier{schema}.Sanitize())); err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("failed to create schema %s: %w", schema, err)
+		}
 	}
 
 	return &Store{pool: pool, schema: schema, dbURL: cfg.DatabaseURL}, nil

@@ -101,7 +101,7 @@ func (f *engineFixture) seedTrigger(t *testing.T, pl intake.CommentPayload) (str
 // outputSchema contract requires: it echoes the gate's strength and policy
 // version verbatim.
 func (f *engineFixture) acceptEcho(reason string) {
-	raw := fmt.Sprintf(`{"outcome":"accept","strength":%q,"policy_version":%q,"reason":%q}`,
+	raw := fmt.Sprintf(`{"outcome":"accept","strength":%q,"policyVersion":%q,"reason":%q}`,
 		f.pol.Admission[0].Strength, f.pol.Version, reason)
 	f.transport.Script("evaluator", raw)
 }
@@ -302,7 +302,7 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 	t.Run("Given an evaluator that returns an accept carrying a forged strength, when the trigger is evaluated, assert that the decision is persisted as rejected with the gate-verified values and no accept ever exists", func(t *testing.T) {
 		f := newEngineFixture(t)
 		f.transport.Script("evaluator", fmt.Sprintf(
-			`{"outcome":"accept","strength":"inferred","policy_version":%q,"reason":"I decide this is fine"}`,
+			`{"outcome":"accept","strength":"inferred","policyVersion":%q,"reason":"I decide this is fine"}`,
 			f.pol.Version))
 		source, tr := f.seedTrigger(t, addressedComment("acme/api"))
 
@@ -332,7 +332,7 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 
 	t.Run("Given an evaluator that returns an accept carrying a forged policy version, when the trigger is evaluated, assert that the decision is persisted as rejected", func(t *testing.T) {
 		f := newEngineFixture(t)
-		f.transport.Script("evaluator", `{"outcome":"accept","strength":"explicit","policy_version":"deadbeef","reason":"under my own policy"}`)
+		f.transport.Script("evaluator", `{"outcome":"accept","strength":"explicit","policyVersion":"deadbeef","reason":"under my own policy"}`)
 		source, tr := f.seedTrigger(t, addressedComment("acme/api"))
 
 		if _, err := f.engine.EvaluateTrigger(context.Background(), source, tr, f.pol); err != nil {
@@ -576,7 +576,7 @@ func TestEngineEvaluatePending(t *testing.T) {
 		f := newEngineFixture(t)
 		f.transport.Script("evaluator",
 			`{"outcome":"ignore","reason":"not a task"}`,
-			fmt.Sprintf(`{"outcome":"accept","strength":"explicit","policy_version":%q,"reason":"a task"}`, f.pol.Version))
+			fmt.Sprintf(`{"outcome":"accept","strength":"explicit","policyVersion":%q,"reason":"a task"}`, f.pol.Version))
 		source1 := ingest(t, f, addressedComment(2001, "@acme-bot what is this issue about?"))
 		source2 := ingest(t, f, addressedComment(2002, "@acme-bot please fix the flaky login test"))
 		if source1 != source2 {

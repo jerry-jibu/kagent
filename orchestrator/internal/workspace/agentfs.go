@@ -126,6 +126,9 @@ func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte,
 		if isAgentfsFileNotFound(err) {
 			return nil, fmt.Errorf("%w: %s", ErrFileNotFound, path)
 		}
+		if isAgentfsDirectory(err) {
+			return nil, fmt.Errorf("%w: %s", ErrIsDirectory, path)
+		}
 		return nil, fmt.Errorf("failed to read %s: %w", path, err)
 	}
 	return []byte(text), nil
@@ -176,6 +179,13 @@ func isAgentfsAlreadyExists(err error) bool {
 
 // isAgentfsFileNotFound recognizes the bridge's missing-file refusal so
 // read-backs can distinguish absence from outage.
+// isAgentfsDirectory reports the bridge's read_file refusal on a directory
+// (verified against the live bridge: read_file on a listed child directory
+// answers exactly "is a directory").
+func isAgentfsDirectory(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "is a directory")
+}
+
 func isAgentfsFileNotFound(err error) bool {
 	if err == nil {
 		return false

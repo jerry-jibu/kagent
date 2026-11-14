@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -148,26 +149,44 @@ func (f *fakeAgentfs) callTool(name string, args map[string]any) (text string, i
 		if !ok {
 			return "workspace not found: " + str("workspace"), true
 		}
-		content, ok := ws[str("path")]
-		if !ok {
-			return "file not found: " + str("path"), true
+		target := str("path")
+		if _, ok := ws[target]; !ok {
+			// A path that prefixes at least one file is a directory: the real
+			// bridge refuses with exactly this message.
+			for p := range ws {
+				if strings.HasPrefix(p, target+"/") {
+					return "is a directory", true
+				}
+			}
+			return "file not found: " + target, true
 		}
-		return content, false
+		return ws[target], false
 	case "agenticfs_list_files":
+		// The real bridge lists the IMMEDIATE children of the path —
+		// directories as bare names, files as their names — and read_file on
+		// a directory refuses with "is a directory". Callers recurse.
 		ws, ok := f.workspaces[str("workspace")]
 		if !ok {
 			return "workspace not found: " + str("workspace"), true
 		}
-		prefix := strings.TrimPrefix(str("path"), "/")
-		if prefix != "" && !strings.HasSuffix(prefix, "/") {
-			prefix += "/"
-		}
+		prefix := strings.TrimSuffix(strings.TrimPrefix(str("path"), "/"), "/")
+		seen := map[string]bool{}
 		var out []string
 		for p := range ws {
-			if prefix == "/" || strings.HasPrefix(p, prefix) {
-				out = append(out, strings.TrimPrefix(p, prefix))
+			if prefix != "" && !strings.HasPrefix(p, prefix+"/") {
+				continue
+			}
+			rest := strings.TrimPrefix(p, prefix+"/")
+			child := rest
+			if i := strings.IndexByte(rest, '/'); i >= 0 {
+				child = rest[:i] // the directory level
+			}
+			if !seen[child] {
+				seen[child] = true
+				out = append(out, child)
 			}
 		}
+		sort.Strings(out)
 		if len(out) == 0 {
 			return "(empty)", false
 		}
