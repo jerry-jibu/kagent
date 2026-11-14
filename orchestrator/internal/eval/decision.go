@@ -30,9 +30,12 @@ var ErrReject = errors.New("evaluator decision rejected")
 // outputSchema (docs/designs/0002 A2: structured output is only available on
 // the kagent harness — that is why the evaluator must be one).
 type Decision struct {
-	Outcome       string `json:"outcome"`
-	Strength      string `json:"strength,omitempty"`
-	PolicyVersion string `json:"policy_version,omitempty"`
+	Outcome  string `json:"outcome"`
+	Strength string `json:"strength,omitempty"`
+	// PolicyVersion is camelCase on the wire: the evaluator's enforced
+	// outputSchema (deploy/kagent/agent-evaluator.yaml) is the contract
+	// source, and JSON keys never match snake_case tags.
+	PolicyVersion string `json:"policyVersion,omitempty"`
 	Reason        string `json:"reason,omitempty"`
 }
 

@@ -15,7 +15,7 @@ const (
 
 func TestParseDecision(t *testing.T) {
 	t.Run("Given an evaluator response that is exactly a Decision JSON object, when parsed, assert that every field decodes into the Decision", func(t *testing.T) {
-		raw := `{"outcome":"accept","strength":"explicit","policy_version":"` + gatePolicyVersion + `","reason":"authorized coding request"}`
+		raw := `{"outcome":"accept","strength":"explicit","policyVersion":"` + gatePolicyVersion + `","reason":"authorized coding request"}`
 		d, err := eval.ParseDecision(raw)
 		if err != nil {
 			t.Fatalf("parse failed: %v", err)

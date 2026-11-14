@@ -347,7 +347,7 @@ func decisionSchema() []decisionField {
 	return []decisionField{
 		{Name: "outcome", Type: "string", Required: true, Description: "the judgment", Enum: []string{"accept", "stop", "ignore", "unavailable"}},
 		{Name: "strength", Type: "string", Required: false, Description: "echo of the gate strength above; required for accept"},
-		{Name: "policy_version", Type: "string", Required: false, Description: "echo of the policy version above; required for accept"},
+		{Name: "policyVersion", Type: "string", Required: false, Description: "echo of the policy version above; required for accept"},
 		{Name: "reason", Type: "string", Required: false, Description: "one-sentence justification"},
 	}
 }
