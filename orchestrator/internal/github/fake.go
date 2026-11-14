@@ -11,24 +11,29 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Fake is an in-memory GitHub serving the issue-comments poll endpoint with
-// the same wire contract the production transport speaks. It exists so tests
-// exercise the real HTTP client against a faithful server instead of a mock
-// of the client's own assumptions.
+// Fake is an in-memory GitHub serving the issue-comments poll endpoint and
+// the PR creation endpoint with the same wire contract the production
+// transport speaks. It exists so tests exercise the real HTTP client against
+// a faithful server instead of a mock of the client's own assumptions.
 //
 // Semantics mirrored from the GitHub REST API
 // (GET /repos/{owner}/{repo}/issues/comments): `since` filters on the
 // comment's updated time, results are sorted by created time, `per_page`
-// (default 30) and `page` (1-based) paginate.
+// (default 30) and `page` (1-based) paginate. PR creation refuses a
+// duplicate head branch with 422 "already exists" (and the transport then
+// resolves the existing PR through the pulls listing).
 type Fake struct {
 	mu       sync.Mutex
 	comments []IssueComment
 	posted   []IssueComment
+	pulls    []PullRequest
 	nextID   int64
+	nextPR   int
 	botLogin string
 	srv      *httptest.Server
 	lastAuth string
@@ -39,11 +44,13 @@ type Fake struct {
 
 // NewFake starts a Fake GitHub server.
 func NewFake() *Fake {
-	f := &Fake{nextID: 900000, botLogin: "orchestrator"}
+	f := &Fake{nextID: 900000, nextPR: 400, botLogin: "orchestrator"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/comments", f.handleListIssueComments)
 	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}/comments", f.handleListIssueConversation)
 	mux.HandleFunc("POST /repos/{owner}/{repo}/issues/{number}/comments", f.handlePostIssueComment)
+	mux.HandleFunc("POST /repos/{owner}/{repo}/pulls", f.handleCreatePullRequest)
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", f.handleListPullRequests)
 	f.srv = httptest.NewServer(mux)
 	return f
 }
@@ -114,6 +121,133 @@ func (f *Fake) PostedComments() []IssueComment {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]IssueComment(nil), f.posted...)
+}
+
+// PullRequests returns every PR the fake holds.
+func (f *Fake) PullRequests() []PullRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]PullRequest(nil), f.pulls...)
+}
+
+// HasPullRequest reports whether an open PR exists for the head branch.
+func (f *Fake) HasPullRequest(repo, head string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, pr := range f.pulls {
+		if pr.Head == head {
+			return true
+		}
+	}
+	return false
+}
+
+// OpenPullRequestCount counts the open PRs for a head branch — the duplicate
+// the replay guard must keep at exactly one.
+func (f *Fake) OpenPullRequestCount(repo, head string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, pr := range f.pulls {
+		if pr.Head == head {
+			n++
+		}
+	}
+	return n
+}
+
+// handleCreatePullRequest mirrors POST /repos/{owner}/{repo}/pulls: 201 with
+// the created PR, 422 "A pull request already exists for ..." when the head
+// branch already carries an open PR.
+func (f *Fake) handleCreatePullRequest(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.requests++
+	f.lastAuth = r.Header.Get("Authorization")
+	failCode, failBody := f.failCode, f.failBody
+	f.mu.Unlock()
+
+	if failCode != 0 {
+		http.Error(w, failBody, failCode)
+		return
+	}
+
+	var in struct {
+		Title string `json:"title"`
+		Head  string `json:"head"`
+		Base  string `json:"base"`
+		Body  string `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, pr := range f.pulls {
+		if pr.Head == in.Head {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"message":"Validation Failed","errors":["A pull request already exists for %s."]}`, in.Head)))
+			return
+		}
+	}
+	pr := PullRequest{
+		Number: f.nextPR,
+		URL:    fmt.Sprintf("https://github.com/%s/%s/pull/%d", r.PathValue("owner"), r.PathValue("repo"), f.nextPR),
+		Head:   in.Head,
+		Base:   in.Base,
+		State:  "open",
+	}
+	f.nextPR++
+	f.pulls = append(f.pulls, pr)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(toWirePullRequest(pr))
+}
+
+// handleListPullRequests mirrors GET /repos/{owner}/{repo}/pulls with the
+// `head` (owner:branch) and `state` filters the duplicate-PR resolution uses.
+func (f *Fake) handleListPullRequests(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.requests++
+	failCode, failBody := f.failCode, f.failBody
+	pulls := append([]PullRequest(nil), f.pulls...)
+	f.mu.Unlock()
+
+	if failCode != 0 {
+		http.Error(w, failBody, failCode)
+		return
+	}
+
+	// head=owner:branch — the fake filters on the branch part.
+	headFilter := strings.TrimPrefix(r.URL.Query().Get("head"), r.PathValue("owner")+":")
+	state := r.URL.Query().Get("state")
+
+	wire := make([]wirePullRequest, 0, len(pulls))
+	for _, pr := range pulls {
+		if headFilter != "" && pr.Head != headFilter {
+			continue
+		}
+		if state != "" && state != "all" && pr.State != state {
+			continue
+		}
+		wire = append(wire, toWirePullRequest(pr))
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(wire)
+}
+
+func toWirePullRequest(pr PullRequest) wirePullRequest {
+	return wirePullRequest{
+		Number:  pr.Number,
+		HTMLURL: pr.URL,
+		State:   pr.State,
+		Head:    wireRef{Ref: pr.Head},
+		Base:    wireRef{Ref: pr.Base},
+	}
 }
 
 func (f *Fake) handleListIssueConversation(w http.ResponseWriter, r *http.Request) {
