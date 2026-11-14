@@ -15,7 +15,7 @@ import (
 // memBackend is an in-memory Backend for read-back tests: it promises the
 // byte-faithful write/read round trip the Backend contract requires.
 type memBackend struct {
-	mu sync.Mutex
+	mu    sync.Mutex
 	files map[string]map[string][]byte // workspace -> path -> content
 	// listedMissing are paths ListFiles reports but ReadFile refuses —
 	// modeling a file that vanishes between listing and read-back.
@@ -97,10 +97,10 @@ func TestReadWorkspaceState(t *testing.T) {
 			t.Fatalf("EnsureWorkspace failed: %v", err)
 		}
 		want := map[string][]byte{
-			"README.md":              []byte("# hello\n"),
-			"src/main.go":            []byte("package main\n"),
-			"src/deep/pkg/util.go":   []byte("package pkg\n"),
-			"docs/指南/中文.md":          []byte("中文内容\n"),
+			"README.md":            []byte("# hello\n"),
+			"src/main.go":          []byte("package main\n"),
+			"src/deep/pkg/util.go": []byte("package pkg\n"),
+			"docs/指南/中文.md":        []byte("中文内容\n"),
 		}
 		for path, content := range want {
 			if err := backend.WriteFile(ctx, ws, path, content); err != nil {

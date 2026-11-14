@@ -124,9 +124,9 @@ func (f *gitFixture) branchCommit(t *testing.T, branch string) (sha, parent, mes
 func TestPatcher(t *testing.T) {
 	t.Run("Given a baseline repo and a workspace state that modifies one file, adds one, deletes one and leaves a skipped binary untouched, when the patcher ships the ticket branch, assert that the pushed tree equals the workspace state byte for byte, the commit descends from the baseline, and the skipped path survives", func(t *testing.T) {
 		f := newGitFixture(t, map[string][]byte{
-			"a.txt":         []byte("original a\n"),
-			"dir/b.txt":     []byte("original b\n"),
-			"del.txt":       []byte("delete me\n"),
+			"a.txt":          []byte("original a\n"),
+			"dir/b.txt":      []byte("original b\n"),
+			"del.txt":        []byte("delete me\n"),
 			"assets/bin.dat": {0x00, 0x01, 0x02, 0xff},
 		})
 		state := map[string][]byte{

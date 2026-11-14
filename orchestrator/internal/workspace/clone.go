@@ -195,6 +195,12 @@ func authArgs() []string {
 // environment: no terminal prompts, and the token (when set) riding the
 // credential-helper environment variable — never argv, never disk.
 func gitRun(ctx context.Context, dir, token string, args ...string) ([]byte, error) {
+	return gitRunEnv(ctx, dir, token, nil, args...)
+}
+
+// gitRunEnv is gitRun with extra environment for the subprocess (e.g. the
+// deterministic commit dates the patcher pins).
+func gitRunEnv(ctx context.Context, dir, token string, extraEnv []string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -203,6 +209,7 @@ func gitRun(ctx context.Context, dir, token string, args ...string) ([]byte, err
 	if token != "" {
 		cmd.Env = append(cmd.Env, tokenEnvVar+"="+token)
 	}
+	cmd.Env = append(cmd.Env, extraEnv...)
 	return cmd.CombinedOutput()
 }
 

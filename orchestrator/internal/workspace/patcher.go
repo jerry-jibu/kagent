@@ -97,8 +97,11 @@ func NewPatcher(opts PatcherOptions) *Patcher {
 }
 
 // Patch applies req.State onto the baseline commit and pushes the ticket
-// branch. It is idempotent for replays: pushing the same commit twice is a
-// remote no-op ("Everything up-to-date").
+// branch. It is idempotent for replays: the commit's author/committer dates
+// are pinned to the baseline commit's committer date, so re-running Patch
+// with the same state produces the SAME commit SHA and the push is a remote
+// no-op ("Everything up-to-date") — a delivery retried after a lost receipt
+// never diverges the branch.
 func (p *Patcher) Patch(ctx context.Context, req PatchRequest) (PatchOutcome, error) {
 	if err := ValidateRepoURL(req.RepoURL); err != nil {
 		return PatchOutcome{}, err
@@ -158,13 +161,26 @@ func (p *Patcher) Patch(ctx context.Context, req PatchRequest) (PatchOutcome, er
 	if email == "" {
 		email = DefaultCommitterEmail
 	}
+	// Deterministic commit dates: derived from the baseline commit so a
+	// replayed Patch with the same state yields the same SHA (see the doc
+	// comment). Without this, each retry would mint a fresh timestamp and a
+	// diverged branch.
+	dateOut, err := gitRun(ctx, baseline.Dir, "", "log", "-1", "--format=%cI")
+	if err != nil {
+		return PatchOutcome{}, fmt.Errorf("failed to read the baseline commit date: %w: %s", err, tailOutput(dateOut))
+	}
+	baseDate := strings.TrimSpace(string(dateOut))
+	commitEnv := []string{
+		"GIT_AUTHOR_DATE=" + baseDate,
+		"GIT_COMMITTER_DATE=" + baseDate,
+	}
 	commitArgs := []string{
 		"-c", "user.name=" + name,
 		"-c", "user.email=" + email,
 		"-c", "commit.gpgsign=false",
 		"commit", "--quiet", "-m", req.Message,
 	}
-	if out, err := gitRun(ctx, baseline.Dir, "", commitArgs...); err != nil {
+	if out, err := gitRunEnv(ctx, baseline.Dir, "", commitEnv, commitArgs...); err != nil {
 		return PatchOutcome{}, fmt.Errorf("failed to commit the workspace delta: %w: %s", err, tailOutput(out))
 	}
 
