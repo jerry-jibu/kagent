@@ -88,7 +88,7 @@
 
 #### A1 模型层——已有，零改动
 
-仓库先例（`docs/env.md:61-62`）：ModelConfig `deepseek` = provider **Anthropic** + `baseUrl: https://api.deepseek.com/anthropic` + Secret（`kagent-deepseek`，存 ANTHROPIC_API_KEY）。0009 原型走的是 OpenAI 兼容（`api.deepseek.com/v1`），两条协议 DeepSeek 官方都提供；**P0 取仓库已验证的 Anthropic 变体**（D8）。不新增 ModelProvider 枚举：枚举改动会波及 API 类型、telemetry 映射、UI 表单，而 baseUrl 覆盖已达成同一效果；Ollama 目录与 telemetry 枚举里 deepseek 名字的覆盖是另一回事，不构成新增理由。
+仓库先例（`docs/env.md:61-62`）：ModelConfig `deepseek` = provider **Anthropic** + `baseUrl: https://api.deepseek.com/anthropic` + Secret（`kagent-deepseek`，存 ANTHROPIC_API_KEY）。0009 原型走的是 OpenAI 兼容（`api.deepseek.com/v1`），两条协议 DeepSeek 官方都提供；**P0 取仓库已验证的 Anthropic 变体**（D8）。注：byo-ext PR #2 官方模板（`examples/agent.yaml.tmpl`）给 DSH 配的是 **OpenAI 兼容**变体（provider OpenAI + `apiKeySecretKey: OPENAI_API_KEY`）——两种配对桥都能吃（ModelConfig 对 bridge 是不透明配置），P0 维持 Anthropic 变体因集群已有验证过的 Secret/ModelConfig 零新增；若 DSH 侧 OTLP usage 校验要求特定 provider 配对再按模板切换。不新增 ModelProvider 枚举：枚举改动会波及 API 类型、telemetry 映射、UI 表单，而 baseUrl 覆盖已达成同一效果；Ollama 目录与 telemetry 枚举里 deepseek 名字的覆盖是另一回事，不构成新增理由。
 
 #### A2 harness 层——BYO 起步（D7，核心决策）
 
@@ -110,9 +110,9 @@
 
 0009 §4 三通道中，superagent 的 attention 流（0001 §4.2：回复引用原 task 送决策）**只能依赖通道 2（受保护 MCP）**：通道 1（原生 ACP 权限）活不过 DATA 快照/进程替换，通道 3（外部审批服务）不保原 task 连续。落地含义：**worker 的 agentfs/MCP 工具清单里，需要"等人后继续原工单"语义的操作必须标 `requireApproval:true`**；纯 DSH 内置工具的权限请求（通道 1）在编排模式下只能作为可丢弃的交互（交互模式 CUJ 2 里没问题，编排模式里 Engine 视其为 unresolved 转 needs-attention）。这一条写进 worker 的 template 约定，是 0001 "bridge 契约"的具体化。
 
-#### A4 打包与分发
+#### A4 打包与分发（出处已锚定）
 
-DSH BYO 镜像（byo-ext PR #2 产物：Go bridge + Node DSH 双运行时）由本仓库构建流水线产出、push 到 registry、digest 钉死写进 Harness CR。**helm 无需任何改动**——BYO 镜像引用随 CR 走，不进 `HarnessImagesConfig`（那是内置类型默认镜像的机制，`helm/kagent/values.yaml:153-156`）。`Harness.Spec.Env` 只收字面量（secret ref 被显式推迟，`runtime_types.go:8-20`）——与"bridge 零凭证"契约一致，无需放宽。
+DSH BYO 镜像源码：上游 `kagent-dev/byo-ext` 仓库的 **PR #2「Add DeepSeek Harness」**（<https://github.com/kagent-dev/byo-ext/pull/2>，分支 `pull/2/head`；本地已取为 `pr-2` 分支检出）。**该 PR 未合入上游 main**——main 只含社区 harness 脚手架（`templates/harness/Dockerfile`），`harnesses/deepseek/`（Go bridge + Node DSH 双运行时，自带 `Dockerfile` 与 `VERIFICATION.md`）仅存在于 PR 分支。镜像从 PR 分支的 `harnesses/deepseek/Dockerfile` 构建，push 到 registry、digest 钉死写进 Harness CR；**构建归属 agent-data-workspace 的流水线**（kagent 仓库零 diff 不受影响）。我们的三份 manifest 以其 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本——该模板同时示范了实际字段名：`apiKeySecret`/`apiKeySecretKey`、`workerPoolRef.name`/`snapshotPolicy.location`。**helm 无需任何改动**——BYO 镜像引用随 CR 走，不进 `HarnessImagesConfig`（那是内置类型默认镜像的机制，`helm/kagent/values.yaml:153-156`）。`Harness.Spec.Env` 只收字面量（secret ref 被显式推迟，`runtime_types.go:8-20`）——与"bridge 零凭证"契约一致，无需放宽。
 
 ### 2. 对外使用面：两模式 × 四入口
 
@@ -245,6 +245,7 @@ sequenceDiagram
 
 *   [0001-superagent-on-kagent-编排层设计](./0001-superagent-on-kagent-编排层设计.md)（编排层，本文的上游）
 *   `0009 — DSH BYO 集成与执行链`（BYO 契约/三审批通道/红线）
+*   byo-ext PR #2（DSH BYO 桥源码与官方 manifest 模板，未合入上游 main）：https://github.com/kagent-dev/byo-ext/pull/2（本地已取 `pr-2` 分支）
 *   kagent 仓库实读（2026-11-14）：`go/api/v1alpha3/harness_types.go`、`go/core/internal/translator/compiler.go`、`go/core/internal/controller/reconciler.go`、`ui/src/`（router/api/appExtensions）、`docs/env.md`
 
 ### Future Improvements
@@ -262,12 +263,12 @@ sequenceDiagram
 #### 1. `deploy/kagent/modelconfig-deepseek.yaml` (Create)
 
 *   **Type / Scope**: k8s manifest（ModelConfig + Secret 引用模板）。
-*   **Proposed Changes**: Anthropic provider + `baseUrl: https://api.deepseek.com/anthropic` + `apiKeySecretRef`（A1 先例）；Secret 值不入库，README 指向创建命令。
+*   **Proposed Changes**: Anthropic provider + `baseUrl: https://api.deepseek.com/anthropic` + `apiKeySecret`/`apiKeySecretKey`（实际字段名；byo-ext 模板同款键位，provider/baseUrl 换 Anthropic 变体）；Secret 值不入库，README 指向创建命令。
 
 #### 2. `deploy/kagent/harness-dsh-byo.yaml` (Create)
 
 *   **Type / Scope**: k8s manifest（Harness CR）。
-*   **Proposed Changes**: `spec.byo:{}` + `workload.image`（digest 钉死占位）+ `workload.command: [/usr/local/bin/kagent-dsh-byo]` + `env` 字面量白名单 + `substrate`（WorkerPoolRef/SnapshotLocation 按 env.md 部署惯例）。零 CRD 扩展。
+*   **Proposed Changes**: `spec.byo:{}` + `workload.image`（digest 钉死占位）+ `workload.command: [/usr/local/bin/kagent-dsh-byo]` + `env` 字面量白名单 + `substrate.workerPoolRef.name`/`snapshotPolicy.location`（实际键名；值按 env.md 部署惯例：`kagent-default` / 既有快照位置）。**以 byo-ext PR #2 的 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本**（provider/baseUrl 按本文 A1 换 Anthropic 变体）。零 CRD 扩展。
 
 #### 3. `deploy/kagent/agent-worker.yaml`、`agent-evaluator.yaml` (Create)
 
@@ -290,7 +291,7 @@ sequenceDiagram
 
 1. `go/api/v1alpha3/harness_types.go` — `DeepSeekHarness` 空结构体 + spec 字段 + CEL ExactlyOneOf 五选一（仿 :131-161）。
 2. `go/core/internal/translator/compiler.go` — `HarnessTypeDeepSeek` 常量（:32-37）+ `harnessType()` case（:187-200）。
-3. `go/core/internal/translator/deepseek/compiler.go` (Create) — 实现 `HarnessCompiler`，本质是 BYO 编译器 + 默认镜像/校验。
+3. `go/core/internal/translator/deepseek/compiler.go` (Create) — 实现 `HarnessCompiler`，本质是 BYO 编译器 + 默认镜像/校验；上游 byo-ext main 的 `templates/harness/` 脚手架是社区 harness 的官方形态，一等化时对齐。
 4. `go/core/internal/controller/reconciler.go` — 注册表接线（:141-145）。
 5. `go/core/internal/translator/images.go` + proto `HarnessImagesConfig` — 默认镜像。
 6. `helm/kagent/templates/_helpers.tpl` + `files/builtin-harness-images.json` — 打包列表（:8）。
