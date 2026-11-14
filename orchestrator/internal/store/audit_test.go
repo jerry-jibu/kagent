@@ -48,7 +48,7 @@ func TestFailTicket(t *testing.T) {
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatalf("migrate failed: %v", err)
 		}
-		seedTicket(t, s, "ticket-f1", "accepted")
+		seedTicket(t, s, "ticket-f1", store.TicketStatusPending)
 
 		err := s.FailTicket(ctx, "ticket-f1", "shallow clone failed: remote branch gone")
 		if err != nil {
@@ -105,7 +105,7 @@ func TestFailTicket(t *testing.T) {
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatalf("migrate failed: %v", err)
 		}
-		seedTicket(t, s, "ticket-f2", "accepted")
+		seedTicket(t, s, "ticket-f2", store.TicketStatusPending)
 
 		if err := s.FailTicket(ctx, "ticket-f2", "first failure"); err != nil {
 			t.Fatalf("first FailTicket failed: %v", err)
@@ -131,7 +131,7 @@ func TestRecordAudit(t *testing.T) {
 		if err := s.Migrate(ctx); err != nil {
 			t.Fatalf("migrate failed: %v", err)
 		}
-		seedTicket(t, s, "ticket-a1", "accepted")
+		seedTicket(t, s, "ticket-a1", store.TicketStatusPending)
 
 		if err := s.RecordAudit(ctx, "ticket-a1", "workspace.materialized", map[string]any{
 			"workspace": "ticket-a1", "base_commit": "abc123", "files": 42,

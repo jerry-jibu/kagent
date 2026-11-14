@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,11 +15,20 @@ import (
 // Transport is the orchestrator's GitHub seam (spec: GitHubTransport): the
 // only place external GitHub state enters the control plane. Production
 // implementations dial the GitHub API; tests inject a Fake-backed transport.
+// Read side (Sources) and write side (Outbox Channels) share the interface:
+// the orchestrator holds the only GitHub credentials (docs/designs/0001 §7).
 type Transport interface {
 	// PollIssueComments returns issue comments of repo updated at or after
 	// since, oldest first, at most limit. A zero since reads from the
 	// beginning of the repository's history.
 	PollIssueComments(ctx context.Context, repo string, since time.Time, limit int) ([]IssueComment, error)
+	// IssueComments returns the current comments of one issue conversation,
+	// oldest first. The Outbox GitHub channel reads a conversation before
+	// posting to detect its own earlier deliveries (deterministic marker).
+	IssueComments(ctx context.Context, repo string, issue int) ([]IssueComment, error)
+	// PostIssueComment posts one comment on the issue conversation and
+	// returns the created comment's server-assigned id.
+	PostIssueComment(ctx context.Context, repo string, issue int, body string) (int64, error)
 }
 
 // TransportConfig configures the production HTTP transport.
@@ -196,4 +206,112 @@ func issueNumberFromURL(issueURL string) (int, error) {
 		return 0, err
 	}
 	return number, nil
+}
+
+// IssueComments walks the issue-conversation pages (per_page at the API
+// ceiling) until a short page ends the listing.
+func (t *httpTransport) IssueComments(ctx context.Context, repo string, issue int) ([]IssueComment, error) {
+	var out []IssueComment
+	for page := 1; ; page++ {
+		wire, lastPage, err := t.issueCommentsPage(ctx, repo, issue, page)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, wire...)
+		if !lastPage {
+			return out, nil
+		}
+	}
+}
+
+// issueCommentsPage fetches one page of an issue's comments; lastPage reports
+// whether this page was full (i.e. a next page may exist).
+func (t *httpTransport) issueCommentsPage(ctx context.Context, repo string, issue, page int) ([]IssueComment, bool, error) {
+	q := url.Values{}
+	q.Set("per_page", strconv.Itoa(githubMaxPerPage))
+	q.Set("page", strconv.Itoa(page))
+
+	endpoint := fmt.Sprintf("%s/repos/%s/issues/%d/comments?%s", t.base, repo, issue, q.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to build comment list request for %s#%d: %w", repo, issue, err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if t.token != "" {
+		req.Header.Set("Authorization", "Bearer "+t.token)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, false, fmt.Errorf("comment list request to %s failed: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, false, fmt.Errorf("comment list request to %s failed: HTTP %d", endpoint, resp.StatusCode)
+	}
+
+	var wire []wireComment
+	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
+		return nil, false, fmt.Errorf("failed to decode comment list response from %s: %w", endpoint, err)
+	}
+
+	comments := make([]IssueComment, 0, len(wire))
+	for _, wc := range wire {
+		number, err := issueNumberFromURL(wc.IssueURL)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to parse issue reference %q: %w", wc.IssueURL, err)
+		}
+		comments = append(comments, IssueComment{
+			ID:          wc.ID,
+			IssueNumber: number,
+			Author:      wc.User.Login,
+			Body:        wc.Body,
+			CreatedAt:   wc.CreatedAt,
+			UpdatedAt:   wc.UpdatedAt,
+			URL:         wc.HTMLURL,
+		})
+	}
+	return comments, len(wire) == githubMaxPerPage, nil
+}
+
+// PostIssueComment posts one comment on the issue conversation via
+// POST /repos/{owner}/{repo}/issues/{number}/comments and returns the created
+// comment's id.
+func (t *httpTransport) PostIssueComment(ctx context.Context, repo string, issue int, body string) (int64, error) {
+	endpoint := fmt.Sprintf("%s/repos/%s/issues/%d/comments", t.base, repo, issue)
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return 0, fmt.Errorf("failed to encode comment body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return 0, fmt.Errorf("failed to build comment post request for %s#%d: %w", repo, issue, err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if t.token != "" {
+		req.Header.Set("Authorization", "Bearer "+t.token)
+	}
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("comment post request to %s failed: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("comment post request to %s failed: HTTP %d", endpoint, resp.StatusCode)
+	}
+
+	var created wireComment
+	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
+		return 0, fmt.Errorf("failed to decode comment post response from %s: %w", endpoint, err)
+	}
+	if created.ID == 0 {
+		return 0, fmt.Errorf("comment post response from %s carries no comment id", endpoint)
+	}
+	return created.ID, nil
 }

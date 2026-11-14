@@ -85,7 +85,7 @@ func newFlowFixture(t *testing.T, ticketID, branch, token string) (*store.Store,
 		Backend: workspace.NewAgentfsBackend(fake.endpoint()),
 		Store:   s,
 	})
-	seedTicket(t, s, ticketID, "accepted")
+	seedTicket(t, s, ticketID, store.TicketStatusPending)
 	return s, fake, m
 }
 
@@ -142,8 +142,8 @@ func TestMaterializeTicketWorkspace(t *testing.T) {
 		if err != nil {
 			t.Fatalf("TicketStatus failed: %v", err)
 		}
-		if status != "accepted" {
-			t.Fatalf("ticket status = %q, want unchanged accepted", status)
+		if status != store.TicketStatusPending {
+			t.Fatalf("ticket status = %q, want unchanged pending", status)
 		}
 	})
 

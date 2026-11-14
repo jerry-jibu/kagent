@@ -160,6 +160,108 @@ func TestTransportPollIssueComments(t *testing.T) {
 	})
 }
 
+func TestTransportWriteIssueComments(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Given a fake GitHub, when the transport posts an issue comment, assert that the comment appears on the issue and the created id comes back", func(t *testing.T) {
+		fake := github.NewFake()
+		defer fake.Close()
+
+		tr := github.NewTransport(github.TransportConfig{BaseURL: fake.URL()})
+		id, err := tr.PostIssueComment(ctx, "acme/api", 42, "Acknowledged — ticket-abc started.")
+		if err != nil {
+			t.Fatalf("post failed: %v", err)
+		}
+		if id <= 0 {
+			t.Fatalf("want a server-assigned comment id, got %d", id)
+		}
+
+		posted := fake.PostedComments()
+		if len(posted) != 1 {
+			t.Fatalf("want exactly one posted comment, got %d", len(posted))
+		}
+		if posted[0].IssueNumber != 42 {
+			t.Fatalf("comment landed on issue %d, want 42", posted[0].IssueNumber)
+		}
+		if posted[0].Body != "Acknowledged — ticket-abc started." {
+			t.Fatalf("body = %q, want the posted text verbatim", posted[0].Body)
+		}
+		if posted[0].ID != id {
+			t.Fatalf("posted comment id %d does not match the returned id %d", posted[0].ID, id)
+		}
+	})
+
+	t.Run("Given an issue holding several comments, when the transport lists that issue's comments, assert that only that conversation's comments come back oldest first", func(t *testing.T) {
+		fake := github.NewFake()
+		defer fake.Close()
+		base := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+		other := github.IssueComment{ID: 1, IssueNumber: 7, Author: "eve", Body: "unrelated", CreatedAt: base, UpdatedAt: base}
+		first := github.IssueComment{ID: 2, IssueNumber: 42, Author: "alice", Body: "first", CreatedAt: base.Add(time.Second), UpdatedAt: base.Add(time.Second)}
+		second := github.IssueComment{ID: 3, IssueNumber: 42, Author: "bob", Body: "second", CreatedAt: base.Add(2 * time.Second), UpdatedAt: base.Add(2 * time.Second)}
+		fake.AddComments([]github.IssueComment{second, other, first}) // scripted out of order
+
+		tr := github.NewTransport(github.TransportConfig{BaseURL: fake.URL()})
+		got, err := tr.IssueComments(ctx, "acme/api", 42)
+		if err != nil {
+			t.Fatalf("list failed: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("want only issue 42's two comments, got %d: %+v", len(got), got)
+		}
+		if got[0].ID != first.ID || got[1].ID != second.ID {
+			t.Fatalf("want [first second] oldest first, got [%d %d]", got[0].ID, got[1].ID)
+		}
+	})
+
+	t.Run("Given more than one page of comments on one issue, when the transport lists that issue's comments, assert that it walks every page oldest first", func(t *testing.T) {
+		fake := github.NewFake()
+		defer fake.Close()
+		base := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+		var scripted []github.IssueComment
+		for i := range 101 {
+			scripted = append(scripted, github.IssueComment{
+				ID:          int64(10 + i),
+				IssueNumber: 42,
+				Author:      "alice",
+				Body:        fmt.Sprintf("c%d", i),
+				CreatedAt:   base.Add(time.Duration(i) * time.Second),
+				UpdatedAt:   base.Add(time.Duration(i) * time.Second),
+			})
+		}
+		fake.AddComments(scripted)
+
+		tr := github.NewTransport(github.TransportConfig{BaseURL: fake.URL()})
+		got, err := tr.IssueComments(ctx, "acme/api", 42)
+		if err != nil {
+			t.Fatalf("list failed: %v", err)
+		}
+		if len(got) != 101 {
+			t.Fatalf("want all 101 comments across pages, got %d", len(got))
+		}
+		if got[0].ID != 10 || got[100].ID != 110 {
+			t.Fatalf("want the full conversation oldest first, got first %d last %d", got[0].ID, got[100].ID)
+		}
+	})
+
+	t.Run("Given a failing GitHub, when the transport posts an issue comment, assert that the failure surfaces as an error naming the status and nothing is recorded", func(t *testing.T) {
+		fake := github.NewFake()
+		defer fake.Close()
+		fake.FailWith(http.StatusForbidden, `{"message":"Resource not accessible by integration"}`)
+
+		tr := github.NewTransport(github.TransportConfig{BaseURL: fake.URL()})
+		_, err := tr.PostIssueComment(ctx, "acme/api", 42, "should never land")
+		if err == nil {
+			t.Fatal("post must fail on a non-2xx response")
+		}
+		if !strings.Contains(err.Error(), "403") {
+			t.Fatalf("error must name the status, got: %v", err)
+		}
+		if len(fake.PostedComments()) != 0 {
+			t.Fatalf("a failed post must not record a comment, got %+v", fake.PostedComments())
+		}
+	})
+}
+
 func TestTriggerIdentity(t *testing.T) {
 	t.Run("Given an issue comment, when asked for its trigger identity, assert that the id is the immutable comment id under its kind", func(t *testing.T) {
 		c := github.IssueComment{ID: 987654, IssueNumber: 42}

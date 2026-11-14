@@ -9,6 +9,7 @@ import (
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/a2a"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/gate"
+	"github.com/jerry-jibu/kagent/orchestrator/internal/github"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/intake"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/policy"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/store"
@@ -17,6 +18,12 @@ import (
 // DefaultInvokeTimeout bounds one evaluator invoke. The evaluator is an
 // agent turn — bounded, but not instant.
 const DefaultInvokeTimeout = 60 * time.Second
+
+// DefaultEvaluateBatch caps how many pending triggers one EvaluatePending
+// cycle judges. A poison trigger (a payload the decode contract rejects)
+// stays pending and is retried every cycle; the bound keeps one bad trigger
+// from turning a cycle into an unbounded retry storm.
+const DefaultEvaluateBatch = 50
 
 // Engine is the eval slice of the control-plane writer (docs/designs/0001
 // §3: Eval = Gate + Assessment; spec: Engine 唯一写者). For one ingested
@@ -32,6 +39,45 @@ type Engine struct {
 // NewEngine wires the Engine to its store and evaluator.
 func NewEngine(st *store.Store, evaluator *Evaluator) *Engine {
 	return &Engine{store: st, evaluator: evaluator}
+}
+
+// EvalStats reports what one EvaluatePending cycle judged.
+type EvalStats struct {
+	// Evaluated counts triggers driven to a terminal decision this cycle.
+	Evaluated int
+	// Tickets counts accepted tickets created this cycle.
+	Tickets int
+	// Outcomes counts persisted decisions by outcome.
+	Outcomes map[string]int
+}
+
+// EvaluatePending judges every trigger of a source that still owes a
+// decision (docs/designs/0001 §8 failure semantics: unavailable records are
+// retryable; terminal decisions are never re-evaluated). One failing trigger
+// does not block the others — its error is collected and the cycle returns a
+// joined error, so a poison payload stays loud without starving the queue.
+func (e *Engine) EvaluatePending(ctx context.Context, source string, pol policy.Policy, limit int) (EvalStats, error) {
+	triggers, err := e.store.PendingTriggers(ctx, source, limit)
+	if err != nil {
+		return EvalStats{}, fmt.Errorf("failed to read pending triggers for %s: %w", source, err)
+	}
+
+	var stats EvalStats
+	stats.Outcomes = map[string]int{}
+	var errs []error
+	for _, tr := range triggers {
+		dec, err := e.EvaluateTrigger(ctx, source, tr, pol)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("trigger %s/%s: %w", source, tr.DeterministicID, err))
+			continue
+		}
+		stats.Evaluated++
+		stats.Outcomes[dec.Outcome]++
+		if dec.Outcome == store.DecisionAccept {
+			stats.Tickets++
+		}
+	}
+	return stats, errors.Join(errs...)
 }
 
 // EvaluateTrigger runs the full eval chain for one ingested trigger and
@@ -82,6 +128,12 @@ func (e *Engine) EvaluateTrigger(ctx context.Context, source string, tr store.Tr
 	}
 	dec, err := e.evaluator.Evaluate(ctx, in)
 	switch {
+	case err == nil && dec.Outcome == store.DecisionAccept:
+		// The accept transition: decision, ticket, assignment and the queued
+		// confirmation comment all commit in one transaction
+		// (docs/designs/0001 §6 — this is the Engine's sole-writer duty T4
+		// delivers).
+		return e.accept(ctx, source, tr, pl, verdict, dec, pol)
 	case err == nil:
 		// Persist the GATE-verified strength and policy version — the
 		// Decision's echoed values were validated to be identical, and for
@@ -122,6 +174,99 @@ func (e *Engine) record(ctx context.Context, source, deterministicID string, in 
 			in.Outcome, source, deterministicID, err)
 	}
 	return dec, nil
+}
+
+// accept performs the full accept transition (docs/designs/0001 §6): the
+// accept decision, the ticket with its mandate (policy hash + sender +
+// scope + strength), the pending assignment, and the confirmation-comment
+// effect commit together or not at all. The effect is delivered by the
+// outbox channel only after the commit, so any failure here leaves neither a
+// half-built ticket nor an outward comment.
+func (e *Engine) accept(ctx context.Context, source string, tr store.Trigger, pl intake.CommentPayload,
+	verdict gate.Verdict, dec Decision, pol policy.Policy) (store.Decision, error) {
+
+	mandate := store.Mandate{
+		PolicyVersion: pol.Version,
+		Strength:      verdict.Strength,
+		Sender:        pl.Author,
+		Scope:         store.MandateScope{Repo: pl.Repo, Issue: pl.Issue},
+	}
+	decisionIn := store.DecisionInput{
+		Outcome:       store.DecisionAccept,
+		Strength:      verdict.Strength,
+		PolicyVersion: pol.Version,
+		Reason:        dec.Reason,
+	}
+	ticketID := store.TicketIDForTrigger(source, tr.DeterministicID)
+	effect, err := confirmationEffect(ticketID, mandate)
+	if err != nil {
+		return store.Decision{}, fmt.Errorf("failed to build the confirmation effect for ticket %s: %w", ticketID, err)
+	}
+
+	created, err := e.store.CreateTicket(ctx, store.TicketInput{
+		Source:          source,
+		DeterministicID: tr.DeterministicID,
+		ThreadKey:       tr.ThreadKey,
+		Decision:        decisionIn,
+		Mandate:         mandate,
+		Effects:         []store.OutboxEffect{effect},
+	})
+	if err != nil {
+		// A racing replay (accept already recorded) rolled back whole: the
+		// committed ticket stands, this call is a no-op observer.
+		if errors.Is(err, store.ErrDuplicateAccept) {
+			latest, found, err := e.store.TriggerDecision(ctx, source, tr.DeterministicID)
+			if err == nil && found {
+				return latest, nil
+			}
+		}
+		return store.Decision{}, fmt.Errorf("failed to create the ticket for trigger %s/%s: %w",
+			source, tr.DeterministicID, err)
+	}
+	return created.Decision, nil
+}
+
+// confirmEffectKey is the outbox idempotency key of a ticket's confirmation
+// comment: one ticket owes exactly one acknowledgment, whatever replays.
+func confirmEffectKey(ticketID string) string {
+	return "confirm:" + ticketID
+}
+
+// confirmationEffect builds the queued GitHub confirmation-comment effect for
+// a freshly accepted ticket: it addresses the original issue, carries the
+// ticket id, and embeds the deterministic marker the channel's receipt
+// idempotency relies on (docs/designs/0001 §6).
+func confirmationEffect(ticketID string, mandate store.Mandate) (store.OutboxEffect, error) {
+	body := fmt.Sprintf(
+		"Acknowledged — opened ticket `%s` to work on this request (requested by @%s, policy %s).\n"+
+			"Progress and results will be reported in this thread.\n\n%s",
+		ticketID, mandate.Sender, shortHash(mandate.PolicyVersion),
+		github.EffectMarker(confirmEffectKey(ticketID)))
+
+	payload, err := json.Marshal(github.IssueCommentEffect{
+		Kind:  github.EffectKindIssueComment,
+		Repo:  mandate.Scope.Repo,
+		Issue: mandate.Scope.Issue,
+		Body:  body,
+	})
+	if err != nil {
+		return store.OutboxEffect{}, err
+	}
+	return store.OutboxEffect{
+		Channel:        github.ChannelGitHub,
+		Address:        fmt.Sprintf("%s#%d", mandate.Scope.Repo, mandate.Scope.Issue),
+		IdempotencyKey: confirmEffectKey(ticketID),
+		Payload:        payload,
+	}, nil
+}
+
+// shortHash truncates a policy version hash for display. The full hash lives
+// in the mandate and the policy table; the comment only shows a fingerprint.
+func shortHash(version string) string {
+	if len(version) > 12 {
+		return version[:12]
+	}
+	return version
 }
 
 // Input is everything the evaluator needs to judge one trigger: the trigger

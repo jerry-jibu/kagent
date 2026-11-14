@@ -122,7 +122,7 @@ func TestIngestSightline(t *testing.T) {
 		ctx := context.Background()
 		mustMigrateInternal(t, s)
 		s.seedThreadForTest(t, source, "issue:2", stale)
-		s.insertTicketForTest(t, "ticket-1", source, "issue:2", "open")
+		s.insertTicketForTest(t, "ticket-1", source, "issue:2", TicketStatusPending)
 
 		stats, err := s.IngestEvents(ctx, SourceRef{Name: source, Kind: "github"}, []Event{
 			{ThreadKey: "issue:2", DeterministicID: "issue-comment:4", Payload: []byte(`{}`), OccurredAt: fresh},

@@ -106,11 +106,46 @@ func (f *engineFixture) acceptEcho(reason string) {
 	f.transport.Script("evaluator", raw)
 }
 
+// mustTrigger reads back the stored trigger row of one deterministic id, for
+// tests that seed several triggers and drive a single one directly.
+func (f *engineFixture) mustTrigger(t *testing.T, source, deterministicID string) store.Trigger {
+	t.Helper()
+	triggers, err := f.store.Triggers(context.Background(), source)
+	if err != nil {
+		t.Fatalf("failed to read triggers: %v", err)
+	}
+	for _, tr := range triggers {
+		if tr.DeterministicID == deterministicID {
+			return tr
+		}
+	}
+	t.Fatalf("trigger %s/%s not found after seeding", source, deterministicID)
+	return store.Trigger{}
+}
+
 func (f *engineFixture) decisions(t *testing.T, source string) []store.Decision {
 	t.Helper()
 	rows, err := f.store.Decisions(context.Background(), source)
 	if err != nil {
 		t.Fatalf("failed to read decisions: %v", err)
+	}
+	return rows
+}
+
+func (f *engineFixture) tickets(t *testing.T) []store.Ticket {
+	t.Helper()
+	rows, err := f.store.Tickets(context.Background())
+	if err != nil {
+		t.Fatalf("failed to read tickets: %v", err)
+	}
+	return rows
+}
+
+func (f *engineFixture) effects(t *testing.T) []store.Effect {
+	t.Helper()
+	rows, err := f.store.Effects(context.Background())
+	if err != nil {
+		t.Fatalf("failed to read effects: %v", err)
 	}
 	return rows
 }
@@ -151,6 +186,50 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 		}
 		if got.ID != dec.ID {
 			t.Fatalf("returned decision %+v does not match the persisted row %+v", dec, got)
+		}
+
+		// The accept transition commits the whole ticket in the same
+		// transaction as the decision (docs/designs/0001 §6): ticket with
+		// mandate, pending assignment, and the queued confirmation effect.
+		tickets := f.tickets(t)
+		if len(tickets) != 1 {
+			t.Fatalf("tickets = %+v, want exactly the accepted ticket", tickets)
+		}
+		tk := tickets[0]
+		if tk.ID != store.TicketIDForTrigger(source, tr.DeterministicID) {
+			t.Fatalf("ticket id %q is not the deterministic one for the trigger", tk.ID)
+		}
+		if tk.Status != store.TicketStatusPending {
+			t.Fatalf("ticket status = %q, want pending", tk.Status)
+		}
+		if tk.Mandate.Sender != "alice" || tk.Mandate.Strength != policy.StrengthExplicit ||
+			tk.Mandate.PolicyVersion != f.pol.Version ||
+			tk.Mandate.Scope != (store.MandateScope{Repo: "acme/api", Issue: 42}) {
+			t.Fatalf("mandate = %+v, want policy hash + sender + scope + strength", tk.Mandate)
+		}
+		assignments, err := f.store.Assignments(context.Background(), tk.ID)
+		if err != nil {
+			t.Fatalf("Assignments failed: %v", err)
+		}
+		if len(assignments) != 1 || assignments[0].Status != "pending" || assignments[0].TaskID != nil {
+			t.Fatalf("assignments = %+v, want exactly one pending assignment with no task", assignments)
+		}
+		effects := f.effects(t)
+		if len(effects) != 1 || effects[0].State != store.EffectPending {
+			t.Fatalf("effects = %+v, want exactly one pending confirmation effect", effects)
+		}
+		confirm, err := github.ParseIssueCommentEffect(effects[0].Payload)
+		if err != nil {
+			t.Fatalf("confirmation effect payload does not decode: %v", err)
+		}
+		if confirm.Repo != "acme/api" || confirm.Issue != 42 {
+			t.Fatalf("confirmation effect targets %s#%d, want the original issue", confirm.Repo, confirm.Issue)
+		}
+		if !strings.Contains(confirm.Body, tk.ID) {
+			t.Fatalf("confirmation body %q must carry the ticket id", confirm.Body)
+		}
+		if !strings.Contains(confirm.Body, github.EffectMarker(effects[0].IdempotencyKey)) {
+			t.Fatalf("confirmation body must embed the deterministic marker for its idempotency key")
 		}
 
 		// The evaluator invoke is the assessment input contract: the agent
@@ -196,6 +275,9 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 		if f.transport.CallCount("evaluator") != 0 {
 			t.Fatalf("a denied trigger must never reach the evaluator, got %d invokes",
 				f.transport.CallCount("evaluator"))
+		}
+		if tickets := f.tickets(t); len(tickets) != 0 {
+			t.Fatalf("a denial must never create a ticket, got %+v", tickets)
 		}
 	})
 
@@ -348,6 +430,12 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 		if rows := f.decisions(t, source); len(rows) != 1 {
 			t.Fatalf("decisions = %d rows, want the single accept", len(rows))
 		}
+		if tickets := f.tickets(t); len(tickets) != 1 {
+			t.Fatalf("tickets = %d rows, want the single accepted ticket across both runs", len(tickets))
+		}
+		if effects := f.effects(t); len(effects) != 1 {
+			t.Fatalf("effects = %d rows, want exactly the one confirmation", len(effects))
+		}
 	})
 
 	t.Run("Given an evaluator that returns ignore for insufficient evidence, when the trigger is evaluated, assert that an ignore decision carrying the gate strength and reason is persisted", func(t *testing.T) {
@@ -368,6 +456,39 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 		}
 		if rows[0].Reason != "insufficient evidence to act" {
 			t.Fatalf("reason = %q, want the evaluator's reason", rows[0].Reason)
+		}
+		if tickets := f.tickets(t); len(tickets) != 0 {
+			t.Fatalf("an ignore decision must never create a ticket, got %+v", tickets)
+		}
+		if effects := f.effects(t); len(effects) != 0 {
+			t.Fatalf("no confirmation comment is owed without a ticket, got %+v", effects)
+		}
+	})
+
+	t.Run("Given an evaluator that returns stop for an explicit sender, when the trigger is evaluated, assert that no ticket and no confirmation effect exist and the reason is persisted", func(t *testing.T) {
+		f := newEngineFixture(t)
+		f.transport.Script("evaluator", `{"outcome":"stop","reason":"request is ambiguous, waiting for the author"}`)
+		source, tr := f.seedTrigger(t, addressedComment("acme/api"))
+
+		if _, err := f.engine.EvaluateTrigger(context.Background(), source, tr, f.pol); err != nil {
+			t.Fatalf("EvaluateTrigger failed: %v", err)
+		}
+
+		if tickets := f.tickets(t); len(tickets) != 0 {
+			t.Fatalf("a stop decision must never create a ticket, got %+v", tickets)
+		}
+		if effects := f.effects(t); len(effects) != 0 {
+			t.Fatalf("no confirmation comment is owed without a ticket, got %+v", effects)
+		}
+		rows := f.decisions(t, source)
+		if len(rows) != 1 || rows[0].Outcome != store.DecisionStop {
+			t.Fatalf("decisions = %+v, want exactly the stop record", rows)
+		}
+		if rows[0].Reason != "request is ambiguous, waiting for the author" {
+			t.Fatalf("stop reason = %q, want the evaluator's judgment persisted", rows[0].Reason)
+		}
+		if rows[0].Strength != policy.StrengthExplicit {
+			t.Fatalf("stop record strength = %q, want the gate-verified strength", rows[0].Strength)
 		}
 	})
 
@@ -414,6 +535,125 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 		}
 		if rows := f.decisions(t, source); len(rows) != 0 {
 			t.Fatalf("decisions = %+v, want no record for a payload the contract cannot decode", rows)
+		}
+	})
+}
+
+func TestEngineEvaluatePending(t *testing.T) {
+	ctx := context.Background()
+
+	// addressedComment builds the canonical authorized trigger: explicit
+	// sender alice, @bot mention, allowlisted repo.
+	addressedComment := func(commentID int64, body string) intake.CommentPayload {
+		pl := comment("alice", body, "acme/api")
+		pl.CommentID = commentID
+		return pl
+	}
+	// ingest ingests one trigger through the real ingest path without the
+	// single-row read-back assertion of seedTrigger (these tests seed
+	// several triggers on one source).
+	ingest := func(t *testing.T, f *engineFixture, pl intake.CommentPayload) string {
+		t.Helper()
+		raw, err := json.Marshal(pl)
+		if err != nil {
+			t.Fatalf("failed to encode trigger payload: %v", err)
+		}
+		source := github.SourceName(pl.Repo)
+		if _, err := f.store.IngestEvents(context.Background(),
+			store.SourceRef{Name: source, Kind: "github"},
+			[]store.Event{{
+				ThreadKey:       fmt.Sprintf("issue:%d", pl.Issue),
+				DeterministicID: fmt.Sprintf("issue-comment:%d", pl.CommentID),
+				Payload:         raw,
+				OccurredAt:      pl.CreatedAt,
+			}}, intake.DefaultSightline); err != nil {
+			t.Fatalf("failed to ingest trigger: %v", err)
+		}
+		return source
+	}
+
+	t.Run("Given two pending triggers on a source, when EvaluatePending runs, assert that both are judged, the accepted one mints a ticket and the cycle reports what it did", func(t *testing.T) {
+		f := newEngineFixture(t)
+		f.transport.Script("evaluator",
+			`{"outcome":"ignore","reason":"not a task"}`,
+			fmt.Sprintf(`{"outcome":"accept","strength":"explicit","policy_version":%q,"reason":"a task"}`, f.pol.Version))
+		source1 := ingest(t, f, addressedComment(2001, "@acme-bot what is this issue about?"))
+		source2 := ingest(t, f, addressedComment(2002, "@acme-bot please fix the flaky login test"))
+		if source1 != source2 {
+			t.Fatalf("both triggers must belong to one source, got %s and %s", source1, source2)
+		}
+
+		stats, err := f.engine.EvaluatePending(ctx, source1, f.pol, 10)
+		if err != nil {
+			t.Fatalf("EvaluatePending failed: %v", err)
+		}
+		if stats.Evaluated != 2 {
+			t.Fatalf("evaluated = %d, want both triggers judged", stats.Evaluated)
+		}
+		if stats.Tickets != 1 {
+			t.Fatalf("tickets = %d, want exactly the accepted one", stats.Tickets)
+		}
+		if stats.Outcomes[store.DecisionIgnore] != 1 || stats.Outcomes[store.DecisionAccept] != 1 {
+			t.Fatalf("outcomes = %+v, want one ignore and one accept", stats.Outcomes)
+		}
+		if tickets := f.tickets(t); len(tickets) != 1 {
+			t.Fatalf("tickets = %d rows, want exactly the accepted ticket", len(tickets))
+		}
+		if effects := f.effects(t); len(effects) != 1 {
+			t.Fatalf("effects = %d rows, want exactly the confirmation effect", len(effects))
+		}
+	})
+
+	t.Run("Given a cycle with an already-terminal trigger and a fresh one, when EvaluatePending runs, assert that only the fresh trigger is judged and the terminal one is never re-evaluated", func(t *testing.T) {
+		f := newEngineFixture(t)
+		f.acceptEcho("first cycle accept")
+		source, tr1 := f.seedTrigger(t, addressedComment(3001, "@acme-bot please fix the flaky login test"))
+		if _, err := f.engine.EvaluateTrigger(ctx, source, tr1, f.pol); err != nil {
+			t.Fatalf("first evaluation failed: %v", err)
+		}
+		f.acceptEcho("should never be consumed")
+		ingest(t, f, addressedComment(3002, "@acme-bot also please add a retry"))
+
+		stats, err := f.engine.EvaluatePending(ctx, source, f.pol, 10)
+		if err != nil {
+			t.Fatalf("EvaluatePending failed: %v", err)
+		}
+		if stats.Evaluated != 1 {
+			t.Fatalf("evaluated = %d, want only the fresh trigger judged", stats.Evaluated)
+		}
+		if tickets := f.tickets(t); len(tickets) != 2 {
+			t.Fatalf("tickets = %d rows, want the first ticket and the new one", len(tickets))
+		}
+	})
+
+	t.Run("Given one trigger whose payload violates the decode contract, when EvaluatePending runs, assert that the failure surfaces but the other trigger is still judged", func(t *testing.T) {
+		f := newEngineFixture(t)
+		f.acceptEcho("authorized coding request")
+		ctxLocal := context.Background()
+		source := github.SourceName("acme/api")
+		if _, err := f.store.IngestEvents(ctxLocal,
+			store.SourceRef{Name: source, Kind: "github"},
+			[]store.Event{{
+				ThreadKey:       "issue:42",
+				DeterministicID: "issue-comment:666",
+				Payload:         []byte(`{"kind":"unknown","nope":1}`),
+				OccurredAt:      time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC),
+			}}, intake.DefaultSightline); err != nil {
+			t.Fatalf("failed to ingest the malformed trigger: %v", err)
+		}
+		// Seed the healthy trigger directly: seedTrigger asserts a
+		// single-row read-back, which no longer holds on this source.
+		ingest(t, f, addressedComment(4001, "@acme-bot please fix the flaky login test"))
+
+		stats, err := f.engine.EvaluatePending(ctxLocal, source, f.pol, 10)
+		if err == nil {
+			t.Fatalf("a malformed trigger must fail the cycle loudly")
+		}
+		if stats.Evaluated != 1 {
+			t.Fatalf("evaluated = %d, want the healthy trigger still judged", stats.Evaluated)
+		}
+		if tickets := f.tickets(t); len(tickets) != 1 {
+			t.Fatalf("tickets = %d rows, want the healthy trigger's ticket", len(tickets))
 		}
 	})
 }

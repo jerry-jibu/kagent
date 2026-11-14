@@ -157,3 +157,39 @@ func (s *Store) TriggerDecision(ctx context.Context, source, deterministicID str
 	}
 	return d, true, nil
 }
+
+// PendingTriggers returns the triggers of a source that still owe a judgment:
+// no decision yet, or a newest decision that is retryable (unavailable), at
+// most limit rows, oldest first. Triggers with a terminal decision are the
+// already-judged audit trail and are never re-offered, so a crash-retry or
+// poll-overlap replay cannot double-evaluate or double-ticket.
+func (s *Store) PendingTriggers(ctx context.Context, source string, limit int) ([]Trigger, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("pending trigger limit must be positive, got %d", limit)
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT t.source, t.deterministic_id, t.thread_key, t.payload, t.created_at
+		FROM triggers t
+		WHERE t.source = $1
+		  AND NOT EXISTS (
+			SELECT 1 FROM decisions d
+			WHERE d.source = t.source
+			  AND d.deterministic_id = t.deterministic_id
+			  AND d.outcome <> 'unavailable')
+		ORDER BY t.created_at, t.deterministic_id
+		LIMIT $2`, source, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pending triggers for %s: %w", source, err)
+	}
+	defer rows.Close()
+
+	var out []Trigger
+	for rows.Next() {
+		var tr Trigger
+		if err := rows.Scan(&tr.Source, &tr.DeterministicID, &tr.ThreadKey, &tr.Payload, &tr.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan pending trigger: %w", err)
+		}
+		out = append(out, tr)
+	}
+	return out, rows.Err()
+}
