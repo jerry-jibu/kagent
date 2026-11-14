@@ -90,7 +90,9 @@ type Ticket struct {
 // Assignment is one ticket↔executor binding. Dispatch (T6) sets TaskID once,
 // when the A2A task is sent. Report carries the state of the report the
 // assignment settled under; DispatchAttempts/LastError are the dispatch
-// ledger a recovery redispatch annotates.
+// ledger a recovery redispatch annotates. StartedDeadline is the G7 stuck
+// window: a dispatched task past it with no outcome trips the Pass's stuck
+// branch (nil = no deadline).
 type Assignment struct {
 	ID               string
 	TicketID         string
@@ -100,6 +102,7 @@ type Assignment struct {
 	DispatchAttempts int
 	LastError        string
 	Kind             string
+	StartedDeadline  *time.Time
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
@@ -331,17 +334,17 @@ func scanTicket(row rowScanner) (Ticket, error) {
 const (
 	assignmentColumns = `
 	id, ticket_id, task_id, status, report, dispatch_attempts, last_error,
-	kind, created_at, updated_at`
+	kind, started_deadline, created_at, updated_at`
 
 	assignmentJoinColumns = `
 	a.id, a.ticket_id, a.task_id, a.status, a.report, a.dispatch_attempts,
-	a.last_error, a.kind, a.created_at, a.updated_at`
+	a.last_error, a.kind, a.started_deadline, a.created_at, a.updated_at`
 )
 
 func scanAssignment(row rowScanner) (Assignment, error) {
 	var a Assignment
 	if err := row.Scan(&a.ID, &a.TicketID, &a.TaskID, &a.Status, &a.Report,
-		&a.DispatchAttempts, &a.LastError, &a.Kind, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&a.DispatchAttempts, &a.LastError, &a.Kind, &a.StartedDeadline, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return Assignment{}, fmt.Errorf("failed to scan assignment: %w", err)
 	}
 	return a, nil

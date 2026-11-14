@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/store"
 )
@@ -31,7 +32,7 @@ func TestMarkAssignmentDispatched(t *testing.T) {
 			t.Fatalf("Assignments failed: %v", err)
 		}
 
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77", time.Time{}); err != nil {
 			t.Fatalf("MarkAssignmentDispatched failed: %v", err)
 		}
 
@@ -57,14 +58,14 @@ func TestMarkAssignmentDispatched(t *testing.T) {
 	t.Run("Given a ticket already bound to a session context, when a continuation dispatch lands with the same context, assert that the context does not regress", func(t *testing.T) {
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-1", "ctx-1"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-1", "ctx-1", time.Time{}); err != nil {
 			t.Fatalf("first dispatch failed: %v", err)
 		}
 		followup, err := s.CreateFollowupAssignment(ctx, ticketID)
 		if err != nil {
 			t.Fatalf("CreateFollowupAssignment failed: %v", err)
 		}
-		if err := s.MarkAssignmentDispatched(ctx, followup.ID, ticketID, "task-2", "ctx-1"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, followup.ID, ticketID, "task-2", "ctx-1", time.Time{}); err != nil {
 			t.Fatalf("continuation dispatch failed: %v", err)
 		}
 		tk, _ := s.Ticket(ctx, ticketID)
@@ -76,10 +77,10 @@ func TestMarkAssignmentDispatched(t *testing.T) {
 	t.Run("Given an assignment no longer pending, when the dispatch is recorded, assert that the store refuses the double transition", func(t *testing.T) {
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-1", "ctx-1"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-1", "ctx-1", time.Time{}); err != nil {
 			t.Fatalf("dispatch failed: %v", err)
 		}
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-1", "ctx-1"); !errors.Is(err, store.ErrAssignmentNotPending) {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-1", "ctx-1", time.Time{}); !errors.Is(err, store.ErrAssignmentNotPending) {
 			t.Fatalf("err = %v, want ErrAssignmentNotPending", err)
 		}
 	})
@@ -126,7 +127,7 @@ func TestApplyAssignmentTerminal(t *testing.T) {
 		t.Helper()
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77", time.Time{}); err != nil {
 			t.Fatalf("MarkAssignmentDispatched failed: %v", err)
 		}
 		return s, ticketID, assignments[0].ID
@@ -240,7 +241,7 @@ func TestApplyAssignmentTerminal(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("progress apply failed: %v", err)
 		}
-		if err := s.MarkAssignmentDispatched(ctx, other.ID, ticketID, "task-78", "ctx-77"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, other.ID, ticketID, "task-78", "ctx-77", time.Time{}); err != nil {
 			t.Fatalf("followup dispatch failed: %v", err)
 		}
 		if _, err := s.ApplyAssignmentTerminal(ctx, store.TerminalPlan{
@@ -279,7 +280,7 @@ func TestMarkTicketNeedsAttention(t *testing.T) {
 	t.Run("Given a running ticket whose task paused for input, when the detection point fires, assert that the ticket moves to needs-attention with an audit row while the assignment keeps running", func(t *testing.T) {
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77", time.Time{}); err != nil {
 			t.Fatalf("dispatch failed: %v", err)
 		}
 
@@ -312,7 +313,7 @@ func TestRunningAssignmentCandidates(t *testing.T) {
 	t.Run("Given dispatched and undispatched tickets, when the reconcile scan runs, assert that only running assignments bound to live tickets are candidates", func(t *testing.T) {
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77", time.Time{}); err != nil {
 			t.Fatalf("dispatch failed: %v", err)
 		}
 
@@ -340,7 +341,7 @@ func TestFollowupCandidates(t *testing.T) {
 	t.Run("Given a running ticket whose only assignment ended with a progress report, when the follow-up scan runs, assert that the ticket is a candidate with its follow-up count", func(t *testing.T) {
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
-		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77"); err != nil {
+		if err := s.MarkAssignmentDispatched(ctx, assignments[0].ID, ticketID, "task-77", "ctx-77", time.Time{}); err != nil {
 			t.Fatalf("dispatch failed: %v", err)
 		}
 		if _, err := s.ApplyAssignmentTerminal(ctx, store.TerminalPlan{
@@ -369,7 +370,7 @@ func TestFollowupCandidates(t *testing.T) {
 				if err != nil {
 					t.Fatalf("CreateFollowupAssignment failed: %v", err)
 				}
-				if err := s.MarkAssignmentDispatched(ctx, a.ID, ticketID, "task-"+a.ID, "ctx-77"); err != nil {
+				if err := s.MarkAssignmentDispatched(ctx, a.ID, ticketID, "task-"+a.ID, "ctx-77", time.Time{}); err != nil {
 					t.Fatalf("dispatch failed: %v", err)
 				}
 				if _, err := s.ApplyAssignmentTerminal(ctx, store.TerminalPlan{

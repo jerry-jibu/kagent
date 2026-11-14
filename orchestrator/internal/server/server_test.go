@@ -3,8 +3,10 @@ package server_test
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ func TestHealthz(t *testing.T) {
 		h := server.NewHandler(
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
+			nil,
 		)
 
 		rec := httptest.NewRecorder()
@@ -30,6 +33,7 @@ func TestHealthz(t *testing.T) {
 		h := server.NewHandler(
 			func() error { return errors.New("migrations not applied") },
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
+			nil,
 		)
 
 		rec := httptest.NewRecorder()
@@ -44,12 +48,58 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestPushEndpoint(t *testing.T) {
+	t.Run("Given a mounted push receiver, when the gateway POSTs an event, assert that the receiver sees it on the push path", func(t *testing.T) {
+		received := make(chan string, 1)
+		push := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			received <- string(body)
+			w.WriteHeader(http.StatusOK)
+		})
+		h := server.NewHandler(
+			func() error { return nil },
+			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
+			push,
+		)
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/a2a/push", strings.NewReader(`{"task":{}}`)))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("want 200, got %d", rec.Code)
+		}
+		select {
+		case body := <-received:
+			if body != `{"task":{}}` {
+				t.Fatalf("receiver body = %q, want the verbatim event", body)
+			}
+		default:
+			t.Fatal("the mounted receiver must see the POST")
+		}
+	})
+
+	t.Run("Given no push receiver configured, when a caller probes the push path, assert that it answers 404 rather than crashing", func(t *testing.T) {
+		h := server.NewHandler(
+			func() error { return nil },
+			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
+			nil,
+		)
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/a2a/push", nil))
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("want 404, got %d", rec.Code)
+		}
+	})
+}
 func TestAdminPolicy(t *testing.T) {
 	t.Run("Given a loaded policy, when a caller GETs /admin/policy, assert that the response carries the current policy version hash", func(t *testing.T) {
 		loadedAt := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 		h := server.NewHandler(
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "deadbeef", loadedAt, true },
+			nil,
 		)
 
 		rec := httptest.NewRecorder()
@@ -77,6 +127,7 @@ func TestAdminPolicy(t *testing.T) {
 		h := server.NewHandler(
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "", time.Time{}, false },
+			nil,
 		)
 
 		rec := httptest.NewRecorder()

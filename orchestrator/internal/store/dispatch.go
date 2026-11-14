@@ -164,7 +164,7 @@ func scanCandidateRow(rows rowScanner) (Assignment, Ticket, error) {
 		sid *string
 	)
 	if err := rows.Scan(&a.ID, &a.TicketID, &a.TaskID, &a.Status, &a.Report,
-		&a.DispatchAttempts, &a.LastError, &a.Kind, &a.CreatedAt, &a.UpdatedAt,
+		&a.DispatchAttempts, &a.LastError, &a.Kind, &a.StartedDeadline, &a.CreatedAt, &a.UpdatedAt,
 		&tk.ID, &tk.ThreadSource, &tk.ThreadKey, &man, &tk.Status, &sid,
 		&tk.TriggerSource, &tk.TriggerDeterministicID, &tk.CreatedAt); err != nil {
 		return Assignment{}, Ticket{}, fmt.Errorf("failed to scan candidate row: %w", err)
@@ -198,21 +198,26 @@ func scanReconcileCandidate(rows rowScanner) (ReconcileCandidate, error) {
 // (docs/designs/0001 §6): the assignment takes its task id and runs, and the
 // ticket moves pending→running with the task's A2A contextId as its session
 // continuity key. The contextId is never overwritten — every later dispatch
-// of the ticket continues the same session. An assignment that is no longer
-// pending is refused with ErrAssignmentNotPending, so a racing retry cannot
-// bind a second task.
-func (s *Store) MarkAssignmentDispatched(ctx context.Context, assignmentID, ticketID, taskID, contextID string) error {
+// of the ticket continues the same session. startDeadline (G7) is the time
+// by which the task must have produced an outcome; a zero time stores none.
+// An assignment that is no longer pending is refused with
+// ErrAssignmentNotPending, so a racing retry cannot bind a second task.
+func (s *Store) MarkAssignmentDispatched(ctx context.Context, assignmentID, ticketID, taskID, contextID string, startDeadline time.Time) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin dispatch transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	var deadline any
+	if !startDeadline.IsZero() {
+		deadline = startDeadline
+	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE assignments
-		SET task_id = $2, status = $3, updated_at = now()
+		SET task_id = $2, status = $3, started_deadline = $5, updated_at = now()
 		WHERE id = $1 AND status = $4`,
-		assignmentID, taskID, AssignmentStatusRunning, AssignmentStatusPending)
+		assignmentID, taskID, AssignmentStatusRunning, AssignmentStatusPending, deadline)
 	if err != nil {
 		return fmt.Errorf("failed to mark assignment %s dispatched: %w", assignmentID, err)
 	}

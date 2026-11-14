@@ -22,6 +22,10 @@ const (
 	// DefaultMaxFollowups caps the continuations a single ticket may spend.
 	// An unbounded progress→follow-up loop would burn worker turns forever.
 	DefaultMaxFollowups = 5
+	// DefaultStartDeadline is the G7 stuck window: a dispatched task that
+	// has produced no outcome (terminal or pause) within it trips the Pass's
+	// stuck branch — needs-attention, never an automatic replay.
+	DefaultStartDeadline = 10 * time.Minute
 )
 
 // Options configures the dispatch chain.
@@ -34,6 +38,10 @@ type Options struct {
 	PushBaseURL string
 	// MaxFollowups caps progress continuations per ticket (0 → default).
 	MaxFollowups int
+	// StartDeadline bounds how long a dispatched task may run without an
+	// outcome before the Pass marks it stuck (G7); 0 → default, negative
+	// stores no deadline.
+	StartDeadline time.Duration
 	// FollowUpAfter delays a progress continuation after the last
 	// assignment settled; 0 continues on the next Pass tick.
 	FollowUpAfter time.Duration
@@ -44,6 +52,18 @@ func (o Options) maxFollowups() int {
 		return DefaultMaxFollowups
 	}
 	return o.MaxFollowups
+}
+
+// startDeadlineAt returns the absolute stuck deadline for a dispatch at t.
+func (o Options) startDeadlineAt(t time.Time) time.Time {
+	switch {
+	case o.StartDeadline > 0:
+		return t.Add(o.StartDeadline)
+	case o.StartDeadline < 0:
+		return time.Time{} // explicit "no deadline"
+	default:
+		return t.Add(DefaultStartDeadline)
+	}
 }
 
 // Dispatcher owns the push side of the advancement chain (docs/designs/0001
@@ -108,7 +128,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate)
 		return d.recordFailure(ctx, c, err)
 	}
 
-	if err := d.store.MarkAssignmentDispatched(ctx, c.Assignment.ID, c.Ticket.ID, result.TaskID, result.ContextID); err != nil {
+	if err := d.store.MarkAssignmentDispatched(ctx, c.Assignment.ID, c.Ticket.ID,
+		result.TaskID, result.ContextID, d.opts.startDeadlineAt(time.Now())); err != nil {
 		if errors.Is(err, store.ErrAssignmentNotPending) {
 			// A concurrent dispatch won; the task id it bound stands.
 			return nil

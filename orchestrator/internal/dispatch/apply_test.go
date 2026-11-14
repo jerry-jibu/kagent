@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/a2a"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/dispatch"
@@ -16,7 +17,7 @@ func dispatchedFixture(t *testing.T) (*store.Store, string, string, *dispatch.Di
 	t.Helper()
 	s, _, assignment := acceptFixture(t)
 	ctx := context.Background()
-	if err := s.MarkAssignmentDispatched(ctx, assignment.ID, assignment.TicketID, "task-9", "ctx-9"); err != nil {
+	if err := s.MarkAssignmentDispatched(ctx, assignment.ID, assignment.TicketID, "task-9", "ctx-9", time.Time{}); err != nil {
 		t.Fatalf("MarkAssignmentDispatched failed: %v", err)
 	}
 	fake := a2a.NewFake()

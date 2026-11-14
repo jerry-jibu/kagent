@@ -14,12 +14,13 @@ import (
 	"github.com/jerry-jibu/kagent/orchestrator/internal/testenv"
 )
 
-// acceptFixture creates one accepted ticket with its pending assignment and
-// returns the store, ticket and assignment.
+// acceptFixture creates one accepted ticket (with its pending assignment and
+// confirmation effect) and returns the store, ticket and assignment.
 func acceptFixture(t *testing.T) (*store.Store, store.Ticket, store.Assignment) {
 	t.Helper()
 	ctx := context.Background()
 	s := testenv.NewMigratedStore(t)
+	ticketID := store.TicketIDForTrigger("github:acme/api", "issue-comment:9001")
 	created, err := s.CreateTicket(ctx, store.TicketInput{
 		Source:          "github:acme/api",
 		DeterministicID: "issue-comment:9001",
@@ -36,6 +37,12 @@ func acceptFixture(t *testing.T) (*store.Store, store.Ticket, store.Assignment) 
 			Sender:        "alice",
 			Scope:         store.MandateScope{Repo: "acme/api", Issue: 42},
 		},
+		Effects: []store.OutboxEffect{{
+			Channel:        "github",
+			Address:        "acme/api#42",
+			IdempotencyKey: "confirm:" + ticketID,
+			Payload:        []byte(`{"kind":"github-issue-comment","repo":"acme/api","issue":42,"body":"Acknowledged"}`),
+		}},
 	})
 	if err != nil {
 		t.Fatalf("CreateTicket failed: %v", err)
