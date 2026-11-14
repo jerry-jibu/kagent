@@ -19,6 +19,7 @@ func TestHealthz(t *testing.T) {
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
 			nil,
+			nil,
 		)
 
 		rec := httptest.NewRecorder()
@@ -33,6 +34,7 @@ func TestHealthz(t *testing.T) {
 		h := server.NewHandler(
 			func() error { return errors.New("migrations not applied") },
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
+			nil,
 			nil,
 		)
 
@@ -60,6 +62,7 @@ func TestPushEndpoint(t *testing.T) {
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
 			push,
+			nil,
 		)
 
 		rec := httptest.NewRecorder()
@@ -83,6 +86,7 @@ func TestPushEndpoint(t *testing.T) {
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
 			nil,
+			nil,
 		)
 
 		rec := httptest.NewRecorder()
@@ -99,6 +103,7 @@ func TestAdminPolicy(t *testing.T) {
 		h := server.NewHandler(
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "deadbeef", loadedAt, true },
+			nil,
 			nil,
 		)
 
@@ -127,6 +132,7 @@ func TestAdminPolicy(t *testing.T) {
 		h := server.NewHandler(
 			func() error { return nil },
 			func() (string, time.Time, bool) { return "", time.Time{}, false },
+			nil,
 			nil,
 		)
 

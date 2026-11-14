@@ -11,6 +11,12 @@
 // terminal states, 2s reconcile against the gateway task store (push-loss
 // backstop, red line on vanished tasks, G7 stuck detection), progress
 // follow-ups, and the outbox deliverer (taken over from the eval loop).
+// From T8 the startup runs the recovery manifest (装载未终结 Assignment;
+// interrupted re-dispatch carries the recovery annotation, committed
+// effects replay under receipt dedup), the Pass enforces waitsForPerson
+// holds, the eval chain respects followupOwners (no fork of an owned
+// thread), and the admin surface serves list-needs-attention / retry /
+// stop — every mutation audited.
 //
 // Startup failure semantics (T1 AC): an unreachable database, a held
 // instance lock, failed migrations, or a broken initial policy all refuse
@@ -247,9 +253,31 @@ func main() {
 				WorkerAgent:   cfg.WorkerAgent,
 				PushBaseURL:   pushBase,
 				StartDeadline: cfg.DispatchDeadline,
+				// T8 startup recovery (docs/designs 0001 §4.3): assignments
+				// minted before this instant were left by a dead process —
+				// their first dispatch here carries the restart recovery
+				// annotation.
+				RecoveryCutoff: time.Now(),
 			})
 			pushReceiver = dispatch.NewReceiver(dispatcher)
 			pass := dispatch.NewPass(st, dispatcher, outbox.New(st, ghTransport), dispatch.PassOptions{})
+
+			// 装载未终结 Assignment: audited per holding ticket before the
+			// first tick; the Pass then carries the work forward (pending
+			// re-dispatch, running reconcile, outbox receipt replay). A
+			// failing manifest scan refuses the start — recovery is not
+			// optional.
+			recovered, err := dispatch.Recover(pollerCtx, st)
+			if err != nil {
+				log.Error("startup recovery failed; refusing to start", "error", err)
+				cancelPoller()
+				watcher.Stop()
+				st.Close()
+				os.Exit(1)
+			}
+			log.Info("startup recovery loaded the non-terminal manifest",
+				"tickets", recovered.Tickets, "pending", recovered.Pending, "running", recovered.Running)
+
 			go runPassLoop(pollerCtx, pass, cfg.PassInterval, log)
 			log.Info("pass beat started",
 				"worker", cfg.WorkerAgent,
@@ -266,7 +294,7 @@ func main() {
 
 	handler := server.NewHandler(state.ready, func() (string, time.Time, bool) {
 		return watcher.Current().Version, watcher.LoadedAt(), true
-	}, pushReceiver)
+	}, pushReceiver, st)
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
