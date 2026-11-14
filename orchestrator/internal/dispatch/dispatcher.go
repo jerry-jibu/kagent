@@ -183,56 +183,100 @@ func (d *Dispatcher) buildRequest(ctx context.Context, c store.DispatchCandidate
 	}, nil
 }
 
+// dispatchDocument is the JSON document sent as the dispatch message — the
+// worker's execution contract (docs/designs/0001 §4.1: 任务文本 + workspace
+// 名 + Mandate 摘要). Its JSON shape is a contract; typed so the compiler,
+// not a map literal, keeps the fields honest.
+type dispatchDocument struct {
+	Kind         string                `json:"kind"`
+	Ticket       string                `json:"ticket"`
+	Thread       dispatchThread        `json:"thread"`
+	Mandate      store.Mandate         `json:"mandate"`
+	Workspace    string                `json:"workspace"`
+	Request      dispatchRequest       `json:"request"`
+	Recovery     *dispatchRecovery     `json:"recovery,omitempty"`
+	UnreadInputs []store.FollowupInput `json:"unread_inputs,omitempty"`
+}
+
+// dispatchThread identifies the external conversation the ticket serves.
+type dispatchThread struct {
+	Source string `json:"source"`
+	Key    string `json:"key"`
+}
+
+// dispatchRequest embeds the original request verbatim — the trigger payload
+// the ticket was created from, so the worker sees the request, not a summary.
+type dispatchRequest struct {
+	Repo      string `json:"repo"`
+	Issue     int    `json:"issue"`
+	CommentID int64  `json:"comment_id"`
+	Author    string `json:"author"`
+	Body      string `json:"body"`
+	URL       string `json:"url"`
+}
+
+// dispatchRecovery annotates a redispatch: which attempt this is and why it
+// is happening again (docs/designs/0001 §4.3: 恢复注记). A fresh first
+// dispatch carries no recovery section at all.
+type dispatchRecovery struct {
+	Attempt       int    `json:"attempt,omitempty"`
+	PreviousError string `json:"previous_error,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+}
+
 // buildDocument builds the dispatch document the worker executes: ticket
 // identity, workspace name (D3: 目录名 = ticket ID), the mandate summary, the
 // original request, and — past a failed attempt — the recovery annotation
-// (docs/designs/0001 §4.1: 任务文本 + workspace 名 + Mandate 摘要; §4.3:
-// 恢复注记).
+// (docs/designs/0001 §4.1; §4.3: 恢复注记).
 func (d *Dispatcher) buildDocument(ctx context.Context, c store.DispatchCandidate) (string, error) {
-	doc := map[string]any{
-		"kind":      "dispatch",
-		"ticket":    c.Ticket.ID,
-		"thread":    map[string]any{"source": c.Ticket.ThreadSource, "key": c.Ticket.ThreadKey},
-		"mandate":   c.Ticket.Mandate,
-		"workspace": c.Ticket.ID,
+	doc := dispatchDocument{
+		Kind:      "dispatch",
+		Ticket:    c.Ticket.ID,
+		Thread:    dispatchThread{Source: c.Ticket.ThreadSource, Key: c.Ticket.ThreadKey},
+		Mandate:   c.Ticket.Mandate,
+		Workspace: c.Ticket.ID,
 	}
 
-	pl, err := intake.DecodeCommentPayload(d.triggerPayload(ctx, c))
+	payload, err := d.triggerPayload(ctx, c)
+	if err != nil {
+		return "", fmt.Errorf("ticket %s cannot carry its original request: %w", c.Ticket.ID, err)
+	}
+	pl, err := intake.DecodeCommentPayload(payload)
 	if err != nil {
 		return "", fmt.Errorf("ticket %s carries a trigger payload violating the decode contract: %w", c.Ticket.ID, err)
 	}
-	doc["request"] = map[string]any{
-		"repo":       pl.Repo,
-		"issue":      pl.Issue,
-		"comment_id": pl.CommentID,
-		"author":     pl.Author,
-		"body":       pl.Body,
-		"url":        pl.URL,
+	doc.Request = dispatchRequest{
+		Repo:      pl.Repo,
+		Issue:     pl.Issue,
+		CommentID: pl.CommentID,
+		Author:    pl.Author,
+		Body:      pl.Body,
+		URL:       pl.URL,
 	}
 
 	if c.Assignment.DispatchAttempts > 0 || d.isRestartRedispatch(c) {
-		recovery := map[string]any{}
+		doc.Recovery = &dispatchRecovery{}
 		if c.Assignment.DispatchAttempts > 0 {
-			recovery["attempt"] = c.Assignment.DispatchAttempts + 1
-			recovery["previous_error"] = c.Assignment.LastError
+			doc.Recovery.Attempt = c.Assignment.DispatchAttempts + 1
+			doc.Recovery.PreviousError = c.Assignment.LastError
 		}
 		if d.isRestartRedispatch(c) {
-			recovery["reason"] = "orchestrator restart"
-		}
-		doc["recovery"] = recovery
-
-		// 未读 Inputs 随行 (docs/designs 0001 §4.3): person messages recorded
-		// on the thread while the ticket was interrupted ride along. There is
-		// no worker ACK in P0, so the inputs ride on every recovery
-		// redispatch — the document carries history, the store keeps truth.
-		inputs, err := d.store.FollowupInputs(ctx, c.Ticket.ID)
-		if err != nil {
-			return "", fmt.Errorf("ticket %s carries unreadable followup inputs: %w", c.Ticket.ID, err)
-		}
-		if len(inputs) > 0 {
-			doc["unread_inputs"] = inputs
+			doc.Recovery.Reason = "orchestrator restart"
 		}
 	}
+
+	// 未读 Inputs 随行 (docs/designs 0001 §4.3): person messages recorded on
+	// the ticket's thread ride along on EVERY dispatch while they exist —
+	// first dispatches included. The inputs are unacknowledged context: a
+	// dispatch that omits them would send the worker back to work on stale
+	// knowledge (直送上下文语义). There is no worker ACK in P0, so the document
+	// carries history and the store keeps truth; progress follow-ups carry
+	// them the same way.
+	inputs, err := d.store.FollowupInputs(ctx, c.Ticket.ID)
+	if err != nil {
+		return "", fmt.Errorf("ticket %s carries unreadable followup inputs: %w", c.Ticket.ID, err)
+	}
+	doc.UnreadInputs = inputs
 
 	message, err := json.Marshal(doc)
 	if err != nil {
@@ -241,20 +285,25 @@ func (d *Dispatcher) buildDocument(ctx context.Context, c store.DispatchCandidat
 	return string(message), nil
 }
 
-func (d *Dispatcher) triggerPayload(ctx context.Context, c store.DispatchCandidate) []byte {
+// triggerPayload reads back the trigger payload the ticket was created from.
+// The trigger rows are immutable audit data: a read failure or a missing
+// matching row is malformed durable state and is refused — the dispatch is
+// never built without its original request (AGENTS.md: reject malformed
+// durable data rather than silently omitting it).
+func (d *Dispatcher) triggerPayload(ctx context.Context, c store.DispatchCandidate) ([]byte, error) {
 	if c.Ticket.TriggerSource == "" {
-		return nil
+		return nil, fmt.Errorf("ticket records no trigger source")
 	}
 	triggers, err := d.store.Triggers(ctx, c.Ticket.TriggerSource)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("failed to read triggers of source %s: %w", c.Ticket.TriggerSource, err)
 	}
 	for _, tr := range triggers {
 		if tr.DeterministicID == c.Ticket.TriggerDeterministicID {
-			return tr.Payload
+			return tr.Payload, nil
 		}
 	}
-	return nil
+	return nil, fmt.Errorf("trigger %s/%s is not in the audit rows of its source", c.Ticket.TriggerSource, c.Ticket.TriggerDeterministicID)
 }
 
 // PushReceiverURL joins the configured base with the receiver path.
@@ -353,16 +402,22 @@ func (d *Dispatcher) applyReportPlan(ctx context.Context, assignment store.Assig
 	return Applied{AssignmentSettled: outcome.Applied, TicketChanged: outcome.TicketChanged}, nil
 }
 
-func reportDetail(report Report, taskID string) map[string]any {
-	detail := map[string]any{
-		"state":   report.State,
-		"task_id": taskID,
+// ReportDetail is the audit detail of a report observation — the durable
+// record later stages read back: the deliverer quotes the ready report's
+// summary and artifacts into the PR body (T7), the admin rows surface the
+// last observation. Typed, not a map: the JSON shape is a contract.
+type ReportDetail struct {
+	State     string   `json:"state"`
+	TaskID    string   `json:"task_id"`
+	Summary   string   `json:"summary,omitempty"`
+	Artifacts []string `json:"artifacts,omitempty"`
+}
+
+func reportDetail(report Report, taskID string) ReportDetail {
+	return ReportDetail{
+		State:     report.State,
+		TaskID:    taskID,
+		Summary:   report.Summary,
+		Artifacts: report.Artifacts,
 	}
-	if report.Summary != "" {
-		detail["summary"] = report.Summary
-	}
-	if len(report.Artifacts) > 0 {
-		detail["artifacts"] = report.Artifacts
-	}
-	return detail
 }

@@ -226,10 +226,19 @@ func isCommitSHA(s string) bool {
 	return true
 }
 
+// DefaultGitBaseURL is the git remote base a mandate-scope repo name
+// composes with when the deployment does not override it.
+const DefaultGitBaseURL = "https://github.com"
+
 // ComposeRepoURL joins a git remote base and a mandate-scope repo name into
 // the clone/push URL: base "https://github.com" and repo "o/r" become
-// "https://github.com/o/r.git".
+// "https://github.com/o/r.git". An empty base falls back to
+// DefaultGitBaseURL — the single derivation point shared by the materializer
+// scan and the deliverer.
 func ComposeRepoURL(base, repo string) string {
+	if base == "" {
+		base = DefaultGitBaseURL
+	}
 	return strings.TrimSuffix(base, "/") + "/" + repo + ".git"
 }
 

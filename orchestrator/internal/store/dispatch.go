@@ -379,7 +379,9 @@ type TerminalPlan struct {
 	TicketStatus     string // ended | failed | needs-attention | "" (no change)
 	DeliveryPending  bool
 	Event            string
-	Detail           map[string]any
+	// Detail is the audit detail encoded verbatim — typed structs at the
+	// producer side (e.g. dispatch.ReportDetail) or legacy map literals.
+	Detail any
 }
 
 // ApplyAssignmentTerminal settles one running assignment idempotently: the
@@ -541,15 +543,16 @@ func newAssignmentID() (string, error) {
 	return "assign-" + hex.EncodeToString(b[:]), nil
 }
 
-// marshalDetail encodes an audit detail map; the audit table rejects nothing
-// JSON, so a failure to encode is a programming error surfaced loudly.
-func marshalDetail(detail map[string]any) []byte {
+// marshalDetail encodes an audit detail (typed struct or legacy map literal);
+// the audit table rejects nothing JSON, so a failure to encode is a
+// programming error surfaced loudly.
+func marshalDetail(detail any) []byte {
 	if detail == nil {
 		detail = map[string]any{}
 	}
 	blob, err := json.Marshal(detail)
 	if err != nil {
-		// A detail map that cannot encode is a bug; persist the fact.
+		// A detail value that cannot encode is a bug; persist the fact.
 		return []byte(fmt.Sprintf(`{"encode_error":%q}`, err.Error()))
 	}
 	return blob

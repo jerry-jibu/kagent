@@ -28,21 +28,17 @@ import (
 	"github.com/jerry-jibu/kagent/orchestrator/internal/workspace"
 )
 
-// DefaultGitBaseURL is the git remote base the repo name composes with.
-const DefaultGitBaseURL = "https://github.com"
-
 // Options configure the deliverer.
 type Options struct {
-	// GitBaseURL is the git remote base ("https://github.com"): the clone/
-	// push URL of mandate-scope repo R becomes GitBaseURL + "/" + R + ".git".
+	// GitBaseURL is the git remote base the mandate-scope repo name composes
+	// with (empty falls back to workspace.DefaultGitBaseURL — the shared
+	// derivation in workspace.ComposeRepoURL).
 	GitBaseURL string
 	// Token is the orchestrator-held credential for git (clone/push) — the
 	// same credential monotonicity as the materializer (0002 A5): the token
 	// rides the transient credential helper, never a URL, never the sandbox.
+	// The commit identity is the patcher's deterministic default.
 	Token string
-	// AuthorName/AuthorEmail override the commit identity.
-	AuthorName  string
-	AuthorEmail string
 	// Log receives per-delivery summaries; nil falls back to slog.Default().
 	Log *slog.Logger
 }
@@ -61,10 +57,6 @@ type Deliverer struct {
 
 // New wires the deliverer. Store, Backend and Transport are required.
 func New(st *store.Store, backend workspace.Backend, gh github.Transport, opts Options) *Deliverer {
-	base := opts.GitBaseURL
-	if base == "" {
-		base = DefaultGitBaseURL
-	}
 	log := opts.Log
 	if log == nil {
 		log = slog.Default()
@@ -95,8 +87,9 @@ type Stats struct {
 }
 
 // DeliverPending ships every pending result, oldest first. One candidate's
-// failure never blocks the others; the error return is reserved for a broken
-// scan (the store itself unreachable).
+// failure never blocks the others; the error return is reserved for a store
+// failure (a broken scan or a bookkeeping transition that did not land) —
+// the beat aborts and the next beat retries it.
 func (d *Deliverer) DeliverPending(ctx context.Context) (Stats, error) {
 	candidates, err := d.store.PendingDeliveries(ctx)
 	if err != nil {
@@ -107,9 +100,9 @@ func (d *Deliverer) DeliverPending(ctx context.Context) (Stats, error) {
 	for _, c := range candidates {
 		delivered, err := d.deliverOne(ctx, c)
 		if err != nil {
-			// deliverOne classified and recorded the failure; a broken scan
+			// deliverOne classified and recorded the failure; a store failure
 			// is the only condition that errors the beat.
-			if isScanError(err) {
+			if isStoreError(err) {
 				return stats, err
 			}
 			continue
@@ -136,12 +129,15 @@ const (
 	outcomeRetried
 )
 
-// errScan marks a broken scan (store unreachable): the beat aborts, other
-// candidates stay for the next tick.
-var errScan = errors.New("scan error")
+// errStore marks a store failure that leaves the beat's bookkeeping unknown
+// (the pending-deliveries scan itself, or a failed delivery transition): the
+// beat aborts, other candidates stay for the next tick. Candidate-classified
+// failures (workspace, git, GitHub) never carry it — they stay pending
+// inside their own ticket.
+var errStore = errors.New("store failure: delivery beat aborted")
 
-func isScanError(err error) bool {
-	return errors.Is(err, errScan)
+func isStoreError(err error) bool {
+	return errors.Is(err, errStore)
 }
 
 // deliverOne ships one candidate. It classifies every outcome:
@@ -169,17 +165,16 @@ func (d *Deliverer) deliverOne(ctx context.Context, c store.DeliveryCandidate) (
 	}
 
 	// 2. Ship the ticket branch: apply the state onto the exact baseline
-	//    commit, commit deterministically, push refs/heads/<ticketID>.
+	//    commit, commit deterministically, push refs/heads/<ticketID>. The
+	//    commit identity is the patcher's deterministic default.
 	outcome, err := d.patcher.Patch(ctx, workspace.PatchRequest{
-		RepoURL:     d.repoURL(c.Ticket.Mandate.Scope.Repo),
-		Token:       d.opts.Token,
-		BaseCommit:  c.BaseCommit,
-		Branch:      ticketID,
-		Message:     commitMessage(c, state),
-		State:       state,
-		SkipPaths:   c.BaseSkipped,
-		AuthorName:  d.opts.AuthorName,
-		AuthorEmail: d.opts.AuthorEmail,
+		RepoURL:    d.repoURL(c.Ticket.Mandate.Scope.Repo),
+		Token:      d.opts.Token,
+		BaseCommit: c.BaseCommit,
+		Branch:     ticketID,
+		Message:    commitMessage(c, state),
+		State:      state,
+		SkipPaths:  c.BaseSkipped,
 	})
 	if err != nil {
 		if errors.Is(err, workspace.ErrEmptyChangeSet) {
@@ -190,8 +185,15 @@ func (d *Deliverer) deliverOne(ctx context.Context, c store.DeliveryCandidate) (
 	}
 
 	// 3. Open the PR (observably idempotent: an existing head-branch PR is
-	//    returned, never duplicated).
-	report := d.readReadyReport(ctx, ticketID)
+	//    returned, never duplicated). The ready report quoted into the PR
+	//    body is read back from the audit trail; a broken audit read stays a
+	//    transient failure — shipping a PR that silently drops the worker's
+	//    report summary is exactly the silent omission the audit contract
+	//    forbids.
+	report, err := d.readReadyReport(ctx, ticketID)
+	if err != nil {
+		return d.retryTransient(ctx, ticketID, err, "ready report read-back")
+	}
 	pr, err := d.gh.CreatePullRequest(ctx, c.Ticket.Mandate.Scope.Repo, pullRequestInput(c, state, report, outcome))
 	if err != nil {
 		return d.retryTransient(ctx, ticketID, err, "pull request creation")
@@ -233,7 +235,9 @@ func (d *Deliverer) deliverOne(ctx context.Context, c store.DeliveryCandidate) (
 func (d *Deliverer) failPermanently(ctx context.Context, ticketID, reason string) (int, error) {
 	applied, err := d.store.FailTicketDelivery(ctx, ticketID, reason)
 	if err != nil {
-		return 0, fmt.Errorf("%w: failed to fail the delivery of %s: %w", errScan, ticketID, err)
+		// The failure transition did not land: the ticket's fate is unknown,
+		// so the beat aborts (the next beat re-derives it from the store).
+		return 0, fmt.Errorf("%w: failed to fail the delivery of %s: %w", errStore, ticketID, err)
 	}
 	if applied {
 		d.log.Warn("ticket delivery failed permanently",
@@ -250,23 +254,20 @@ func (d *Deliverer) retryTransient(ctx context.Context, ticketID string, cause e
 		"error":     cause.Error(),
 		"permanent": false,
 	}); err != nil {
-		return 0, fmt.Errorf("%w: failed to record the transient failure of %s: %w", errScan, ticketID, err)
+		// The failure observation did not land: the ledger is behind the
+		// world, so the beat aborts instead of shipping against a blind spot.
+		return 0, fmt.Errorf("%w: failed to record the transient failure of %s: %w", errStore, ticketID, err)
 	}
 	d.log.Warn("ticket delivery retried on the next beat",
 		"ticket", ticketID, "stage", stage, "error", cause)
 	return outcomeRetried, nil
 }
 
-// repoURL composes the git remote of a mandate-scope repo.
+// repoURL composes the git remote of a mandate-scope repo. The base default
+// lives in workspace.ComposeRepoURL — the one derivation shared with the
+// materializer.
 func (d *Deliverer) repoURL(repo string) string {
-	return workspace.ComposeRepoURL(d.gitBase(), repo)
-}
-
-func (d *Deliverer) gitBase() string {
-	if d.opts.GitBaseURL == "" {
-		return DefaultGitBaseURL
-	}
-	return d.opts.GitBaseURL
+	return workspace.ComposeRepoURL(d.opts.GitBaseURL, repo)
 }
 
 // readyReport is the report.ready audit detail the result comment and the PR
@@ -277,11 +278,13 @@ type readyReport struct {
 }
 
 // readReadyReport reads the latest ready report back from the audit trail —
-// the durable record the dispatcher wrote at the ready transition.
-func (d *Deliverer) readReadyReport(ctx context.Context, ticketID string) readyReport {
+// the durable record the dispatcher wrote at the ready transition. An
+// unreadable trail is an error, never an empty report: the PR body would
+// silently lose the worker's summary.
+func (d *Deliverer) readReadyReport(ctx context.Context, ticketID string) (readyReport, error) {
 	events, err := d.store.AuditEvents(ctx, ticketID)
 	if err != nil {
-		return readyReport{}
+		return readyReport{}, fmt.Errorf("failed to read the ready report of %s from the audit trail: %w", ticketID, err)
 	}
 	var report readyReport
 	for _, ev := range events {
@@ -300,7 +303,7 @@ func (d *Deliverer) readReadyReport(ctx context.Context, ticketID string) readyR
 			}
 		}
 	}
-	return report
+	return report, nil
 }
 
 // pullRequestInput builds the PR the requester can review: head = ticket

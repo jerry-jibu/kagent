@@ -56,8 +56,10 @@ func (s *Store) FailTicket(ctx context.Context, ticketID, reason string) error {
 
 // RecordAudit appends one lifecycle event for the ticket. It does not
 // verify the ticket exists: audit rows are observations, and the caller
-// (materializer/dispatcher) has already resolved the ticket.
-func (s *Store) RecordAudit(ctx context.Context, ticketID, event string, detail map[string]any) error {
+// (materializer/dispatcher) has already resolved the ticket. The detail is
+// encoded verbatim — typed structs at the producer side (STYLE.md: typed
+// data over generic maps) or legacy map literals, whichever the caller owns.
+func (s *Store) RecordAudit(ctx context.Context, ticketID, event string, detail any) error {
 	if detail == nil {
 		detail = map[string]any{}
 	}

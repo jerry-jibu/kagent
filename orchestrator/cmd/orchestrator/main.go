@@ -63,6 +63,7 @@ const DefaultEvalInterval = 5 * time.Second
 
 // Config groups the service settings (CLI flags per STYLE.md).
 type Config struct {
+	LogLevel           string
 	DatabaseURL        string
 	Schema             string
 	PolicyDir          string
@@ -91,13 +92,14 @@ type Config struct {
 
 func parseConfig() Config {
 	var cfg Config
-	flag.StringVar(&cfg.DatabaseURL, "database-url", "", "PostgreSQL connection string (required)")
+	flag.StringVar(&cfg.LogLevel, "log-level", "info", "minimum log level (debug, info, warn or error)")
+	flag.StringVar(&cfg.DatabaseURL, "database-url", "", "PostgreSQL connection string (required; falls back to the DATABASE_URL environment variable)")
 	flag.StringVar(&cfg.Schema, "schema", "orchestrator", "orchestrator-owned PostgreSQL schema")
 	flag.StringVar(&cfg.PolicyDir, "policy-dir", "/etc/orchestrator/policy", "directory mounted from the policy ConfigMap")
 	flag.StringVar(&cfg.ListenAddr, "listen-addr", ":8080", "healthz/admin HTTP listen address")
 	flag.DurationVar(&cfg.PolicyPollInterval, "policy-poll-interval", 5*time.Second, "policy reload poll interval")
 	flag.StringVar(&cfg.GitHubSource, "github-source", "", "GitHub repository (owner/name) to poll for issue comments; empty disables the GitHub source")
-	flag.StringVar(&cfg.GitHubToken, "github-token", "", "GitHub bearer token (mounted from a Secret)")
+	flag.StringVar(&cfg.GitHubToken, "github-token", "", "GitHub bearer token; falls back to the GITHUB_TOKEN environment variable (the Secret's injection path)")
 	flag.StringVar(&cfg.GitHubAPIURL, "github-api-url", "https://api.github.com", "GitHub REST API base URL")
 	flag.DurationVar(&cfg.GitHubPollInterval, "github-poll-interval", source.DefaultPollInterval, "GitHub source poll interval")
 	flag.StringVar(&cfg.GitHubStartCursor, "github-start-cursor", "", "RFC3339 position a fresh GitHub source starts reading from (default: the repository origin)")
@@ -109,10 +111,29 @@ func parseConfig() Config {
 	flag.DurationVar(&cfg.PassInterval, "pass-interval", dispatch.DefaultPassInterval, "Pass beat interval (dispatch/reconcile/follow-up/outbox)")
 	flag.DurationVar(&cfg.DispatchDeadline, "dispatch-start-deadline", dispatch.DefaultStartDeadline, "how long a dispatched task may run without an outcome before the Pass marks it stuck (0 disables, negative disables)")
 	flag.StringVar(&cfg.WorkspaceMCPEndpoint, "workspace-mcp-endpoint", "", "agentfs MCP bridge endpoint materializing ticket workspaces; required for the delivery loop (empty disables delivery)")
-	flag.StringVar(&cfg.WorkspaceBaseBranch, "workspace-base-branch", "main", "branch the workspace materializer clones per ticket (P0: one deployment-level base branch)")
-	flag.StringVar(&cfg.GitHubGitBaseURL, "github-git-url", delivery.DefaultGitBaseURL, "git remote base the mandate-scope repo composes with for clone/push and PRs")
+	flag.StringVar(&cfg.WorkspaceBaseBranch, "workspace-base-branch", "main", "branch the workspace materializer clones per ticket by default (Story 27: a mandate scope may point at a specific branch)")
+	flag.StringVar(&cfg.GitHubGitBaseURL, "github-git-url", workspace.DefaultGitBaseURL, "git remote base the mandate-scope repo composes with for clone/push and PRs")
 	flag.Parse()
+
+	// Credential injection: in-cluster the Secret rides the environment, so
+	// the values never appear in the pod spec's argv. An explicit flag still
+	// wins for local runs.
+	if cfg.DatabaseURL == "" {
+		cfg.DatabaseURL = os.Getenv("DATABASE_URL")
+	}
+	if cfg.GitHubToken == "" {
+		cfg.GitHubToken = os.Getenv("GITHUB_TOKEN")
+	}
 	return cfg
+}
+
+// parseLogLevel resolves the --log-level flag into a slog level.
+func parseLogLevel(flagValue string) (slog.Level, error) {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(flagValue)); err != nil {
+		return slog.LevelInfo, fmt.Errorf("--log-level %q is not one of debug, info, warn or error: %w", flagValue, err)
+	}
+	return level, nil
 }
 
 // startupState feeds the healthz readiness probe: it reports exactly which
@@ -138,11 +159,18 @@ func (s *startupState) ready() error {
 
 func main() {
 	cfg := parseConfig()
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	level, err := parseLogLevel(cfg.LogLevel)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	// JSON logs go to stderr (STYLE.md Logging): stdout stays free for the
+	// data plane, and container log collectors parse stderr consistently.
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
 
 	if cfg.DatabaseURL == "" {
-		log.Error("--database-url is required")
+		log.Error("--database-url is required (flag or DATABASE_URL environment variable)")
 		os.Exit(2)
 	}
 
@@ -208,16 +236,24 @@ func main() {
 	// (docs/designs/0003 路线 A: Engine accept 后、派工前物化). Coalesced:
 	// one buffered slot, a scan already covers every awaiting ticket.
 	materializeNotify := make(chan struct{}, 1)
+
+	// failStart tears the process down on a refused start (AC: 拒绝启动):
+	// every partially started subsystem is stopped and the process exits
+	// nonzero. One teardown sequence instead of one per refusal site.
+	failStart := func(msg string, cause error) {
+		log.Error(msg, "error", cause)
+		cancelPoller()
+		watcher.Stop()
+		st.Close()
+		os.Exit(1)
+	}
+
 	if cfg.GitHubSource != "" {
 		var startCursor time.Time
 		if cfg.GitHubStartCursor != "" {
 			startCursor, err = time.Parse(time.RFC3339, cfg.GitHubStartCursor)
 			if err != nil {
-				log.Error("--github-start-cursor must be RFC3339", "error", err)
-				cancelPoller()
-				watcher.Stop()
-				st.Close()
-				os.Exit(1)
+				failStart("--github-start-cursor must be RFC3339", err)
 			}
 		}
 		ghTransport := github.NewTransport(github.TransportConfig{
@@ -230,11 +266,7 @@ func main() {
 			StartCursor:  startCursor,
 		})
 		if err != nil {
-			log.Error("failed to configure GitHub source; refusing to start", "error", err)
-			cancelPoller()
-			watcher.Stop()
-			st.Close()
-			os.Exit(1)
+			failStart("failed to configure GitHub source; refusing to start", err)
 		}
 		go poller.Run(pollerCtx, log)
 		log.Info("github source started",
@@ -278,11 +310,7 @@ func main() {
 			// dispatch.
 			dbNow, err := st.Now(pollerCtx)
 			if err != nil {
-				log.Error("failed to read the database clock; refusing to start", "error", err)
-				cancelPoller()
-				watcher.Stop()
-				st.Close()
-				os.Exit(1)
+				failStart("failed to read the database clock; refusing to start", err)
 			}
 			workerTransport := a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: cfg.A2AGatewayURL})
 			dispatcher := dispatch.New(st, workerTransport, dispatch.Options{
@@ -305,11 +333,7 @@ func main() {
 			// optional.
 			recovered, err := dispatch.Recover(pollerCtx, st)
 			if err != nil {
-				log.Error("startup recovery failed; refusing to start", "error", err)
-				cancelPoller()
-				watcher.Stop()
-				st.Close()
-				os.Exit(1)
+				failStart("startup recovery failed; refusing to start", err)
 			}
 			log.Info("startup recovery loaded the non-terminal manifest",
 				"tickets", recovered.Tickets, "pending", recovered.Pending, "running", recovered.Running)
@@ -410,6 +434,30 @@ func main() {
 	st.Close()
 }
 
+// runLoop is the shared skeleton of the orchestrator's background loops: it
+// beats fn once immediately, then on every tick — and on every wake signal,
+// when a channel is wired (the materialize loop's accept nudge) — until ctx
+// is done. Per-beat failures are logged inside the beat closures and never
+// stop the loop; the next beat retries. name names the loop in the stop log.
+func runLoop(ctx context.Context, name string, interval time.Duration,
+	wake <-chan struct{}, beat func(), log *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	beat()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Debug("loop stopped", "loop", name)
+			return
+		case <-ticker.C:
+			beat()
+		case <-wake:
+			beat()
+		}
+	}
+}
+
 // runEvalLoop judges pending triggers on the eval cadence. Errors are
 // logged per cycle and never stop the loop: a failing evaluator is retried
 // on the next tick, and the store's transactional guarantees keep every
@@ -421,10 +469,7 @@ func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
 	log *slog.Logger) {
 
 	source := github.SourceName(repo)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	cycle := func() {
+	runLoop(ctx, "eval", interval, nil, func() {
 		stats, err := engine.EvaluatePending(ctx, source, watcher.Current(), eval.DefaultEvaluateBatch)
 		if err != nil {
 			log.Error("eval cycle failed", "source", source, "error", err)
@@ -439,17 +484,7 @@ func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
 			default:
 			}
 		}
-	}
-
-	cycle()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			cycle()
-		}
-	}
+	}, log)
 }
 
 // runPassLoop beats the advancement chain (docs/designs/0001 §4.3): each
@@ -457,10 +492,7 @@ func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
 // Per-item failures are already absorbed inside the tick; only a broken
 // store scan errors here and the next tick retries it.
 func runPassLoop(ctx context.Context, pass *dispatch.Pass, interval time.Duration, log *slog.Logger) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	tick := func() {
+	runLoop(ctx, "pass", interval, nil, func() {
 		stats, err := pass.Tick(ctx)
 		if err != nil {
 			log.Error("pass tick failed", "error", err)
@@ -475,17 +507,7 @@ func runPassLoop(ctx context.Context, pass *dispatch.Pass, interval time.Duratio
 				"followups", stats.Followups,
 				"delivered", stats.Delivered)
 		}
-	}
-
-	tick()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			tick()
-		}
-	}
+	}, log)
 }
 
 // derivePushBaseURL falls back to a loopback push base from the listen
@@ -507,10 +529,7 @@ func derivePushBaseURL(listenAddr string) string {
 // failures are classified and recorded inside DeliverPending; only a broken
 // store scan errors, and the next beat retries it.
 func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interval time.Duration, log *slog.Logger) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	beat := func() {
+	runLoop(ctx, "delivery", interval, nil, func() {
 		stats, err := deliverer.DeliverPending(ctx)
 		if err != nil {
 			log.Error("delivery beat failed", "error", err)
@@ -522,17 +541,7 @@ func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interva
 				"failed", stats.Failed,
 				"retried", stats.Retried)
 		}
-	}
-
-	beat()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			beat()
-		}
-	}
+	}, log)
 }
 
 // runMaterializeLoop materializes the workspaces of freshly accepted tickets
@@ -543,10 +552,7 @@ func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interva
 // stays responsive while workspaces are being prepared.
 func runMaterializeLoop(ctx context.Context, materializer *workspace.Materializer,
 	interval time.Duration, materializeNotify <-chan struct{}, log *slog.Logger) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	scan := func() {
+	runLoop(ctx, "materialize", interval, materializeNotify, func() {
 		stats, err := materializer.MaterializePending(ctx)
 		if err != nil {
 			log.Error("materialize scan failed", "error", err)
@@ -556,17 +562,5 @@ func runMaterializeLoop(ctx context.Context, materializer *workspace.Materialize
 				"materialized", stats.Materialized,
 				"failed", stats.Failed)
 		}
-	}
-
-	scan()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			scan()
-		case <-materializeNotify:
-			scan()
-		}
-	}
+	}, log)
 }

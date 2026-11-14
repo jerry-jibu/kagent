@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -69,8 +70,13 @@ func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin Adm
 		mux.HandleFunc("GET /admin/needs-attention", func(w http.ResponseWriter, r *http.Request) {
 			tickets, err := admin.NeedsAttentionTickets(r.Context())
 			if err != nil {
+				// The cause rides the response body, so a broken store scan
+				// never answers a bare 503. (The Pass/eval/delivery loops log
+				// the same store failure on every tick; the admin surface is
+				// a human's view, so the reason must be visible where the
+				// human is looking.)
 				writeJSON(w, http.StatusServiceUnavailable,
-					map[string]string{"reason": "failed to list needs-attention tickets"})
+					map[string]string{"reason": fmt.Sprintf("failed to list needs-attention tickets: %v", err)})
 				return
 			}
 			rows := make([]map[string]any, 0, len(tickets))

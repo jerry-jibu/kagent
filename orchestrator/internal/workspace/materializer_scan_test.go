@@ -18,6 +18,13 @@ import (
 // only; CreateTicket validation normally guarantees this shape).
 func seedScopedTicket(t *testing.T, s *store.Store, id, status, repo string) {
 	t.Helper()
+	seedScopedTicketOnBranch(t, s, id, status, repo, "")
+}
+
+// seedScopedTicketOnBranch is seedScopedTicket with a mandate scope base
+// branch (Story 27: issue 指向分支); empty leaves the scope without one.
+func seedScopedTicketOnBranch(t *testing.T, s *store.Store, id, status, repo, baseBranch string) {
+	t.Helper()
 	cfg, err := pgxpool.ParseConfig(testDatabaseURL(t))
 	if err != nil {
 		t.Fatalf("parse database URL: %v", err)
@@ -28,7 +35,7 @@ func seedScopedTicket(t *testing.T, s *store.Store, id, status, repo string) {
 		t.Fatalf("open seed pool: %v", err)
 	}
 	defer pool.Close()
-	mandate := `{"policy_version":"test","strength":"explicit","sender":"maintainer","scope":{"repo":"` + repo + `","issue":7}}`
+	mandate := `{"policy_version":"test","strength":"explicit","sender":"maintainer","scope":{"repo":"` + repo + `","issue":7,"base_branch":"` + baseBranch + `"}}`
 	tx, err := pool.Begin(context.Background())
 	if err != nil {
 		t.Fatalf("begin seed: %v", err)
@@ -79,6 +86,20 @@ func newGitBaseRepo(t *testing.T, repo string) (string, string, map[string][]byt
 	gitRun(t, repoDir, "-c", "user.email=orc@test", "-c", "user.name=orc", "commit", "-m", "initial", "-q")
 	head := strings.TrimSpace(gitRun(t, repoDir, "rev-parse", "main"))
 	return "file://" + base, head, files
+}
+
+// newGitBranch creates an extra branch off main in the local fixture repo and
+// commits one distinguishing file to it, returning that file's content.
+func newGitBranch(t *testing.T, repoDir, branch, file string, content []byte) {
+	t.Helper()
+	gitRun(t, repoDir, "checkout", "-q", "-b", branch)
+	p := filepath.Join(repoDir, file)
+	if err := os.WriteFile(p, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repoDir, "add", ".")
+	gitRun(t, repoDir, "-c", "user.email=orc@test", "-c", "user.name=orc", "commit", "-m", branch, "-q")
+	gitRun(t, repoDir, "checkout", "-q", "main")
 }
 
 func TestMaterializePending(t *testing.T) {
@@ -206,6 +227,51 @@ func TestMaterializePending(t *testing.T) {
 		}
 		if len(after) != len(events) {
 			t.Fatalf("audit rows went %d → %d, want no duplicate", len(events), len(after))
+		}
+	})
+
+	t.Run("Given a ticket whose mandate scope names a base branch, when the scan runs, assert that the workspace is materialized from that branch instead of the deployment default (Story 27: issue 指向分支经 Mandate scope 到物化器)", func(t *testing.T) {
+		gitBase, _, _ := newGitBaseRepo(t, "acme/api")
+		repoDir := filepath.Join(strings.TrimPrefix(gitBase, "file://"), "acme", "api.git")
+		featureReadme := []byte("# demo repo (release-1.2 line)\n")
+		newGitBranch(t, repoDir, "release-1.2", "FEATURE.md", featureReadme)
+
+		s, fake, m := newScanFixture(t, gitBase) // deployment default branch: main
+		seedScopedTicketOnBranch(t, s, "ticket-scan-branch", store.TicketStatusPending, "acme/api", "release-1.2")
+
+		stats, err := m.MaterializePending(ctx)
+		if err != nil {
+			t.Fatalf("MaterializePending failed: %v", err)
+		}
+		if stats.Materialized != 1 || stats.Failed != 0 {
+			t.Fatalf("stats = %+v, want 1 materialized / 0 failed", stats)
+		}
+
+		// The workspace carries the pointed-at branch's working copy — the
+		// file only release-1.2 holds proves which branch was cloned.
+		backend := workspace.NewAgentfsBackend(fake.endpoint())
+		got, err := backend.ReadFile(ctx, "ticket-scan-branch", "FEATURE.md")
+		if err != nil {
+			t.Fatalf("read-back of FEATURE.md failed: %v", err)
+		}
+		if !bytesEqual(got, featureReadme) {
+			t.Fatalf("FEATURE.md read-back is not the release-1.2 content; the wrong branch was cloned")
+		}
+
+		// The recorded baseline names the branch: the delivery diff and the
+		// PR base are pinned to it (T7 reads the baseline back).
+		events, err := s.AuditEvents(ctx, "ticket-scan-branch")
+		if err != nil {
+			t.Fatalf("AuditEvents failed: %v", err)
+		}
+		var auditedBranch string
+		for _, ev := range events {
+			if ev.Event == "workspace.materialized" {
+				auditedBranch, _ = ev.Detail["branch"].(string)
+			}
+		}
+		if auditedBranch != "release-1.2" {
+			t.Fatalf("materialization audit = %+v, want branch release-1.2", events)
 		}
 	})
 }

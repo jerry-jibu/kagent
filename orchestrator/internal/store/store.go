@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/fs"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -212,7 +212,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to list migrations: %w", err)
 	}
-	sort.Strings(entries)
+	slices.Sort(entries)
 
 	applied := make(map[string]bool)
 	rows, err := s.pool.Query(ctx, "SELECT version FROM schema_migrations")

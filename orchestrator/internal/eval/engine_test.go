@@ -252,6 +252,47 @@ func TestEngineEvaluateTrigger(t *testing.T) {
 		}
 	})
 
+	t.Run("Given an accept for a comment whose body points the work at a branch, when the ticket is created, assert that the mandate scope carries the parsed base branch (Story 27: issue 指向分支)", func(t *testing.T) {
+		f := newEngineFixture(t)
+		f.acceptEcho("authorized coding request")
+		pl := comment("alice", "@acme-bot please port the fix\nbase-branch: release-1.2", "acme/api")
+		source, tr := f.seedTrigger(t, pl)
+
+		if _, err := f.engine.EvaluateTrigger(context.Background(), source, tr, f.pol); err != nil {
+			t.Fatalf("EvaluateTrigger failed: %v", err)
+		}
+
+		tickets := f.tickets(t)
+		if len(tickets) != 1 {
+			t.Fatalf("tickets = %+v, want exactly the accepted ticket", tickets)
+		}
+		scope := tickets[0].Mandate.Scope
+		if scope.BaseBranch != "release-1.2" {
+			t.Fatalf("mandate scope = %+v, want base branch release-1.2 (Story 27)", scope)
+		}
+		if scope.Repo != "acme/api" || scope.Issue != 42 {
+			t.Fatalf("mandate scope = %+v, want the original repo/issue untouched", scope)
+		}
+	})
+
+	t.Run("Given an accept for a comment without a base-branch line, when the ticket is created, assert that the mandate scope leaves the base branch empty (the materializer's deployment default applies)", func(t *testing.T) {
+		f := newEngineFixture(t)
+		f.acceptEcho("authorized coding request")
+		source, tr := f.seedTrigger(t, addressedComment("acme/api"))
+
+		if _, err := f.engine.EvaluateTrigger(context.Background(), source, tr, f.pol); err != nil {
+			t.Fatalf("EvaluateTrigger failed: %v", err)
+		}
+
+		tickets := f.tickets(t)
+		if len(tickets) != 1 {
+			t.Fatalf("tickets = %+v, want exactly the accepted ticket", tickets)
+		}
+		if got := tickets[0].Mandate.Scope.BaseBranch; got != "" {
+			t.Fatalf("mandate scope base branch = %q, want empty (deployment default)", got)
+		}
+	})
+
 	t.Run("Given a comment in a repository outside the allowlist, when the trigger is evaluated, assert that a denied decision is recorded and the evaluator is never invoked", func(t *testing.T) {
 		f := newEngineFixture(t)
 		f.acceptEcho("should never be reached")

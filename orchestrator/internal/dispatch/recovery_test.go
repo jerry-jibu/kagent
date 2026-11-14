@@ -212,3 +212,53 @@ func TestRecoveryAnnotation(t *testing.T) {
 		}
 	})
 }
+
+// The ride-along semantics of the unread inputs (docs/designs/0001 §4.3):
+// the inputs are the person's unacknowledged context — a dispatch document
+// that omits them would send the worker back to work on stale knowledge. So
+// they ride on EVERY dispatch while recorded inputs exist, not only on
+// recovery redispatches; the document carries history, the store keeps truth.
+func TestUnreadInputsRideOnEveryDispatch(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Given a fresh first dispatch of a ticket holding recorded follow-up inputs, when the document is built, assert that the unread inputs ride along without any recovery annotation (未读输入只要存在就随行：直送上下文语义)", func(t *testing.T) {
+		s, _, _ := acceptFixture(t)
+		storeTriggerPayload(t, s)
+		ticketID := ticketIDOf(t, s)
+		if _, err := s.RecordFollowupInput(ctx, ticketID, "github:acme/api", "issue-comment:9001-early", store.DecisionInput{
+			Outcome:       store.DecisionIgnore,
+			Strength:      "explicit",
+			PolicyVersion: "abc123",
+			Reason:        "person spoke while the ticket was still pending",
+		}); err != nil {
+			t.Fatalf("RecordFollowupInput failed: %v", err)
+		}
+		fake := a2a.NewFake()
+		fake.ScriptDispatch("kagent/worker", a2a.DispatchResult{TaskID: "task-u1", ContextID: "ctx-u1"})
+		d := dispatch.New(s, fake, dispatch.Options{
+			WorkerAgent: "kagent/worker",
+			// The process started before the assignment was minted: a fresh
+			// first dispatch, no restart recovery involved.
+			RecoveryCutoff: time.Now().Add(-time.Hour),
+		})
+
+		if _, err := d.DispatchPending(ctx); err != nil {
+			t.Fatalf("DispatchPending failed: %v", err)
+		}
+		var doc struct {
+			Recovery     json.RawMessage `json:"recovery"`
+			UnreadInputs []struct {
+				DeterministicID string `json:"deterministic_id"`
+			} `json:"unread_inputs"`
+		}
+		if err := json.Unmarshal([]byte(fake.DispatchCalls()[0].Message), &doc); err != nil {
+			t.Fatalf("message is not a dispatch document: %v", err)
+		}
+		if len(doc.UnreadInputs) != 1 || doc.UnreadInputs[0].DeterministicID != "issue-comment:9001-early" {
+			t.Fatalf("unread inputs = %+v, want the recorded person message on the first dispatch", doc.UnreadInputs)
+		}
+		if len(doc.Recovery) != 0 {
+			t.Fatalf("recovery annotation = %s, want none on a fresh first dispatch", doc.Recovery)
+		}
+	})
+}

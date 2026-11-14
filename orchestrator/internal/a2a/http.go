@@ -167,7 +167,7 @@ func (t *HTTPTransport) rpc(ctx context.Context, route, method string, params an
 	payload, err := json.Marshal(jsonrpcRequest{
 		JSONRPC: "2.0",
 		Method:  method,
-		ID:      invokeID(),
+		ID:      newMessageID(), // the JSON-RPC request id, minted like the A2A message id
 		Params:  params,
 	})
 	if err != nil {
@@ -406,9 +406,4 @@ func newMessageID() string {
 		return fmt.Sprintf("orch-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
-}
-
-// invokeID mints the JSON-RPC request id.
-func invokeID() string {
-	return newMessageID()
 }

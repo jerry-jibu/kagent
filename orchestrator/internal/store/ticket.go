@@ -46,6 +46,12 @@ var ErrDuplicateAccept = errors.New("accept decision already recorded for trigge
 type MandateScope struct {
 	Repo  string `json:"repo"`
 	Issue int    `json:"issue"`
+	// BaseBranch is the branch the requester pointed the work at (Story 27:
+	// issue 指向分支, parsed from the trigger body by intake.BaseBranchFromBody).
+	// Empty means the deployment-level default applies — the materializer's
+	// configured base branch. It scopes where the work happens; it never
+	// widens authority, which comes from the Gate verdict alone.
+	BaseBranch string `json:"base_branch,omitempty"`
 }
 
 // Mandate is the durable authorization a ticket was created under. It

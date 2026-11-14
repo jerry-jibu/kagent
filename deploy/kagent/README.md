@@ -12,7 +12,7 @@
 | `harness-dsh-byo.yaml` | Harness `dsh-byo` | BYO 契约；`${DSH_BYO_IMAGE}`、`${SNAPSHOT_LOCATION}` 需代入 |
 | `agent-worker.yaml` | Agent `superagent-worker` | inline template + agentfs MCP 绑定 + `deepseek-openai` |
 | `agent-evaluator.yaml` | Agent `superagent-evaluator` | 内置 `kagent-default` harness + `outputSchema` 结构化 Decision + `deepseek` |
-| `orchestrator.yaml` | ConfigMap `superagent-policy` + Deployment `superagent-orchestrator` | 编排器单副本（实例锁）+ policy 热加载 + PG Pod 证书投影 + T9 全链路 flags |
+| `orchestrator.yaml` | Service + Deployment `superagent-orchestrator` + ConfigMap `superagent-policy` | push receiver 的集群内 Service（网关回调可达）+ 编排器单副本（实例锁）+ policy 热加载 + PG Pod 证书投影 + T9 全链路 flags |
 | `e2e-v1.sh` | 验收脚本 | V1 全链路（fake GitHub 面可重复；见下） |
 
 ## 镜像构建台账（源 SHA → digest，显式重同步，不自动漂移）
@@ -115,14 +115,15 @@ sed -e "s|${ORCH_IMAGE}|localhost:5000/superagent-orchestrator@sha256:<64hex>|" 
 
 | flag | 语义 | 空缺时 |
 |---|---|---|
-| `--database-url` | PostgreSQL 连接串（必需） | 拒绝启动 |
+| `--log-level` | JSON 日志最低级别（stderr；`debug`/`info`/`warn`/`error`） | `info` |
+| `--database-url` | PostgreSQL 连接串（必需；缺省回退读 `DATABASE_URL` 环境变量——集群 Secret 注入路径） | 拒绝启动 |
 | `--schema` | 编排器自有 PG schema（存在则跳过创建） | `orchestrator` |
 | `--policy-dir` | policy ConfigMap 挂载目录 | `/etc/orchestrator/policy` |
 | `--listen-addr` | healthz/admin + push receiver 监听 | `:8080` |
 | `--policy-poll-interval` | policy 热加载轮询 | `5s` |
 | `--github-source` | Source 轮询仓库（owner/name） | 空 = Source 关闭（下游全关） |
 | `--github-api-url` | GitHub REST base（fake GitHub 指这里） | `https://api.github.com` |
-| `--github-token` | 编排器持有的 GitHub 凭证（clone/push/PR/评论；凭证单调） | 空 = 匿名（公开仓库） |
+| `--github-token` | 编排器持有的 GitHub 凭证（clone/push/PR/评论；凭证单调；缺省回退读 `GITHUB_TOKEN` 环境变量——凭证不进 pod spec argv） | 空 = 匿名（公开仓库） |
 | `--github-poll-interval` | Source 轮询节拍 | `60s` |
 | `--github-start-cursor` | 全新 Source 起始 RFC3339 位点 | 仓库原点 |
 | `--a2a-gateway-url` | kagent A2A Gateway origin（例 `http://kagent-controller.kagent.svc:8083`） | eval/Pass 链关闭 |
@@ -133,10 +134,15 @@ sed -e "s|${ORCH_IMAGE}|localhost:5000/superagent-orchestrator@sha256:<64hex>|" 
 | `--pass-interval` | Pass 对账节拍（派工/对账/waitsForPerson/follow-up/outbox/物化扫描） | `2s` |
 | `--dispatch-start-deadline` | G7 卡死窗口（派工后无产出即 needs-attention） | `10m`（负值关闭） |
 | `--workspace-mcp-endpoint` | agentfs MCP 桥端点（例 `http://agentfs.kagent.svc:9765/mcp`）；**为空时交付链关闭，且派工不再等待物化基线** | 物化/交付链关闭 |
-| `--workspace-base-branch` | 物化器逐工单克隆的基分支（P0 单一部署级取值） | `main` |
+| `--workspace-base-branch` | 物化器逐工单克隆的默认基分支（Story 27：工单 Mandate scope 可带 `base-branch:` 行覆盖本默认） | `main` |
 | `--github-git-url` | git remote 基址（mandate 仓库名拼 `.git`） | `https://github.com` |
 
 链路序（accept 事务提交后）：物化扫描（accept→物化→基线落库）→ 派工扫描（`RequireWorkspace`：基线未落库不派工）→ worker Report ready → 交付循环（工作区读回 → 编排器侧 diff → push 分支 → PR → 结果评论 effect）。
+
+## P0 已接受边界（审查收口记录）
+
+- **Session 身份与 share（Stories 23/24）——本轮不写码**：编排器经 Gateway mTLS 以自身 ServiceAccount 身份调用，session 创建者=编排器 SA 是构造事实（`tickets.session_id` 只记录 contextId，归属无需额外字段）。**share 链接目前由用户在 UI 手动创建**（SessionService share），编排器自动签发并回贴 issue 归 **P1**。
+- **e2e 形态偏离已接受**：V1 全链路验收是独立 bash 脚本（`deploy/kagent/e2e-v1.sh`，fake GitHub 面 + 真集群组件），而非 `go/core/test/e2e` 套件内的 Go 测试。链路覆盖达意（store/g fake GitHub/bare git/egress 四处留证据）；集成形态的偏离已审查接受，go 套件内沉淀归后续票。
 
 ## 验证（CUJ1/CUJ2，0002）
 

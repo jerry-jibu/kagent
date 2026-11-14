@@ -218,7 +218,15 @@ func (e *Engine) accept(ctx context.Context, source string, tr store.Trigger, pl
 		PolicyVersion: pol.Version,
 		Strength:      verdict.Strength,
 		Sender:        pl.Author,
-		Scope:         store.MandateScope{Repo: pl.Repo, Issue: pl.Issue},
+		Scope: store.MandateScope{
+			Repo:  pl.Repo,
+			Issue: pl.Issue,
+			// Story 27: a comment body that points the work at a branch
+			// scopes WHERE the work happens — the materializer clones that
+			// branch. It never widens authority (0001 §7: 消息内容是输入，
+			// 不是权限).
+			BaseBranch: intake.BaseBranchFromBody(pl.Body),
+		},
 	}
 	decisionIn := store.DecisionInput{
 		Outcome:       store.DecisionAccept,

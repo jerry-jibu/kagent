@@ -177,9 +177,18 @@ func (m *Materializer) MaterializePending(ctx context.Context) (MaterializeStats
 
 	var stats MaterializeStats
 	for _, tk := range tickets {
+		// Story 27 (issue 指向分支): a mandate scope that names a base branch
+		// clones that branch; the deployment-level option stays the default
+		// for every ticket whose requester did not point at one. The branch
+		// lands in the recorded baseline, so the delivery diff and the PR
+		// base follow automatically.
+		branch := tk.Mandate.Scope.BaseBranch
+		if branch == "" {
+			branch = m.branch
+		}
 		req := CloneRequest{
 			RepoURL: ComposeRepoURL(m.gitBase, tk.Mandate.Scope.Repo),
-			Branch:  m.branch,
+			Branch:  branch,
 			Token:   m.token,
 		}
 		if _, err := m.MaterializeTicketWorkspace(ctx, tk.ID, req); err != nil {

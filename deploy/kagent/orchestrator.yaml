@@ -1,4 +1,4 @@
-# superagent-on-kagent P0 — orchestrator Deployment + policy ConfigMap（T1 骨架 / T9 全链路收口）
+# superagent-on-kagent P0 — orchestrator Service + Deployment + policy ConfigMap（T1 骨架 / T9 全链路收口）
 #
 # 设计依据：docs/designs/0001 D5/D6（独立 schema、单副本 Deployment）、§6（Store 事务纪律）、
 # docs/designs/0003（V1 全链路：accept→物化→派工→交付）。
@@ -7,7 +7,8 @@
 #   ${ORCH_IMAGE}                编排器镜像 digest 钉死形态（构建台账）
 #   ${POLICY_REPO}               Gate 允许的 GitHub 仓库（owner/name）
 #   ${GITHUB_SOURCE_REPO}        Source 轮询的仓库；置空整个 --github-source 对 = 关闭 Source（空转模式）
-# DATABASE_URL 指向集群 PostgreSQL 实例；orchestrator 使用独立 schema（默认 orchestrator）。
+# DATABASE_URL / GITHUB_TOKEN 以 env 注入（Secret 引用），不进容器 argv——
+# 编排器侧缺省回退读同名环境变量，pod spec 不出现凭证。
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -26,6 +27,25 @@ data:
   # bot 名单：bot 评论不视作人类触发（防自触发环）
   bots.json: |
     {"bots": ["kagent-bot[bot]"]}
+---
+# push receiver 的集群内入口：--push-base-url（http://superagent-orchestrator.kagent.svc:8080）
+# 与容器 --listen-addr :8080 经本 Service 对齐，网关的任务终态回调才能到达
+# /a2a/push（docs/designs/0001 D2；缺 Service 时推送地址集群内不可解析）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  selector:
+    app.kubernetes.io/name: superagent-orchestrator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -56,8 +76,6 @@ spec:
           # 占位：以构建台账 digest 替换（源 SHA → digest）
           image: ${ORCH_IMAGE}
           args:
-            - --database-url
-            - $(DATABASE_URL)
             - --schema
             - orchestrator
             - --policy-dir
@@ -69,8 +87,6 @@ spec:
             - ${GITHUB_SOURCE_REPO}
             - --github-poll-interval
             - 60s
-            - --github-token
-            - $(GITHUB_TOKEN)
             # T4 研判链：evaluator Agent 经 A2A Gateway invoke（kagent harness + outputSchema）
             - --a2a-gateway-url
             - http://kagent-controller.kagent.svc:8083
@@ -103,6 +119,8 @@ spec:
             # /run/postgres.podcert.ate.dev 客户端证书路径），配合下方
             # postgres-client-certificate projected volume（同一 signer +
             # username annotation，为编排器 Pod 铸造 kagent_owner_user 证书）。
+            # 凭证以 env 注入（不进 argv/pod spec 字面量）；编排器对
+            # --database-url/--github-token 缺省时回退读同名环境变量。
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
