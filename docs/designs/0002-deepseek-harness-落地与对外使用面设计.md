@@ -161,6 +161,10 @@ sequenceDiagram
 
 DSH BYO 镜像源码：上游 `kagent-dev/byo-ext` 仓库的 **PR #2「Add DeepSeek Harness」**（<https://github.com/kagent-dev/byo-ext/pull/2>，分支 `pull/2/head`；本地已取为 `pr-2` 分支检出）。**该 PR 未合入上游 main**——main 只含社区 harness 脚手架（`templates/harness/Dockerfile`），`harnesses/deepseek/`（Go bridge + Node DSH 双运行时，自带 `Dockerfile` 与 `VERIFICATION.md`）仅存在于 PR 分支。镜像从 PR 分支的 `harnesses/deepseek/Dockerfile` 构建，push 到 registry、digest 钉死写进 Harness CR；**构建归属 agent-data-workspace 的流水线**（kagent 仓库零 diff 不受影响）。我们的三份 manifest 以其 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本——该模板同时示范了实际字段名：`apiKeySecret`/`apiKeySecretKey`、`workerPoolRef.name`/`snapshotPolicy.location`。**helm 无需任何改动**——BYO 镜像引用随 CR 走，不进 `HarnessImagesConfig`（那是内置类型默认镜像的机制，`helm/kagent/values.yaml:153-156`）。`Harness.Spec.Env` 只收字面量（secret ref 被显式推迟，`runtime_types.go:8-20`）——与"bridge 零凭证"契约一致，无需放宽。
 
+#### A5 工作区物化与上下文可达（D10 定案，详设见 [0003](./0003-工作区物化与上下文可达性.md)）
+
+工单工作目录的代码物化采用**编排器预置**：Engine accept 后编排器（持 GitHub 凭证）浅克隆 `--depth 1` 物化进工单工作区，worker 离线做本地 git（DSH BYO 镜像已含 git/ripgrep/bash，byo-ext `Dockerfile:15`）产出 `format-patch`，**编排器取回并 push/建 PR**（凭证只在编排器，worker 无凭证且 remote URL 不嵌 token）。worker 自取 clone 为 P2 演进——前提是 EgressPolicy 放行 `github.com:443`（`agent_types.go:65` 原生扩展点）+ egress 层 git 凭证注入（新机制）；github.com 在 BYO 编译期 egress 白名单之外（`byo/compiler.go:77-79`），当前网络层即禁止。上下文可达性红线：跨 agent 运行时上下文**不共享**（仅按值注入/编译期 subagent），跨 actor 经 DATA 恢复**可达**。验证场景 V1–V7 见 0003。
+
 ### 2. 对外使用面：两模式 × 四入口
 
 ```mermaid
