@@ -10,7 +10,7 @@
 | 宿主机 | macOS Sonoma arm64 | 14.8 | — |
 | 虚拟机 | colima（vz + virtiofs，4C/8G/60G） | colima 0.10.3 / lima 2.3.0 | `~/.colima/` |
 | 集群 | kind `kagent`（K8s v1.37.0） | kind 0.33.0 | VM 内 docker 容器 `kagent-control-plane` |
-| 控制面 | kagent | v1.0.0-rc3 | ns `kagent` |
+| 控制面 | kagent | v1.0.1（2026-11-13 自 rc3 原地 helm 升级，substrate 仍 1.0.0） | ns `kagent` |
 | 运行时 | Agent Substrate | v1.0.0 | ns `ate-system` |
 | 数据工作区 | AgenticFS（集群内 + macOS 直挂） | 主分支构建 | ns `kagent`，Pod `agentfs` |
 | 数据源 | SeaweedFS（S3 兼容） | 3.80 | ns `kagent`，Pod `seaweedfs` |
@@ -39,8 +39,8 @@ kubectl -n kagent patch svc kagent-ui --type merge -p '{"spec":{"type":"NodePort
 
 | Pod | 镜像 | 职责 |
 |---|---|---|
-| `kagent/controller` | kagent/controller:1.0.0-rc3 | watch CRD、编译 ActorTemplate、gRPC+A2A+MCP 网关（8083）、会话管理 |
-| `kagent-ui` | kagent/ui:1.0.0-rc3 | Web 控制台（30882） |
+| `kagent/controller` | kagent/controller:1.0.1 | watch CRD、编译 ActorTemplate、gRPC+A2A+MCP 网关（8083）、会话管理 |
+| `kagent-ui` | kagent/ui:1.0.1 | Web 控制台（30882） |
 | `kagent-tools` | kagent/tools:0.3.0 | 内置 MCP 工具服务器（8084/mcp，8085/metrics） |
 | `kagent-postgresql` | postgres:18-alpine + tls-reloader sidecar | 会话/任务/历史持久层（5432） |
 | `kagent-default` | substrate/ateworker-gvisor:v1.0.0 | gVisor 沙箱 WorkerPool（actor 运行处） |
@@ -50,12 +50,13 @@ kubectl -n kagent patch svc kagent-ui --type merge -p '{"spec":{"type":"NodePort
 | `podcertificate-controller` | substrate/podcertcontroller | 全集群 mTLS 证书根（K8s v1.37 PodCertificate API） |
 
 kagent CR 现状：`Agent/workspace-agent`（READY）= DeepSeek 模型 + kagent-harness + `agenticfs-mcp` MCP 工具绑定。
+1.0.1 安装另带三个内置 Harness：`kagent-default` / `codex-default` / `claude-default`（v1.0.1 onboarding 新特性）。
 
 ## 4. 配置清单（全部落盘点）
 
 | 文件 / 资源 | 内容 |
 |---|---|
-| `~/Library/Application Support/kagent/config.yaml` | CLI 配置：provider、chart 版本钉住（`1.0.0-rc3`/`1.0.0`，**无 v 前缀**）、`bundledPostgresImage: postgres:18-alpine`、substrate/atelet valuesFiles |
+| `~/Library/Application Support/kagent/config.yaml` | CLI 配置：provider、chart 版本钉住（kagent `1.0.1` / substrate、atelet `1.0.0`，**无 v 前缀**）、`bundledPostgresImage: postgres:18-alpine`、substrate/atelet valuesFiles |
 | `~/Library/Application Support/kagent/overrides/substrate-images.yaml` | 去 digest 镜像覆盖（绕 DaoCloud tag 缓存漂移） |
 | Secret `kagent-deepseek`（ns kagent） | `ANTHROPIC_API_KEY`（DeepSeek Anthropic 兼容网关） |
 | ModelConfig `deepseek` | provider Anthropic + `baseUrl: https://api.deepseek.com/anthropic` + model `deepseek-flash` |
