@@ -1,6 +1,8 @@
 package policy_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,6 +155,21 @@ func TestLoad(t *testing.T) {
 		}
 		if after.Version == before.Version {
 			t.Fatal("changed content must produce a new version hash")
+		}
+	})
+}
+
+func TestCanonical(t *testing.T) {
+	t.Run("Given a loaded policy, when its canonical bytes are hashed, assert that the result equals the policy version", func(t *testing.T) {
+		dir := writePolicyDir(t, validRepos(), validAdmission(), validBots())
+		p, err := policy.Load(dir)
+		if err != nil {
+			t.Fatalf("load failed: %v", err)
+		}
+
+		sum := sha256.Sum256(p.Canonical())
+		if got := hex.EncodeToString(sum[:]); got != p.Version {
+			t.Fatalf("canonical bytes must hash to Version: got %s, want %s", got, p.Version)
 		}
 	})
 }

@@ -123,6 +123,15 @@ func (p Policy) validate() error {
 
 // Hash computes the canonical content hash: parsed content, sorted, re-marshaled.
 func (p Policy) Hash() string {
+	raw := p.Canonical()
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// Canonical returns the sorted, re-marshaled policy content. Its SHA256 is
+// exactly the Version hash, so the content persisted in the Store is the
+// verbatim hash input.
+func (p Policy) Canonical() []byte {
 	c := canonical{
 		Repositories: append([]string(nil), p.Repositories...),
 		Admission:    append([]AdmissionRule(nil), p.Admission...),
@@ -137,8 +146,7 @@ func (p Policy) Hash() string {
 		// Marshal of plain strings/structs cannot fail; unreachable guard.
 		panic(fmt.Sprintf("policy canonical marshal failed: %v", err))
 	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:])
+	return raw
 }
 
 // StrengthFor returns the admission strength of a sender, or StrengthDenied
