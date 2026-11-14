@@ -396,4 +396,3 @@ func TestDeliveryAuditDetailShape(t *testing.T) {
 		}
 	})
 }
-

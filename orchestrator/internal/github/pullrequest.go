@@ -147,9 +147,9 @@ func (t *httpTransport) findOpenPullRequest(ctx context.Context, repo, head stri
 // wirePullRequest mirrors the GitHub pull request response object (the
 // subset the orchestrator consumes).
 type wirePullRequest struct {
-	Number  int    `json:"number"`
-	HTMLURL string `json:"html_url"`
-	State   string `json:"state"`
+	Number  int     `json:"number"`
+	HTMLURL string  `json:"html_url"`
+	State   string  `json:"state"`
 	Head    wireRef `json:"head"`
 	Base    wireRef `json:"base"`
 }
