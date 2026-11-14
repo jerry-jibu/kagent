@@ -47,11 +47,13 @@ const waitsForPersonArms = `
 
 // WaitsForPersonTicket is one ticket the waitsForPerson predicate holds:
 // its latest assignment settled without completing and nobody has spoken on
-// the thread since (docs/designs 0001 §3).
+// the thread since (docs/designs 0001 §3). TicketStatus lets the enforcer
+// skip tickets already sitting in needs-attention without a store write.
 type WaitsForPersonTicket struct {
 	TicketID         string
 	ThreadSource     string
 	ThreadKey        string
+	TicketStatus     string // pending | running | needs-attention
 	AssignmentID     string // the latest assignment
 	AssignmentStatus string // ended | unresolved
 	Report           string // blocked | failed | waiting | dropped | "" (unresolved)
@@ -69,7 +71,7 @@ type WaitsForPersonTicket struct {
 // ticket as well, so an answered hold is visible here.
 func (s *Store) WaitsForPersonTickets(ctx context.Context) ([]WaitsForPersonTicket, error) {
 	rows, err := s.pool.Query(ctx, latestAssignmentCTE+`
-	SELECT tk.id, tk.thread_source, tk.thread_key,
+	SELECT tk.id, tk.thread_source, tk.thread_key, tk.status,
 	       l.assignment_id, l.status, l.report, l.settled_at
 	FROM tickets tk
 	JOIN latest l ON l.ticket_id = tk.id
@@ -95,7 +97,7 @@ func collectWaitsForPerson(rows pgx.Rows) ([]WaitsForPersonTicket, error) {
 	var out []WaitsForPersonTicket
 	for rows.Next() {
 		var c WaitsForPersonTicket
-		if err := rows.Scan(&c.TicketID, &c.ThreadSource, &c.ThreadKey,
+		if err := rows.Scan(&c.TicketID, &c.ThreadSource, &c.ThreadKey, &c.TicketStatus,
 			&c.AssignmentID, &c.AssignmentStatus, &c.Report, &c.SettledAt); err != nil {
 			return nil, fmt.Errorf("failed to scan waitsForPerson candidate: %w", err)
 		}

@@ -76,6 +76,10 @@ type PassStats struct {
 	// Stuck counts dispatched assignments past their start deadline whose
 	// task produced no outcome (G7): needs-attention, no replay.
 	Stuck int
+	// Held counts tickets the waitsForPerson scan moved to needs-attention
+	// this tick (0001 §3: 最近 Assignment blocked/failed 且此后无人发言 →
+	// 自动挂起输入). Tickets already held are not re-audited or counted.
+	Held int
 	// Followups counts continuation assignments minted this tick.
 	Followups int
 	// Delivered counts outbox effects delivered this tick.
@@ -96,6 +100,9 @@ func (p *Pass) Tick(ctx context.Context) (PassStats, error) {
 	stats.DispatchFailed = dispatched.Failed
 
 	if err := p.reconcile(ctx, &stats); err != nil {
+		return stats, err
+	}
+	if err := p.enforceWaitsForPerson(ctx, &stats); err != nil {
 		return stats, err
 	}
 	if err := p.scheduleFollowups(ctx, &stats); err != nil {
@@ -204,6 +211,41 @@ func isStuck(a store.Assignment, task a2a.Task, now time.Time) bool {
 	default:
 		return !a2a.IsTerminalTaskState(task.State)
 	}
+}
+
+// enforceWaitsForPerson holds every ticket the waitsForPerson predicate
+// flags that is not already held (docs/designs 0001 §3: 最近 Assignment
+// blocked/failed 且此后无人发言 → 自动挂起输入). In a healthy store the
+// report-driven transitions hold these tickets atomically with the settle,
+// so this scan is the consistency backstop: it catches drifted rows and
+// makes the hold a standing invariant, not an accident of the write path.
+// Tickets already in needs-attention are skipped without a write — the hold
+// absorbs automation through the dispatch scan's needs-attention exclusion.
+// A person answers through the admin retry (or a fresh trigger); the Pass
+// never resumes held work on its own.
+func (p *Pass) enforceWaitsForPerson(ctx context.Context, stats *PassStats) error {
+	candidates, err := p.store.WaitsForPersonTickets(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read waitsForPerson candidates: %w", err)
+	}
+	for _, c := range candidates {
+		if c.TicketStatus == store.TicketStatusNeedsAttention {
+			continue
+		}
+		settled := c.Report
+		if settled == "" {
+			settled = c.AssignmentStatus
+		}
+		changed, err := p.store.MarkTicketNeedsAttention(ctx, c.TicketID,
+			fmt.Sprintf("waitsForPerson: assignment %s settled %s and nobody has spoken on the thread since", c.AssignmentID, settled))
+		if err != nil {
+			return fmt.Errorf("failed to hold ticket %s for a person: %w", c.TicketID, err)
+		}
+		if changed {
+			stats.Held++
+		}
+	}
+	return nil
 }
 
 // scheduleFollowups mints continuation assignments for running tickets

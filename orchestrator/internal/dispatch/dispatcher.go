@@ -45,6 +45,12 @@ type Options struct {
 	// FollowUpAfter delays a progress continuation after the last
 	// assignment settled; 0 continues on the next Pass tick.
 	FollowUpAfter time.Duration
+	// RecoveryCutoff is the instant the current process started (T8 startup
+	// recovery, docs/designs 0001 §4.3). Assignments minted before it were
+	// left behind by a dead process: their first dispatch after the restart
+	// carries the restart recovery annotation. Zero disables the restart
+	// arm — dispatch-failure retries keep annotating via the ledger.
+	RecoveryCutoff time.Time
 }
 
 func (o Options) maxFollowups() int {
@@ -139,6 +145,13 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate)
 	return nil
 }
 
+// isRestartRedispatch reports whether the assignment was minted before the
+// current process started: its first dispatch here is a restart recovery
+// redispatch (docs/designs 0001 §4.3: 重启中断的 Assignment 重派).
+func (d *Dispatcher) isRestartRedispatch(c store.DispatchCandidate) bool {
+	return !d.opts.RecoveryCutoff.IsZero() && c.Assignment.CreatedAt.Before(d.opts.RecoveryCutoff)
+}
+
 // recordFailure records one failed dispatch attempt. The assignment stays
 // pending; the Pass's next tick retries it with the recovery annotation.
 func (d *Dispatcher) recordFailure(ctx context.Context, c store.DispatchCandidate, cause error) error {
@@ -192,10 +205,27 @@ func (d *Dispatcher) buildDocument(ctx context.Context, c store.DispatchCandidat
 		"url":        pl.URL,
 	}
 
-	if c.Assignment.DispatchAttempts > 0 {
-		doc["recovery"] = map[string]any{
-			"attempt":        c.Assignment.DispatchAttempts + 1,
-			"previous_error": c.Assignment.LastError,
+	if c.Assignment.DispatchAttempts > 0 || d.isRestartRedispatch(c) {
+		recovery := map[string]any{}
+		if c.Assignment.DispatchAttempts > 0 {
+			recovery["attempt"] = c.Assignment.DispatchAttempts + 1
+			recovery["previous_error"] = c.Assignment.LastError
+		}
+		if d.isRestartRedispatch(c) {
+			recovery["reason"] = "orchestrator restart"
+		}
+		doc["recovery"] = recovery
+
+		// 未读 Inputs 随行 (docs/designs 0001 §4.3): person messages recorded
+		// on the thread while the ticket was interrupted ride along. There is
+		// no worker ACK in P0, so the inputs ride on every recovery
+		// redispatch — the document carries history, the store keeps truth.
+		inputs, err := d.store.FollowupInputs(ctx, c.Ticket.ID)
+		if err != nil {
+			return "", fmt.Errorf("ticket %s carries unreadable followup inputs: %w", c.Ticket.ID, err)
+		}
+		if len(inputs) > 0 {
+			doc["unread_inputs"] = inputs
 		}
 	}
 

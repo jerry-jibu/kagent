@@ -70,7 +70,11 @@ type FollowupCandidate struct {
 
 // PendingDispatches returns the pending assignments bound to live tickets,
 // oldest first. Failed and ended tickets are never dispatched: the dead
-// state is terminal (docs/designs/0001 §8).
+// state is terminal (docs/designs 0001 §8). A needs-attention ticket is
+// never auto-dispatched either — the hold waits for a person, and the only
+// legitimate path back to a pending assignment is the admin retry, which
+// flips the ticket to running atomically with the mint (T8 issue #9: 自动
+// 挂起输入 absorbs automation).
 func (s *Store) PendingDispatches(ctx context.Context) ([]DispatchCandidate, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+assignmentJoinColumns+`,
@@ -78,9 +82,9 @@ func (s *Store) PendingDispatches(ctx context.Context) ([]DispatchCandidate, err
 		       tk.trigger_source, tk.trigger_deterministic_id, tk.created_at
 		FROM assignments a
 		JOIN tickets tk ON tk.id = a.ticket_id
-		WHERE a.status = $1 AND tk.status NOT IN ($2, $3)
+		WHERE a.status = $1 AND tk.status NOT IN ($2, $3, $4)
 		ORDER BY a.created_at, a.id`,
-		AssignmentStatusPending, TicketStatusFailed, TicketStatusEnded)
+		AssignmentStatusPending, TicketStatusFailed, TicketStatusEnded, TicketStatusNeedsAttention)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pending dispatches: %w", err)
 	}
@@ -104,6 +108,70 @@ func (s *Store) RunningAssignmentCandidates(ctx context.Context) ([]ReconcileCan
 		return nil, fmt.Errorf("failed to list reconcile candidates: %w", err)
 	}
 	return collectCandidates(rows, scanReconcileCandidate)
+}
+
+// NonTerminalAssignments returns every pending or running assignment on a
+// live (non-terminal) ticket with its ticket, oldest first — the startup
+// recovery manifest (docs/designs 0001 §4.3: 装载未终结 Assignment). Work on
+// a failed/ended ticket is settled whatever the rows say; it never comes
+// back through a restart.
+func (s *Store) NonTerminalAssignments(ctx context.Context) ([]DispatchCandidate, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT `+assignmentJoinColumns+`,
+		       tk.id, tk.thread_source, tk.thread_key, tk.mandate, tk.status, tk.session_id,
+		       tk.trigger_source, tk.trigger_deterministic_id, tk.created_at
+		FROM assignments a
+		JOIN tickets tk ON tk.id = a.ticket_id
+		WHERE a.status IN ($1, $2) AND tk.status NOT IN ($3, $4)
+		ORDER BY a.created_at, a.id`,
+		AssignmentStatusPending, AssignmentStatusRunning, TicketStatusFailed, TicketStatusEnded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list non-terminal assignments: %w", err)
+	}
+	return collectCandidates(rows, scanDispatchCandidate)
+}
+
+// FollowupInput is one person message recorded on an owned thread
+// (followupOwners guard, docs/designs 0001 §4.2) — the "unread inputs" a
+// recovery dispatch carries along.
+type FollowupInput struct {
+	Source          string `json:"source"`
+	DeterministicID string `json:"deterministic_id"`
+	Decision        string `json:"decision"`
+	Reason          string `json:"reason,omitempty"`
+	CreatedAt       time.Time
+}
+
+// FollowupInputs returns the follow-up inputs recorded on a ticket, oldest
+// first — the ride-along context of a recovery redispatch (0001 §4.3: 未读
+// Inputs 随行).
+func (s *Store) FollowupInputs(ctx context.Context, ticketID string) ([]FollowupInput, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT detail, created_at
+		FROM audit
+		WHERE ticket_id = $1 AND event = $2
+		ORDER BY id`,
+		ticketID, "ticket.followup_input")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list followup inputs of %s: %w", ticketID, err)
+	}
+	defer rows.Close()
+
+	var out []FollowupInput
+	for rows.Next() {
+		var (
+			in     FollowupInput
+			detail []byte
+		)
+		if err := rows.Scan(&detail, &in.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan followup input of %s: %w", ticketID, err)
+		}
+		if err := json.Unmarshal(detail, &in); err != nil {
+			return nil, fmt.Errorf("ticket %s carries a followup input that does not decode: %w", ticketID, err)
+		}
+		out = append(out, in)
+	}
+	return out, rows.Err()
 }
 
 // FollowupCandidates returns the live running tickets whose assignments all
