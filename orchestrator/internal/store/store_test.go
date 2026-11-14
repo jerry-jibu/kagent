@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,6 +236,50 @@ func TestIngestEvents(t *testing.T) {
 		}
 		if ok {
 			t.Fatal("cursor must be absent before the first ingest")
+		}
+	})
+
+	t.Run("Given many workers ingesting the same inbox concurrently, when they all run, assert that every trigger exists exactly once and only claim refusals are reported as errors", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		mustMigrate(t, s)
+
+		const workers = 8
+		errs := make(chan error, workers)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start // maximize genuine overlap
+				_, err := s.IngestEvents(ctx, store.SourceRef{Name: source, Kind: "github"}, sequence, 14*24*time.Hour)
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+
+		for err := range errs {
+			if err != nil && !errors.Is(err, store.ErrInboxLocked) {
+				t.Fatalf("only ErrInboxLocked may be reported under contention, got: %v", err)
+			}
+		}
+
+		triggers, err := s.Triggers(ctx, source)
+		if err != nil {
+			t.Fatalf("read triggers failed: %v", err)
+		}
+		if len(triggers) != len(sequence) {
+			t.Fatalf("dedup must keep exactly one row per event, want %d rows, got %d", len(sequence), len(triggers))
+		}
+		seen := map[string]bool{}
+		for _, tr := range triggers {
+			if seen[tr.DeterministicID] {
+				t.Fatalf("duplicate trigger row for %s", tr.DeterministicID)
+			}
+			seen[tr.DeterministicID] = true
 		}
 	})
 }
