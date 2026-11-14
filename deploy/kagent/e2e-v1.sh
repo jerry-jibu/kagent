@@ -186,7 +186,7 @@ DEEPSEEK_HITS=$(kubectl -n ate-system logs deploy/atenet-egress --since="$GATEWA
 # 任何非 deepseek 行出现 github.com = 真实出站（请求 URI/host），判失败。
 GITHUB_HITS=$(kubectl -n ate-system logs deploy/atenet-egress --since="$GATEWAY_SINCE" 2>/dev/null | grep -i "github.com" | grep -vicE "deepseek" || true)
 [ "$DEEPSEEK_HITS" -ge 1 ] && ok "egress 网关有 DeepSeek 命中（$DEEPSEEK_HITS 次）——worker 流量经 egress，断言非空转" || fail "egress 网关无 DeepSeek 命中（流量未经过网关？）"
-[ "$GITHUB_HITS" = "0" ] && ok "egress 网关零 github.com 命中（近 $GATEWAY_SINCE）——沙箱无 github.com 出站" || fail "egress 网关出现 github.com 命中 $GITHUB_HITS 次"
+[ "$GITHUB_HITS" = "0" ] && ok "egress 网关零 github.com 命中（近 ${GATEWAY_SINCE}）——沙箱无 github.com 出站" || fail "egress 网关出现 github.com 命中 $GITHUB_HITS 次"
 # 编排器凭证单调性佐证：worker env 只含模型凭证与平台注入（atelet Run 日志），无 GitHub token
 WORKER_ENV=$(kubectl -n ate-system logs ds/atelet --since="$GATEWAY_SINCE" 2>/dev/null | grep '"method":"/atelet.Atelet/Run"' | grep superagent-worker | tail -1 | grep -c "GITHUB_TOKEN\|github" || true)
 [ "$WORKER_ENV" = "0" ] && ok "worker Run 请求 env 无 GitHub 凭证（凭证单调，编排器持唯一凭证）" || fail "worker env 出现 github 相关凭证"
