@@ -587,3 +587,16 @@ func ContentHash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+
+// Now returns the database's current timestamp. Startup code uses it
+// instead of the app clock whenever it must compare against DB-generated
+// timestamps — assignments carry created_at from this clock, so a skewed
+// app clock must never flip a recovery redispatch into a fresh dispatch
+// (T8 RecoveryCutoff).
+func (s *Store) Now(ctx context.Context) (time.Time, error) {
+	var now time.Time
+	if err := s.pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("failed to read the database clock: %w", err)
+	}
+	return now, nil
+}

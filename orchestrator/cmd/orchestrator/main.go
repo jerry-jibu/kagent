@@ -248,16 +248,27 @@ func main() {
 			if pushBase == "" {
 				pushBase = derivePushBaseURL(cfg.ListenAddr)
 			}
+			// T8 startup recovery (docs/designs 0001 §4.3): assignments
+			// minted before this instant were left by a dead process —
+			// their first dispatch here carries the restart recovery
+			// annotation. The cutoff comes from the DATABASE clock, the
+			// clock assignment created_at is written by: a skewed app
+			// clock must not flip a recovery redispatch into a fresh
+			// dispatch.
+			dbNow, err := st.Now(pollerCtx)
+			if err != nil {
+				log.Error("failed to read the database clock; refusing to start", "error", err)
+				cancelPoller()
+				watcher.Stop()
+				st.Close()
+				os.Exit(1)
+			}
 			workerTransport := a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: cfg.A2AGatewayURL})
 			dispatcher := dispatch.New(st, workerTransport, dispatch.Options{
-				WorkerAgent:   cfg.WorkerAgent,
-				PushBaseURL:   pushBase,
-				StartDeadline: cfg.DispatchDeadline,
-				// T8 startup recovery (docs/designs 0001 §4.3): assignments
-				// minted before this instant were left by a dead process —
-				// their first dispatch here carries the restart recovery
-				// annotation.
-				RecoveryCutoff: time.Now(),
+				WorkerAgent:    cfg.WorkerAgent,
+				PushBaseURL:    pushBase,
+				StartDeadline:  cfg.DispatchDeadline,
+				RecoveryCutoff: dbNow,
 			})
 			pushReceiver = dispatch.NewReceiver(dispatcher)
 			pass := dispatch.NewPass(st, dispatcher, outbox.New(st, ghTransport), dispatch.PassOptions{})
