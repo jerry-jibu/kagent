@@ -11,12 +11,15 @@
 // terminal states, 2s reconcile against the gateway task store (push-loss
 // backstop, red line on vanished tasks, G7 stuck detection), progress
 // follow-ups, and the outbox deliverer (taken over from the eval loop).
-// From T8 the startup runs the recovery manifest (装载未终结 Assignment;
-// interrupted re-dispatch carries the recovery annotation, committed
-// effects replay under receipt dedup), the Pass enforces waitsForPerson
-// holds, the eval chain respects followupOwners (no fork of an owned
-// thread), and the admin surface serves list-needs-attention / retry /
-// stop — every mutation audited.
+// From T7 the delivery loop ships ready results as ticket branches, PRs and
+// result comments when --workspace-mcp-endpoint is set (Alternative E: the
+// patch is computed orchestrator-side from the workspace read-back — the
+// worker never touches git or github.com). From T8 the startup runs the
+// recovery manifest (装载未终结 Assignment; interrupted re-dispatch carries
+// the recovery annotation, committed effects replay under receipt dedup),
+// the Pass enforces waitsForPerson holds, the eval chain respects
+// followupOwners (no fork of an owned thread), and the admin surface serves
+// list-needs-attention / retry / stop — every mutation audited.
 //
 // Startup failure semantics (T1 AC): an unreachable database, a held
 // instance lock, failed migrations, or a broken initial policy all refuse
@@ -36,6 +39,7 @@ import (
 	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/a2a"
+	"github.com/jerry-jibu/kagent/orchestrator/internal/delivery"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/dispatch"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/eval"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/github"
@@ -45,6 +49,7 @@ import (
 	"github.com/jerry-jibu/kagent/orchestrator/internal/server"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/source"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/store"
+	"github.com/jerry-jibu/kagent/orchestrator/internal/workspace"
 )
 
 // DefaultEvalInterval is the eval cadence. The eval loop must run noticeably
@@ -74,6 +79,9 @@ type Config struct {
 	PushBaseURL      string
 	PassInterval     time.Duration
 	DispatchDeadline time.Duration
+
+	WorkspaceMCPEndpoint string
+	GitHubGitBaseURL     string
 }
 
 func parseConfig() Config {
@@ -95,6 +103,8 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.PushBaseURL, "push-base-url", "", "orchestrator origin the gateway can reach for push callbacks (default: derived from --listen-addr)")
 	flag.DurationVar(&cfg.PassInterval, "pass-interval", dispatch.DefaultPassInterval, "Pass beat interval (dispatch/reconcile/follow-up/outbox)")
 	flag.DurationVar(&cfg.DispatchDeadline, "dispatch-start-deadline", dispatch.DefaultStartDeadline, "how long a dispatched task may run without an outcome before the Pass marks it stuck (0 disables, negative disables)")
+	flag.StringVar(&cfg.WorkspaceMCPEndpoint, "workspace-mcp-endpoint", "", "agentfs MCP bridge endpoint materializing ticket workspaces; required for the delivery loop (empty disables delivery)")
+	flag.StringVar(&cfg.GitHubGitBaseURL, "github-git-url", delivery.DefaultGitBaseURL, "git remote base the mandate-scope repo composes with for clone/push and PRs")
 	flag.Parse()
 	return cfg
 }
@@ -299,6 +309,29 @@ func main() {
 		} else {
 			log.Info("pass beat disabled: --worker-agent and --a2a-gateway-url are required for dispatch")
 		}
+
+		// Delivery loop (T7): ships ready results as ticket branches + PRs +
+		// result comments (docs/designs/0003 Alternative E: the orchestrator
+		// computes the patch from the workspace read-back — the worker never
+		// touches git or github.com). Runs when the agentfs bridge endpoint
+		// is configured; the git remote base and the API token are the same
+		// orchestrator-held credential pair the materializer clones with.
+		if cfg.WorkspaceMCPEndpoint == "" {
+			log.Info("delivery loop disabled: --workspace-mcp-endpoint is required for workspace read-back")
+		} else if cfg.GitHubToken == "" {
+			log.Info("delivery loop disabled: --github-token is required for git push and PR creation")
+		} else {
+			deliverer := delivery.New(st, workspace.NewAgentfsBackend(cfg.WorkspaceMCPEndpoint), ghTransport, delivery.Options{
+				GitBaseURL: cfg.GitHubGitBaseURL,
+				Token:      cfg.GitHubToken,
+				Log:        log,
+			})
+			go runDeliveryLoop(pollerCtx, deliverer, cfg.PassInterval, log)
+			log.Info("delivery loop started",
+				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
+				"git_base_url", cfg.GitHubGitBaseURL,
+				"interval", cfg.PassInterval.String())
+		}
 	} else {
 		log.Info("github source disabled (--github-source not set)")
 	}
@@ -417,4 +450,36 @@ func derivePushBaseURL(listenAddr string) string {
 		return "http://127.0.0.1" + addr
 	}
 	return "http://" + addr
+}
+
+// runDeliveryLoop ships pending results on the Pass cadence. Per-candidate
+// failures are classified and recorded inside DeliverPending; only a broken
+// store scan errors, and the next beat retries it.
+func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interval time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	beat := func() {
+		stats, err := deliverer.DeliverPending(ctx)
+		if err != nil {
+			log.Error("delivery beat failed", "error", err)
+		}
+		if stats.Delivered+stats.Confirmed+stats.Failed+stats.Retried > 0 {
+			log.Info("delivery beat",
+				"delivered", stats.Delivered,
+				"confirmed", stats.Confirmed,
+				"failed", stats.Failed,
+				"retried", stats.Retried)
+		}
+	}
+
+	beat()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			beat()
+		}
+	}
 }

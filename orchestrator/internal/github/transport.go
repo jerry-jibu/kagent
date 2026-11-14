@@ -29,6 +29,11 @@ type Transport interface {
 	// PostIssueComment posts one comment on the issue conversation and
 	// returns the created comment's server-assigned id.
 	PostIssueComment(ctx context.Context, repo string, issue int, body string) (int64, error)
+	// CreatePullRequest opens the PR from the delivered ticket branch to its
+	// base branch (T7). Observably idempotent: a head branch that already
+	// carries an open PR returns the EXISTING PR, never a duplicate — a
+	// delivery replay after a lost receipt is safe.
+	CreatePullRequest(ctx context.Context, repo string, in PullRequestInput) (PullRequest, error)
 }
 
 // TransportConfig configures the production HTTP transport.

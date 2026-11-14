@@ -338,6 +338,7 @@ func (d *Dispatcher) applyReportPlan(ctx context.Context, assignment store.Assig
 		ReportState:      report.State,
 		TicketID:         ticket.ID,
 		TicketStatus:     plan.TicketStatus,
+		DeliveryPending:  plan.Deliverable,
 		Event:            plan.Event,
 		Detail:           reportDetail(report, task.ID),
 	})

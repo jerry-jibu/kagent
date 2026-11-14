@@ -94,14 +94,7 @@ func (c *Cloner) Clone(ctx context.Context, req CloneRequest) (CloneOutcome, err
 		return CloneOutcome{}, fmt.Errorf("failed to create clone directory: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", BuildCloneArgs(req.RepoURL, req.Branch, dest)...)
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0", // never hang on an interactive prompt
-	)
-	if req.Token != "" {
-		cmd.Env = append(cmd.Env, tokenEnvVar+"="+req.Token)
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := gitRun(ctx, dest, req.Token, BuildCloneArgs(req.RepoURL, req.Branch, dest)...); err != nil {
 		_ = os.RemoveAll(dest)
 		return CloneOutcome{}, fmt.Errorf("shallow clone of %s branch %s failed: %w: %s",
 			req.RepoURL, req.Branch, err, tailOutput(out))
@@ -115,13 +108,69 @@ func (c *Cloner) Clone(ctx context.Context, req CloneRequest) (CloneOutcome, err
 	return CloneOutcome{Dir: dest, BaseCommit: head}, nil
 }
 
+// CloneCommitRequest pins the fetch to one exact commit instead of a branch
+// tip. The delivery diff (T7, 0003 Alternative E) is computed against the
+// commit the workspace was MATERIALIZED from — if the upstream branch moved
+// since, re-cloning the tip would fold other people's changes into the PR.
+type CloneCommitRequest struct {
+	// RepoURL is the clone URL (credential-free; ValidateRepoURL enforces).
+	RepoURL string
+	// Commit is the full 40-hex SHA to fetch.
+	Commit string
+	// Token is the orchestrator-held credential; optional.
+	Token string
+}
+
+// CloneCommit fetches exactly req.Commit (depth 1, credential-free URL, token
+// via the transient helper) into a fresh temp dir checked out at that commit
+// (detached HEAD). GitHub accepts fetch-by-SHA server-side
+// (uploadpack.allowAnySHA1InWant); local test remotes enable it in their
+// config. Errors are prompt, like Clone.
+func (c *Cloner) CloneCommit(ctx context.Context, req CloneCommitRequest) (CloneOutcome, error) {
+	if err := ValidateRepoURL(req.RepoURL); err != nil {
+		return CloneOutcome{}, err
+	}
+	if !isCommitSHA(req.Commit) {
+		return CloneOutcome{}, fmt.Errorf("clone commit %q is not a full hex SHA", req.Commit)
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return CloneOutcome{}, fmt.Errorf("git binary not found on PATH: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	dest, err := os.MkdirTemp("", "kagent-clone-commit-")
+	if err != nil {
+		return CloneOutcome{}, fmt.Errorf("failed to create clone directory: %w", err)
+	}
+
+	cleanup := func(err error) (CloneOutcome, error) {
+		_ = os.RemoveAll(dest)
+		return CloneOutcome{}, err
+	}
+
+	if out, err := gitRun(ctx, dest, req.Token, "init", "-q", "."); err != nil {
+		return cleanup(fmt.Errorf("failed to init the baseline clone: %w: %s", err, tailOutput(out)))
+	}
+	// -c options are git GLOBAL options: they must precede the subcommand.
+	if out, err := gitRun(ctx, dest, req.Token,
+		append(authArgs(), "fetch", "-q", "--depth", "1", "--no-tags", req.RepoURL, req.Commit)...); err != nil {
+		return cleanup(fmt.Errorf("failed to fetch baseline commit %s of %s: %w: %s",
+			req.Commit, req.RepoURL, err, tailOutput(out)))
+	}
+	if out, err := gitRun(ctx, dest, "", "checkout", "--detach", "--quiet", "FETCH_HEAD"); err != nil {
+		return cleanup(fmt.Errorf("failed to check out the baseline commit: %w: %s", err, tailOutput(out)))
+	}
+
+	return CloneOutcome{Dir: dest, BaseCommit: req.Commit}, nil
+}
+
 // BuildCloneArgs returns the git argv for the shallow clone: depth 1,
 // single branch, no tags, transient credential helper. The token is never
 // part of argv — the helper reads it from the subprocess environment.
 func BuildCloneArgs(repoURL, branch, dest string) []string {
-	return []string{
-		"-c", "credential.helper=", // reset ambient helpers
-		"-c", "credential.helper=" + inlineCredentialHelper,
+	return append(authArgs(),
 		"clone",
 		"--depth", "1",
 		"--single-branch",
@@ -129,7 +178,52 @@ func BuildCloneArgs(repoURL, branch, dest string) []string {
 		"--branch", branch,
 		repoURL,
 		dest,
+	)
+}
+
+// authArgs resets ambient credential helpers and installs the transient
+// inline helper that reads the token from tokenEnvVar at auth time. Only
+// meaningful for network transports; harmless for file://.
+func authArgs() []string {
+	return []string{
+		"-c", "credential.helper=", // reset ambient helpers
+		"-c", "credential.helper=" + inlineCredentialHelper,
 	}
+}
+
+// gitRun runs one git command in dir with the orchestrator's hardened
+// environment: no terminal prompts, and the token (when set) riding the
+// credential-helper environment variable — never argv, never disk.
+func gitRun(ctx context.Context, dir, token string, args ...string) ([]byte, error) {
+	return gitRunEnv(ctx, dir, token, nil, args...)
+}
+
+// gitRunEnv is gitRun with extra environment for the subprocess (e.g. the
+// deterministic commit dates the patcher pins).
+func gitRunEnv(ctx context.Context, dir, token string, extraEnv []string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0", // never hang on an interactive prompt
+	)
+	if token != "" {
+		cmd.Env = append(cmd.Env, tokenEnvVar+"="+token)
+	}
+	cmd.Env = append(cmd.Env, extraEnv...)
+	return cmd.CombinedOutput()
+}
+
+// isCommitSHA reports whether s is a full 40-hex commit SHA.
+func isCommitSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateRepoURL refuses clone URLs that embed credentials: a token inside

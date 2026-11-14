@@ -7,6 +7,7 @@ package dispatch
 type Plan struct {
 	AssignmentStatus string
 	TicketStatus     string // "" = no ticket change
+	Deliverable      bool   // ready: the workspace result is owed a PR + result comment (T7)
 	Event            string
 }
 
@@ -14,7 +15,9 @@ type Plan struct {
 //
 //	progress → assignment ends, ticket stays running (Pass schedules the
 //	           continuation via the follow-up scan);
-//	ready    → assignment ends, ticket ends (result available; T7 posts it);
+//	ready    → assignment ends, ticket ends, result pending delivery
+//	           (T7 ships branch/PR/comment — Alternative E: orchestrator-side
+//	           diff, docs/designs/0003);
 //	waiting  → assignment ends, ticket needs-attention (waiting for a person);
 //	blocked  → assignment ends, ticket needs-attention;
 //	failed   → assignment ends, ticket failed;
@@ -30,6 +33,7 @@ func PlanForReport(report Report) Plan {
 		return Plan{
 			AssignmentStatus: "ended",
 			TicketStatus:     "ended",
+			Deliverable:      true,
 			Event:            "report.ready",
 		}
 	case ReportWaiting, ReportBlocked, ReportDropped:

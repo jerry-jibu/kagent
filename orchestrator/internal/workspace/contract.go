@@ -32,14 +32,24 @@ type Backend interface {
 	// WriteFile writes one file by path inside the workspace, replacing
 	// any previous content, creating parent directories implicitly.
 	WriteFile(ctx context.Context, workspace, path string, content []byte) error
-	// ReadFile reads one file by path inside the workspace.
+	// ReadFile reads one file by path inside the workspace. A path that
+	// does not exist reads back as ErrFileNotFound.
 	ReadFile(ctx context.Context, workspace, path string) ([]byte, error)
+	// ListFiles lists the workspace-relative paths under prefix, sorted
+	// lexically. An empty prefix lists the whole workspace; an empty
+	// workspace lists empty.
+	ListFiles(ctx context.Context, workspace, prefix string) ([]string, error)
 }
 
 // ErrNotTransportable marks content a Backend cannot carry losslessly.
 // Callers record the path and continue; the workspace must never contain
 // silently corrupted bytes.
 var ErrNotTransportable = errors.New("content not transportable over this backend")
+
+// ErrFileNotFound marks a read of a path that does not exist in the
+// workspace. The delivery read-back treats it as absence (the file is
+// genuinely not in the workspace), never as an outage.
+var ErrFileNotFound = errors.New("file not found in workspace")
 
 // validateWorkspacePath enforces workspace-relative, slash-separated paths
 // with no traversal, absolute reference, or NUL. The agentfs workspace also

@@ -356,12 +356,15 @@ type TerminalOutcome struct {
 // assignment's settle state, the optional ticket transition, and the audit
 // row — all in one transaction (docs/designs/0001 §6: persist transitions
 // atomically). A plan without TicketStatus settles the assignment only.
+// DeliveryPending marks a ready result: when the transition applies, the
+// ticket's result becomes owed a PR + result comment (T7 delivery scan).
 type TerminalPlan struct {
 	AssignmentID     string
 	AssignmentStatus string // ended | unresolved
 	ReportState      string // the report the assignment settled under
 	TicketID         string
 	TicketStatus     string // ended | failed | needs-attention | "" (no change)
+	DeliveryPending  bool
 	Event            string
 	Detail           map[string]any
 }
@@ -414,6 +417,19 @@ func (s *Store) ApplyAssignmentTerminal(ctx context.Context, plan TerminalPlan) 
 				plan.TicketID, plan.TicketStatus, err)
 		}
 		ticketChanged = ticketTag.RowsAffected() == 1
+	}
+
+	if plan.DeliveryPending {
+		// A ready result owes a delivery exactly once: the marker is set in
+		// the same transaction as the settled transition, so a replay of the
+		// terminal plan cannot re-arm a delivered (or failed) delivery.
+		if _, err := tx.Exec(ctx, `
+			UPDATE tickets
+			SET delivery_state = $2, updated_at = now()
+			WHERE id = $1 AND delivery_state = $3`,
+			plan.TicketID, DeliveryPending, DeliveryNone); err != nil {
+			return TerminalOutcome{}, fmt.Errorf("failed to arm the delivery of ticket %s: %w", plan.TicketID, err)
+		}
 	}
 
 	if plan.Event != "" {

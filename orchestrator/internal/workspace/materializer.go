@@ -87,6 +87,19 @@ func (m *Materializer) MaterializeTicketWorkspace(ctx context.Context, ticketID 
 		"files", res.Files,
 		"bytes", res.Bytes,
 		"skipped", len(res.Skipped))
+	// The baseline is load-bearing for delivery (T7): the deliverer re-clones
+	// this exact commit to compute the workspace diff, and excludes the
+	// untransportable paths from its deletion set. A ticket without a
+	// persisted baseline can never be delivered, so a lost write fails the
+	// materialization like any other failure.
+	skipped := make([]string, 0, len(res.Skipped))
+	for _, s := range res.Skipped {
+		skipped = append(skipped, s.Path)
+	}
+	if err := m.store.RecordTicketBaseline(ctx, ticketID, req.Branch, outcome.BaseCommit, skipped); err != nil {
+		failure := fmt.Errorf("failed to record the delivery baseline of ticket %s: %w", ticketID, err)
+		return res, errors.Join(failure, m.failTicket(ctx, ticketID, failure.Error()))
+	}
 	if err := m.store.RecordAudit(ctx, ticketID, "workspace.materialized", map[string]any{
 		"workspace":   ticketID,
 		"base_commit": outcome.BaseCommit,
