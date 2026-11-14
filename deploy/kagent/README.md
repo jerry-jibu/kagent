@@ -11,6 +11,7 @@
 | `harness-dsh-byo.yaml` | Harness `dsh-byo` | BYO 契约；`${DSH_BYO_IMAGE}`、`${SNAPSHOT_LOCATION}` 需代入 |
 | `agent-worker.yaml` | Agent `superagent-worker` | inline template + agentfs MCP 绑定 |
 | `agent-evaluator.yaml` | Agent `superagent-evaluator` | 内置 `kagent-default` harness + `outputSchema` 结构化 Decision |
+| `orchestrator.yaml` | ConfigMap `superagent-policy` + Deployment `superagent-orchestrator` | 编排器单副本（实例锁）+ policy 热加载挂载；镜像 digest 待构建台账代入 |
 
 ## 前置
 

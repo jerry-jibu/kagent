@@ -1,0 +1,93 @@
+# superagent-on-kagent P0 — orchestrator Deployment + policy ConfigMap（T1 骨架）
+#
+# 设计依据：docs/designs/0001 D5/D6（独立 schema、单副本 Deployment）、§6（Store 事务纪律）。
+# 镜像由构建流水线产出后以 digest 钉死替换（与 harness 清单同一台账纪律）。
+# DATABASE_URL 指向集群 PostgreSQL 实例；orchestrator 使用独立 schema（默认 orchestrator）。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superagent-policy
+  namespace: kagent
+  labels:
+    app.kubernetes.io/part-of: superagent-on-kagent
+data:
+  # 仓库名单：允许触发工单的 GitHub 仓库（owner/name）
+  repos.json: |
+    {"repositories": ["example/repo"]}
+  # 发送者 admission 表：explicit = @ 即显式授权；inferred = 可研判；denied = 显式拒绝
+  admission.json: |
+    {"senders": [{"id": "maintainer-login", "strength": "explicit"}]}
+  # bot 名单：bot 评论不视作人类触发（防自触发环）
+  bots.json: |
+    {"bots": ["kagent-bot[bot]"]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  # P0 单副本：实例锁（PG advisory lock）拒绝第二个实例，防止双跑/迁移竞态
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: superagent-orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: superagent-orchestrator
+        app.kubernetes.io/part-of: superagent-on-kagent
+    spec:
+      containers:
+        - name: orchestrator
+          # 占位：以构建台账 digest 替换（源 SHA → digest）
+          image: registry.example.com/kagent/superagent-orchestrator:PLACEHOLDER
+          args:
+            - --database-url
+            - $(DATABASE_URL)
+            - --schema
+            - orchestrator
+            - --policy-dir
+            - /etc/orchestrator/policy
+            - --listen-addr
+            - :8080
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-db
+                  key: url
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/orchestrator/policy
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: policy
+          configMap:
+            name: superagent-policy
