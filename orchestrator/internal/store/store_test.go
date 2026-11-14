@@ -55,6 +55,7 @@ func TestMigrate(t *testing.T) {
 		}
 		want := []string{
 			"assignments",
+			"audit",
 			"outbox",
 			"policy",
 			"schema_migrations",
@@ -76,8 +77,8 @@ func TestMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("applied migrations failed: %v", err)
 		}
-		if len(versions) != 1 || versions[0] != "0001_init" {
-			t.Fatalf("expected [0001_init] recorded, got %v", versions)
+		if len(versions) != 2 || versions[0] != "0001_init" || versions[1] != "0002_audit" {
+			t.Fatalf("expected [0001_init 0002_audit] recorded, got %v", versions)
 		}
 	})
 
@@ -96,8 +97,8 @@ func TestMigrate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("applied migrations failed: %v", err)
 		}
-		if len(versions) != 1 {
-			t.Fatalf("expected migration recorded exactly once, got %v", versions)
+		if len(versions) != 2 {
+			t.Fatalf("expected each migration recorded exactly once, got %v", versions)
 		}
 	})
 }
