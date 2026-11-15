@@ -24,6 +24,13 @@ type AuditEvent struct {
 // ONE transaction (docs/designs/0001 §6: persist transitions atomically).
 // The audit row lands if and only if the transition did — an audit trail
 // must never describe a state change that did not happen.
+//
+// Terminal tickets are guarded (PR #11 review, Required): failed and ended
+// are terminal, so an already-failed replay is a no-op and an ENDED ticket —
+// one that delivered its PR — can never be rewritten to failed. Live
+// assignments settle in the same transaction (the StopTicket discipline): a
+// ticket that failed takes its pending/running assignments with it, never
+// leaving one dangling forever.
 func (s *Store) FailTicket(ctx context.Context, ticketID, reason string) error {
 	detail, err := json.Marshal(map[string]any{"reason": reason})
 	if err != nil {
@@ -39,13 +46,37 @@ func (s *Store) FailTicket(ctx context.Context, ticketID, reason string) error {
 	tag, err := tx.Exec(ctx, `
 		UPDATE tickets
 		SET status = 'failed', updated_at = now()
-		WHERE id = $1`, ticketID)
+		WHERE id = $1 AND status NOT IN ('failed', 'ended')`, ticketID)
 	if err != nil {
 		return fmt.Errorf("failed to mark ticket %s failed: %w", ticketID, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrTicketNotFound
+		// Either the ticket does not exist, or it is already terminal: the
+		// audit trail must never describe a change that did not happen, so
+		// no audit row is written. Distinguish for the caller.
+		var status string
+		serr := tx.QueryRow(ctx,
+			"SELECT status FROM tickets WHERE id = $1", ticketID).Scan(&status)
+		if errors.Is(serr, pgx.ErrNoRows) {
+			return ErrTicketNotFound
+		}
+		if serr != nil {
+			return fmt.Errorf("failed to read ticket %s: %w", ticketID, serr)
+		}
+		// Already failed or ended: the terminal state stands. Replay-safe
+		// no-op — the caller's intent (ticket not live) already holds.
+		return nil
 	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE assignments
+		SET status = $2, report = $3, updated_at = now()
+		WHERE ticket_id = $1 AND status IN ($4, $5)`,
+		ticketID, AssignmentStatusEnded, "dropped: ticket failed",
+		AssignmentStatusPending, AssignmentStatusRunning); err != nil {
+		return fmt.Errorf("failed to settle the live assignments of %s: %w", ticketID, err)
+	}
+
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO audit (ticket_id, event, detail)
 		VALUES ($1, 'ticket.failed', $2)`, ticketID, detail); err != nil {

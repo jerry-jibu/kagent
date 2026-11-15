@@ -244,6 +244,19 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate)
 			// A concurrent dispatch won; the task id it bound stands.
 			return nil
 		}
+		if errors.Is(err, store.ErrTicketTerminal) {
+			// The ticket went terminal between the scan and the bind: the
+			// assignment settles as dropped instead of dangling pending —
+			// and nothing is recorded for adoption, because binding onto a
+			// terminal ticket is refused by design. The landed task's later
+			// pushes surface as unknown-task observations, never adopted.
+			if settleErr := d.store.SettleRefusedDispatch(ctx, c.Assignment.ID, c.Ticket.ID,
+				"ticket terminal before the dispatch bind"); settleErr != nil {
+				return fmt.Errorf("dispatch of %s hit a terminal ticket and the refusal settle failed: bind: %v; settle: %w",
+					c.Assignment.ID, err, settleErr)
+			}
+			return nil
+		}
 		// The task is live at the gateway but unbound here: record it for
 		// adoption and alert. Returning the error keeps the dispatch
 		// counted as failed — the next tick adopts instead of re-sending.
@@ -321,6 +334,17 @@ func (d *Dispatcher) adoptOrphanedTask(ctx context.Context, c store.DispatchCand
 	if err := d.store.MarkAssignmentDispatched(ctx, c.Assignment.ID, c.Ticket.ID,
 		snapshot.ID, snapshot.ContextID, d.opts.startDeadlineAt(time.Now())); err != nil &&
 		!errors.Is(err, store.ErrAssignmentNotPending) {
+		if errors.Is(err, store.ErrTicketTerminal) {
+			// The ticket went terminal while the adoption was in flight:
+			// settle the pending assignment as dropped — never re-record,
+			// or adoption would spin against the refused bind forever.
+			if settleErr := d.store.SettleRefusedDispatch(ctx, c.Assignment.ID, c.Ticket.ID,
+				"ticket terminal before the adopted bind"); settleErr != nil {
+				return false, fmt.Errorf("adoption of %s hit a terminal ticket and the refusal settle failed: bind: %v; settle: %w",
+					snapshot.ID, err, settleErr)
+			}
+			return true, nil
+		}
 		// The binding failed with the observation consumed: put it back.
 		if putErr := d.store.RecordOrphanTask(ctx, store.OrphanTask{
 			Key:        c.Assignment.ID,
@@ -490,16 +514,14 @@ func (d *Dispatcher) triggerPayload(ctx context.Context, c store.DispatchCandida
 	if c.Ticket.TriggerSource == "" {
 		return nil, fmt.Errorf("ticket records no trigger source")
 	}
-	triggers, err := d.store.Triggers(ctx, c.Ticket.TriggerSource)
+	tr, found, err := d.store.TriggerByDeterministicID(ctx, c.Ticket.TriggerSource, c.Ticket.TriggerDeterministicID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read triggers of source %s: %w", c.Ticket.TriggerSource, err)
+		return nil, fmt.Errorf("failed to read the trigger of source %s: %w", c.Ticket.TriggerSource, err)
 	}
-	for _, tr := range triggers {
-		if tr.DeterministicID == c.Ticket.TriggerDeterministicID {
-			return tr.Payload, nil
-		}
+	if !found {
+		return nil, fmt.Errorf("trigger %s/%s is not in the audit rows of its source", c.Ticket.TriggerSource, c.Ticket.TriggerDeterministicID)
 	}
-	return nil, fmt.Errorf("trigger %s/%s is not in the audit rows of its source", c.Ticket.TriggerSource, c.Ticket.TriggerDeterministicID)
+	return tr.Payload, nil
 }
 
 // PushReceiverURL joins the configured base with the receiver path.

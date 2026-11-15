@@ -307,16 +307,62 @@ func (s *Store) MarkAssignmentDispatched(ctx context.Context, assignmentID, tick
 	}
 
 	// The ticket runs once dispatched; a ticket that already ended or failed
-	// must not resurrect through a dispatch.
-	if _, err := tx.Exec(ctx, `
+	// must not resurrect through a dispatch (PR #11 review: the guard's
+	// result is enforced — 0 rows means the ticket is terminal and the
+	// whole transition rolls back, not just the ticket write).
+	ticketTag, err := tx.Exec(ctx, `
 		UPDATE tickets
 		SET status = CASE WHEN status = $2 THEN $3 ELSE status END,
 		    session_id = COALESCE(NULLIF($4, ''), session_id),
 		    updated_at = now()
 		WHERE id = $1 AND status NOT IN ($5, $6)`,
 		ticketID, TicketStatusPending, TicketStatusRunning, contextID,
-		TicketStatusFailed, TicketStatusEnded); err != nil {
+		TicketStatusFailed, TicketStatusEnded)
+	if err != nil {
 		return fmt.Errorf("failed to run ticket %s: %w", ticketID, err)
+	}
+	if ticketTag.RowsAffected() == 0 {
+		var status string
+		serr := tx.QueryRow(ctx,
+			"SELECT status FROM tickets WHERE id = $1", ticketID).Scan(&status)
+		if serr != nil {
+			return fmt.Errorf("failed to read ticket %s after the refused dispatch: %w", ticketID, serr)
+		}
+		return fmt.Errorf("%w: ticket %s is %s — a dispatch must not bind onto a terminal ticket", ErrTicketTerminal, ticketID, status)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// SettleRefusedDispatch closes a PENDING assignment whose dispatch was
+// refused because its ticket went terminal between the scan and the bind
+// (PR #11 C3): pending→ended ("dropped") + audit row in one transaction —
+// the assignment never dangles on a dead ticket, and the dispatcher does
+// not retry a refused dispatch. CAS against pending: a concurrent settle
+// wins silently.
+func (s *Store) SettleRefusedDispatch(ctx context.Context, assignmentID, ticketID, reason string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin refused-dispatch transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE assignments
+		SET status = $2, report = $3, updated_at = now()
+		WHERE id = $1 AND status = $4`,
+		assignmentID, AssignmentStatusEnded, "dropped: "+reason, AssignmentStatusPending); err != nil {
+		return fmt.Errorf("failed to settle the refused dispatch of %s: %w", assignmentID, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO audit (ticket_id, event, detail)
+		VALUES ($1, 'dispatch.refused', $2)`,
+		ticketID, marshalDetail(map[string]any{
+			"assignment_id": assignmentID,
+			"reason":        reason,
+		})); err != nil {
+		return fmt.Errorf("failed to audit the refused dispatch of %s: %w", ticketID, err)
 	}
 
 	return tx.Commit(ctx)

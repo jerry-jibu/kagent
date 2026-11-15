@@ -99,7 +99,7 @@ func TestFailTicket(t *testing.T) {
 		}
 	})
 
-	t.Run("Given an already failed ticket, when FailTicket runs again, assert that the transition is idempotent and a second audit record is still appended", func(t *testing.T) {
+	t.Run("Given an already failed ticket, when FailTicket runs again, assert that the replay is a no-op with NO second audit record — an audit trail never describes a change that did not happen", func(t *testing.T) {
 		s := openTestStore(t)
 		ctx := context.Background()
 		if err := s.Migrate(ctx); err != nil {
@@ -118,8 +118,51 @@ func TestFailTicket(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AuditEvents failed: %v", err)
 		}
-		if len(events) != 2 {
-			t.Fatalf("audit events = %d, want both failure records", len(events))
+		if len(events) != 1 {
+			t.Fatalf("audit events = %d, want exactly one (the replay wrote no row)", len(events))
+		}
+	})
+
+	t.Run("Given an ENDED ticket (delivered its PR), when FailTicket runs, assert the ended state stands — a delivered ticket can never be rewritten to failed (PR #11 review, Required)", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate failed: %v", err)
+		}
+		seedTicket(t, s, "ticket-f3", store.TicketStatusEnded)
+
+		if err := s.FailTicket(ctx, "ticket-f3", "late blame attempt"); err != nil {
+			t.Fatalf("FailTicket on an ended ticket must be a no-op, not an error: %v", err)
+		}
+		if status, _ := s.TicketStatus(ctx, "ticket-f3"); status != store.TicketStatusEnded {
+			t.Fatalf("ticket = %q, want ended to stand against the failure write", status)
+		}
+		events, _ := s.AuditEvents(ctx, "ticket-f3")
+		if len(events) != 0 {
+			t.Fatalf("audit events = %d, want none for the refused write", len(events))
+		}
+	})
+
+	t.Run("Given a ticket with a live pending assignment, when FailTicket runs, assert the assignment settles with the ticket in the same transaction — no dangling assignment (PR #11 review, Required)", func(t *testing.T) {
+		s := openTestStore(t)
+		ctx := context.Background()
+		if err := s.Migrate(ctx); err != nil {
+			t.Fatalf("migrate failed: %v", err)
+		}
+		tk, assignment := adminTicketFixture(t, s, "github:acme/api", "issue-comment:9100", "issue:91")
+
+		if err := s.FailTicket(ctx, tk.ID, "materialization failed"); err != nil {
+			t.Fatalf("FailTicket failed: %v", err)
+		}
+		got, err := s.Assignments(ctx, tk.ID)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("Assignments = %+v, %v", got, err)
+		}
+		if got[0].Status != store.AssignmentStatusEnded {
+			t.Fatalf("assignment = %q, want settled (ended) with the failed ticket", got[0].Status)
+		}
+		if got[0].ID != assignment.ID {
+			t.Fatalf("settled assignment %s is not the fixture's %s", got[0].ID, assignment.ID)
 		}
 	})
 }

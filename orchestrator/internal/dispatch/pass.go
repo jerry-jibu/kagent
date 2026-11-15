@@ -84,38 +84,51 @@ type PassStats struct {
 	Followups int
 	// Delivered counts outbox effects delivered this tick.
 	Delivered int
+	// ItemFailures counts per-item persistence failures this tick (a
+	// poisoned row whose red-line/hold/follow-up write failed): each is
+	// retried next tick, and one bad row never blocks the other items or
+	// the outbox drain (PR #11 review, Required — the tick's comment
+	// promised this; the stages now honor it).
+	ItemFailures int
 }
 
 // Tick runs one beat. Per-item failures never fail the beat: each is counted
 // and retried on the next tick — the store's transactional guards make every
-// retry safe. Only a broken scan (the store itself unreachable) errors.
+// retry safe. A stage that cannot even scan (the store itself unreachable)
+// records its error and the beat CONTINUES with the remaining stages — the
+// outbox drain runs every tick regardless of any earlier stage's error, so a
+// poisoned row can never starve user-visible deliveries (PR #11 review,
+// Required). All stage errors are joined and returned after the drain.
 func (p *Pass) Tick(ctx context.Context) (PassStats, error) {
 	var stats PassStats
+	var errs []error
 
 	dispatched, err := p.dispatcher.DispatchPending(ctx)
 	if err != nil {
-		return stats, fmt.Errorf("failed to dispatch pending assignments: %w", err)
+		errs = append(errs, fmt.Errorf("failed to dispatch pending assignments: %w", err))
+	} else {
+		stats.Dispatched = dispatched.Dispatched
+		stats.DispatchFailed = dispatched.Failed
 	}
-	stats.Dispatched = dispatched.Dispatched
-	stats.DispatchFailed = dispatched.Failed
 
 	if err := p.reconcile(ctx, &stats); err != nil {
-		return stats, err
+		errs = append(errs, err)
 	}
 	if err := p.enforceWaitsForPerson(ctx, &stats); err != nil {
-		return stats, err
+		errs = append(errs, err)
 	}
 	if err := p.scheduleFollowups(ctx, &stats); err != nil {
-		return stats, err
+		errs = append(errs, err)
 	}
 	if p.deliverer != nil {
 		delivered, err := p.deliverer.DeliverPending(ctx)
 		if err != nil {
-			return stats, fmt.Errorf("failed to drain the outbox: %w", err)
+			errs = append(errs, fmt.Errorf("failed to drain the outbox: %w", err))
+		} else {
+			stats.Delivered = delivered.Delivered + delivered.Confirmed
 		}
-		stats.Delivered = delivered.Delivered + delivered.Confirmed
 	}
-	return stats, nil
+	return stats, errors.Join(errs...)
 }
 
 // reconcile drives every running assignment to its task's real state
@@ -152,7 +165,10 @@ func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
 					"reason":  "task not found at the gateway; outcome indeterminate — no automatic replay (docs/designs/0009 §4)",
 				},
 			}); aerr != nil {
-				return fmt.Errorf("failed to red-line assignment %s: %w", c.Assignment.ID, aerr)
+				// Per-item failure: count and continue — one poisoned row
+				// never blocks the rest of the scan or the drain.
+				stats.ItemFailures++
+				continue
 			}
 			stats.Redlined++
 		case err != nil:
@@ -169,7 +185,8 @@ func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
 				changed, merr := p.store.MarkTicketNeedsAttention(ctx, c.Ticket.ID,
 					fmt.Sprintf("task %s produced no outcome before its start deadline", taskID))
 				if merr != nil {
-					return fmt.Errorf("failed to mark the stuck ticket %s: %w", c.Ticket.ID, merr)
+					stats.ItemFailures++
+					continue
 				}
 				if changed {
 					if aerr := p.store.RecordAudit(ctx, c.Ticket.ID, "assignment.stuck", map[string]any{
@@ -178,7 +195,8 @@ func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
 						"started_deadline": c.Assignment.StartedDeadline,
 						"observed_state":   task.State,
 					}); aerr != nil {
-						return fmt.Errorf("failed to record the stuck audit of %s: %w", c.Assignment.ID, aerr)
+						stats.ItemFailures++
+						continue
 					}
 				}
 				stats.Stuck++
@@ -186,9 +204,11 @@ func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
 			}
 			applied, aerr := p.dispatcher.ApplyTerminal(ctx, task)
 			if aerr != nil {
-				// ErrUnknownTask means the binding vanished mid-flight —
-				// malformed durable data; loud, and the next tick re-reads.
-				return fmt.Errorf("failed to apply the observed state of task %s: %w", task.ID, aerr)
+				// Loud per-item failure (ErrUnknownTask = the binding
+				// vanished mid-flight): counted, the scan moves on — one
+				// poisoned candidate never blocks the others or the drain.
+				stats.ItemFailures++
+				continue
 			}
 			if applied.AssignmentSettled || applied.TicketChanged {
 				stats.Reconciled++
@@ -239,7 +259,8 @@ func (p *Pass) enforceWaitsForPerson(ctx context.Context, stats *PassStats) erro
 		changed, err := p.store.MarkTicketNeedsAttention(ctx, c.TicketID,
 			fmt.Sprintf("waitsForPerson: assignment %s settled %s and nobody has spoken on the thread since", c.AssignmentID, settled))
 		if err != nil {
-			return fmt.Errorf("failed to hold ticket %s for a person: %w", c.TicketID, err)
+			stats.ItemFailures++
+			continue
 		}
 		if changed {
 			stats.Held++
@@ -272,7 +293,8 @@ func (p *Pass) scheduleFollowups(ctx context.Context, stats *PassStats) error {
 			continue
 		}
 		if _, err := p.store.CreateFollowupAssignment(ctx, c.TicketID); err != nil {
-			return fmt.Errorf("failed to mint the follow-up of ticket %s: %w", c.TicketID, err)
+			stats.ItemFailures++
+			continue
 		}
 		stats.Followups++
 	}

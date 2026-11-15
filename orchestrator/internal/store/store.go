@@ -457,8 +457,9 @@ func (s *Store) IngestEvents(ctx context.Context, src SourceRef, events []Event,
 				       OR EXISTS (SELECT 1 FROM tickets tk
 				                  WHERE tk.thread_source = th.source
 				                    AND tk.thread_key = th.thread_key
-				                    AND tk.status <> $4))
-			)`, src.Name, e.ThreadKey, cutoff, TicketStatusEnded).Scan(&visible); err != nil {
+				                    AND tk.status IN ($4, $5, $6)))
+			)`, src.Name, e.ThreadKey, cutoff,
+			TicketStatusPending, TicketStatusRunning, TicketStatusNeedsAttention).Scan(&visible); err != nil {
 			return IngestStats{}, fmt.Errorf("failed to check sightline for thread %s/%s: %w", src.Name, e.ThreadKey, err)
 		}
 		if !visible {
@@ -544,6 +545,26 @@ func (s *Store) SourceCursor(ctx context.Context, source string) (time.Time, boo
 		return time.Time{}, false, nil
 	}
 	return *cursor, true, nil
+}
+
+// TriggerByDeterministicID fetches ONE trigger by its immutable identity
+// (PR #11 review, Required: the dispatch document rebuild reads the original
+// request per attempt — a point query, not a full-source scan of the
+// ever-growing audit table).
+func (s *Store) TriggerByDeterministicID(ctx context.Context, source, deterministicID string) (Trigger, bool, error) {
+	var tr Trigger
+	err := s.pool.QueryRow(ctx, `
+		SELECT source, deterministic_id, thread_key, payload, created_at
+		FROM triggers
+		WHERE source = $1 AND deterministic_id = $2`,
+		source, deterministicID).Scan(&tr.Source, &tr.DeterministicID, &tr.ThreadKey, &tr.Payload, &tr.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Trigger{}, false, nil
+	}
+	if err != nil {
+		return Trigger{}, false, fmt.Errorf("failed to read trigger %s/%s: %w", source, deterministicID, err)
+	}
+	return tr, true, nil
 }
 
 // Triggers returns the audit rows ingested for a source, oldest first.

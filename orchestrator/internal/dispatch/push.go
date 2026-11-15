@@ -72,10 +72,23 @@ func (m *pushMessage) text() string {
 	return sb.String()
 }
 
+// maxPushBodyBytes bounds one pushed event. A2A task events are small; a
+// larger body is malformed for this endpoint, and the receiver is
+// unauthenticated in P0 — an unbounded decode would let one oversized POST
+// OOM the process holding the instance lock (PR #11 review, Required).
+const maxPushBodyBytes = 4 << 20 // 4 MiB
+
 // ServeHTTP accepts one pushed event and registers the observation.
 func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var event pushEvent
+	req.Body = http.MaxBytesReader(w, req.Body, maxPushBodyBytes)
 	if err := json.NewDecoder(req.Body).Decode(&event); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writePushJSON(w, http.StatusRequestEntityTooLarge, false,
+				"push event exceeds the body bound")
+			return
+		}
 		writePushJSON(w, http.StatusBadRequest, false, "event is not an A2A push event: "+err.Error())
 		return
 	}
@@ -108,12 +121,14 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// verifies the task at the gateway before trusting it, so an
 		// unverified push cannot spoof a binding.
 		if recErr := r.dispatcher.RecordUnclaimedTask(req.Context(), task); recErr != nil {
-			writePushJSON(w, http.StatusInternalServerError, false, recErr.Error())
+			// A generic reason in 5xx bodies: store internals stay off the
+			// wire (PR #11 review, Required).
+			writePushJSON(w, http.StatusInternalServerError, false, "failed to record the unclaimed task for adoption")
 			return
 		}
 		writePushJSON(w, http.StatusOK, true, "task recorded for adoption")
 	default:
-		writePushJSON(w, http.StatusInternalServerError, false, err.Error())
+		writePushJSON(w, http.StatusInternalServerError, false, "failed to apply the pushed task observation")
 	}
 }
 
