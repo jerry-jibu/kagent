@@ -6,6 +6,19 @@ import (
 	"fmt"
 )
 
+// Read-back work bounds (PR #11 review, Required): mirrored from the
+// materialization side. A worker that generated tens of thousands of files
+// must fail its delivery loudly, not run one beat for hours.
+const (
+	// DefaultMaxReadFiles caps the read-back file count.
+	DefaultMaxReadFiles = 50_000
+	// DefaultMaxReadBytes caps the total read-back payload.
+	DefaultMaxReadBytes = 500 << 20
+)
+
+// errReadBudgetExceeded marks a read-back that crossed its budget.
+var errReadBudgetExceeded = fmt.Errorf("workspace read-back exceeded its work budget")
+
 // ReadWorkspaceState reads the whole workspace back: every listed path with
 // its byte-identical content. This is the deliverer's view of the worker's
 // sandbox (0003 Alternative E: the orchestrator computes the patch from the
@@ -18,8 +31,16 @@ import (
 // as errors for the caller to retry — an incomplete snapshot must never read
 // as complete.
 func ReadWorkspaceState(ctx context.Context, backend Backend, ws string) (map[string][]byte, error) {
+	return ReadWorkspaceStateBounded(ctx, backend, ws, DefaultMaxReadFiles, DefaultMaxReadBytes)
+}
+
+// ReadWorkspaceStateBounded is ReadWorkspaceState with explicit budgets
+// (negative values disable a bound).
+func ReadWorkspaceStateBounded(ctx context.Context, backend Backend, ws string, maxFiles int, maxBytes int64) (map[string][]byte, error) {
 	state := map[string][]byte{}
-	if err := readBackInto(ctx, backend, ws, "", state); err != nil {
+	var files int64
+	var bytes int64
+	if err := readBackInto(ctx, backend, ws, "", state, &files, &bytes, maxFiles, maxBytes); err != nil {
 		return nil, err
 	}
 	return state, nil
@@ -28,10 +49,14 @@ func ReadWorkspaceState(ctx context.Context, backend Backend, ws string) (map[st
 // readBackInto collects every file under prefix into state. The real agentfs
 // bridge lists IMMEDIATE children (directories as bare names), so a listed
 // directory recurses through ListFiles(prefix); a listed file is read.
-func readBackInto(ctx context.Context, backend Backend, ws, prefix string, state map[string][]byte) error {
+func readBackInto(ctx context.Context, backend Backend, ws, prefix string, state map[string][]byte,
+	files *int64, bytes *int64, maxFiles int, maxBytes int64) error {
 	paths, err := backend.ListFiles(ctx, ws, prefix)
 	if err != nil {
 		return fmt.Errorf("failed to list workspace %s: %w", ws, err)
+	}
+	if maxFiles >= 0 && *files+int64(len(paths)) > int64(maxFiles) {
+		return fmt.Errorf("%w: at least %d files under %s/, the cap is %d", errReadBudgetExceeded, *files+int64(len(paths)), prefix, maxFiles)
 	}
 
 	for _, path := range paths {
@@ -50,7 +75,7 @@ func readBackInto(ctx context.Context, backend Backend, ws, prefix string, state
 			case isNotFound(err):
 				continue // vanished between listing and read: absent now
 			case errors.Is(err, ErrIsDirectory):
-				if err := readBackInto(ctx, backend, ws, full, state); err != nil {
+				if err := readBackInto(ctx, backend, ws, full, state, files, bytes, maxFiles, maxBytes); err != nil {
 					return err
 				}
 				continue
@@ -58,6 +83,11 @@ func readBackInto(ctx context.Context, backend Backend, ws, prefix string, state
 				return fmt.Errorf("failed to read back %s from workspace %s: %w", full, ws, err)
 			}
 		}
+		if maxBytes >= 0 && *bytes+int64(len(content)) > maxBytes {
+			return fmt.Errorf("%w: %d bytes read so far, the cap is %d (at %s)", errReadBudgetExceeded, *bytes, maxBytes, full)
+		}
+		*files++
+		*bytes += int64(len(content))
 		state[full] = content
 	}
 	return nil

@@ -10,6 +10,17 @@ import (
 	"sort"
 )
 
+// Defaults for the production work bounds (PR #11 review, Required): the
+// V6 design budget (<500MiB / <60s, docs/designs/0003) was test-only —
+// without enforced caps a huge repo or a worker generating tens of
+// thousands of files would run one beat for hours with nothing failing it.
+const (
+	// DefaultMaxFiles caps the materialized file count.
+	DefaultMaxFiles = 50_000
+	// DefaultMaxBytes caps the total materialized payload.
+	DefaultMaxBytes = 500 << 20
+)
+
 // MaterializeOptions tunes one materialization run.
 type MaterializeOptions struct {
 	// IncludeGitDir also materializes the .git directory. Default false:
@@ -19,7 +30,18 @@ type MaterializeOptions struct {
 	// depends on a byte-safe bulk channel (0003 defers agentfs write
 	// mechanics; see the T5 report).
 	IncludeGitDir bool
+	// MaxFiles caps the materialized file count; 0 → DefaultMaxFiles,
+	// negative disables the cap.
+	MaxFiles int
+	// MaxBytes caps the total materialized payload; 0 → DefaultMaxBytes,
+	// negative disables the cap.
+	MaxBytes int64
 }
+
+// errWorkBudgetExceeded marks a materialization that crossed its file/byte
+// budget. The caller fails the ticket with the recorded reason (0003 V6:
+// the budget is a production bound now, not a test assertion).
+var errWorkBudgetExceeded = fmt.Errorf("materialization exceeded its work budget")
 
 // MaterializeResult reports one materialization run.
 type MaterializeResult struct {
@@ -53,6 +75,19 @@ type SkippedFile struct {
 func MaterializeDirectory(ctx context.Context, backend Backend, wsName, dir string, opts MaterializeOptions) (MaterializeResult, error) {
 	res := MaterializeResult{Workspace: wsName}
 
+	maxFiles := int64(DefaultMaxFiles)
+	if opts.MaxFiles > 0 {
+		maxFiles = int64(opts.MaxFiles)
+	} else if opts.MaxFiles < 0 {
+		maxFiles = -1 // disabled
+	}
+	maxBytes := int64(DefaultMaxBytes)
+	if opts.MaxBytes > 0 {
+		maxBytes = opts.MaxBytes
+	} else if opts.MaxBytes < 0 {
+		maxBytes = -1 // disabled
+	}
+
 	if err := backend.EnsureWorkspace(ctx, wsName); err != nil {
 		return res, fmt.Errorf("failed to ensure workspace %s: %w", wsName, err)
 	}
@@ -62,7 +97,15 @@ func MaterializeDirectory(ctx context.Context, backend Backend, wsName, dir stri
 		return res, err
 	}
 
+	if maxFiles >= 0 && int64(len(paths)) > maxFiles {
+		return res, fmt.Errorf("%w: the tree holds %d files, the cap is %d", errWorkBudgetExceeded, len(paths), maxFiles)
+	}
+
 	for _, rel := range paths {
+		if maxBytes >= 0 && res.Bytes > maxBytes {
+			return res, fmt.Errorf("%w: %d bytes written so far, the cap is %d (aborted at %s)",
+				errWorkBudgetExceeded, res.Bytes, maxBytes, rel)
+		}
 		full := filepath.Join(dir, filepath.FromSlash(rel))
 		info, err := os.Lstat(full)
 		if err != nil {

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -29,9 +30,8 @@ const agentfsMaxFileBytes = 4 << 20
 // corrupted bytes.
 type AgentfsBackend struct {
 	endpoint  string
-	connect   sync.Once
+	mu        sync.Mutex // guards client — a failed dial must stay retryable
 	client    *MCPClient
-	connectEr error
 	intention string
 }
 
@@ -46,24 +46,61 @@ func NewAgentfsBackend(endpoint string) *AgentfsBackend {
 	}
 }
 
-// dial lazily connects to the bridge exactly once so backend construction
-// cannot fail and concurrent callers share one MCP session.
+// dial lazily connects to the bridge, caching ONLY successful dials. A
+// cached failure would brick the materialize and delivery loops until
+// process restart (PR #11 review, Required): a bridge outage at first dial
+// must stay retryable, and a session invalidated by a bridge restart
+// (ErrSessionLost) re-dials a fresh session.
 func (b *AgentfsBackend) dial(ctx context.Context) (*MCPClient, error) {
-	b.connect.Do(func() {
-		b.client, b.connectEr = NewMCPClient(ctx, b.endpoint)
-	})
-	return b.client, b.connectEr
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.client != nil {
+		return b.client, nil
+	}
+	client, err := NewMCPClient(ctx, b.endpoint)
+	if err != nil {
+		return nil, err
+	}
+	b.client = client
+	return b.client, nil
+}
+
+// redial closes the current client (best effort) and forgets it, so the
+// next call dials a fresh session.
+func (b *AgentfsBackend) redial() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.client != nil {
+		b.client.Close()
+		b.client = nil
+	}
+}
+
+// call runs one tool call with session-loss re-dial: an ErrSessionLost
+// error forgets the cached client and retries once on a fresh session —
+// a bridge restart invalidates sessions but the backend must recover.
+func (b *AgentfsBackend) call(ctx context.Context, tool string, args map[string]any) (string, error) {
+	client, err := b.dial(ctx)
+	if err != nil {
+		return "", err
+	}
+	text, err := client.CallTool(ctx, tool, args)
+	if errors.Is(err, ErrSessionLost) {
+		b.redial()
+		client, err = b.dial(ctx)
+		if err != nil {
+			return "", err
+		}
+		text, err = client.CallTool(ctx, tool, args)
+	}
+	return text, err
 }
 
 // EnsureWorkspace creates the per-ticket workspace (blank sandbox).
 func (b *AgentfsBackend) EnsureWorkspace(ctx context.Context, name string) error {
-	client, err := b.dial(ctx)
-	if err != nil {
-		return err
-	}
 	// agentfs create_workspace refuses duplicates; treat that as the
 	// idempotent success the Backend contract promises.
-	_, err = client.CallTool(ctx, "agenticfs_create_workspace", map[string]any{
+	_, err := b.call(ctx, "agenticfs_create_workspace", map[string]any{
 		"name":      name,
 		"intention": b.intention,
 	})
@@ -89,11 +126,7 @@ func (b *AgentfsBackend) WriteFile(ctx context.Context, ws, path string, content
 	if len(content) > agentfsMaxFileBytes {
 		return fmt.Errorf("%w: %s is %d bytes; the agentfs read cap is %d", ErrNotTransportable, path, len(content), agentfsMaxFileBytes)
 	}
-	client, err := b.dial(ctx)
-	if err != nil {
-		return err
-	}
-	_, err = client.CallTool(ctx, "agenticfs_write_file", map[string]any{
+	_, err := b.call(ctx, "agenticfs_write_file", map[string]any{
 		"workspace": ws,
 		"path":      path,
 		"content":   string(content),
@@ -114,11 +147,7 @@ func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte,
 	if err := validateWorkspacePath(path); err != nil {
 		return nil, err
 	}
-	client, err := b.dial(ctx)
-	if err != nil {
-		return nil, err
-	}
-	text, err := client.CallTool(ctx, "agenticfs_read_file", map[string]any{
+	text, err := b.call(ctx, "agenticfs_read_file", map[string]any{
 		"workspace": ws,
 		"path":      path,
 	})
@@ -139,11 +168,7 @@ func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte,
 // listing as the literal "(empty)", which maps back to an empty slice. A
 // prefix filters by lexical prefix; "" lists the whole workspace.
 func (b *AgentfsBackend) ListFiles(ctx context.Context, ws, prefix string) ([]string, error) {
-	client, err := b.dial(ctx)
-	if err != nil {
-		return nil, err
-	}
-	text, err := client.CallTool(ctx, "agenticfs_list_files", map[string]any{
+	text, err := b.call(ctx, "agenticfs_list_files", map[string]any{
 		"workspace": ws,
 		"path":      prefix,
 	})

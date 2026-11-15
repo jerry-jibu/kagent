@@ -32,9 +32,19 @@ const mcpProtocolVersion = "2024-11-05"
 type MCPClient struct {
 	endpoint string
 	hc       *http.Client
-	session  string
+	session  atomic.Value // string — written on response headers, read by concurrent callers
 	nextID   atomic.Int64
 }
+
+// mcpRequestTimeout bounds one MCP round trip when the caller's context has
+// no deadline (the beat loops pass long-lived poller contexts). Without it a
+// hung TCP read would stall the single-threaded delivery loop forever.
+const mcpRequestTimeout = 60 * time.Second
+
+// ErrSessionLost reports the bridge answering without (or rejecting) the
+// negotiated session — a bridge restart invalidated it. The backend dials a
+// fresh session on this error instead of failing forever.
+var ErrSessionLost = fmt.Errorf("MCP session lost")
 
 // NewMCPClient dials the MCP endpoint and performs the initialize handshake.
 func NewMCPClient(ctx context.Context, endpoint string) (*MCPClient, error) {
@@ -53,7 +63,7 @@ func NewMCPClient(ctx context.Context, endpoint string) (*MCPClient, error) {
 		return nil, fmt.Errorf("MCP initialize failed: %w", err)
 	}
 	// Session id arrives with the initialize response headers; rpc() stored it.
-	if c.session == "" {
+	if c.currentSession() == "" {
 		return nil, fmt.Errorf("MCP server did not assign a session id")
 	}
 	return c, nil
@@ -89,6 +99,13 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]a
 	return text, nil
 }
 
+// currentSession reads the negotiated session id (atomic: response-header
+// writes race concurrent readers on the shared client).
+func (c *MCPClient) currentSession() string {
+	sid, _ := c.session.Load().(string)
+	return sid
+}
+
 // Close releases the HTTP session. Errors are irrelevant at teardown.
 func (c *MCPClient) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -97,7 +114,9 @@ func (c *MCPClient) Close() {
 	if err != nil {
 		return
 	}
-	req.Header.Set("Mcp-Session-Id", c.session)
+	if sid := c.currentSession(); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
+	}
 	_, _ = c.hc.Do(req)
 }
 
@@ -105,6 +124,13 @@ func (c *MCPClient) Close() {
 // Per the streamable HTTP transport the response may be a bare JSON body or
 // an SSE stream; both are handled.
 func (c *MCPClient) rpc(ctx context.Context, method string, params any, out any) error {
+	if _, deadlineSet := ctx.Deadline(); !deadlineSet {
+		// Per-request fallback so a hung bridge read cannot stall a beat
+		// loop forever (PR #11 review, Required).
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mcpRequestTimeout)
+		defer cancel()
+	}
 	id := c.nextID.Add(1)
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
@@ -123,8 +149,8 @@ func (c *MCPClient) rpc(ctx context.Context, method string, params any, out any)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("MCP-Protocol-Version", mcpProtocolVersion)
-	if c.session != "" {
-		req.Header.Set("Mcp-Session-Id", c.session)
+	if sid := c.currentSession(); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
 	}
 
 	resp, err := c.hc.Do(req)
@@ -134,8 +160,15 @@ func (c *MCPClient) rpc(ctx context.Context, method string, params any, out any)
 	defer resp.Body.Close()
 
 	// Session assignment: the initialize response carries it (MCP spec).
+	// Atomic store: the client is shared by the materialize and delivery
+	// goroutines (PR #11 review, data-race hazard).
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		c.session = sid
+		c.session.Store(sid)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		// The bridge invalidated the session (restart): signal the backend
+		// to re-dial instead of failing every call forever.
+		return fmt.Errorf("%w: %s answered %d", ErrSessionLost, c.endpoint, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %d", resp.StatusCode)
