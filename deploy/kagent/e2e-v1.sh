@@ -27,7 +27,7 @@ AGENTFS=http://localhost:9765/mcp
 PG_URL='postgres://postgres:p0@localhost:55432/postgres?sslmode=disable'
 SCHEMA=v1e2e
 ORC_URL=http://localhost:8080
-HOST_DIAL=192.168.5.2   # pod → 宿主编排器 push 回调（probe 可达；失败由 Pass 对账兜底）
+HOST_DIAL=${HOST_DIAL:-172.18.0.1}   # pod → 宿主编排器 push 回调（kind 桥网关；可用 HOST_DIAL 覆盖）
 TIMEOUT_CHAIN=900       # 全链路超时（秒）
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

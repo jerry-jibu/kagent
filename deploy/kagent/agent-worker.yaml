@@ -29,8 +29,8 @@ spec:
            编排器会转 needs-attention 并把人的回答以新输入送回。
         5. 每个 turn 结束时输出结构化 Report（最后一段为 JSON）：
            {"state": "progress|ready|blocked|failed|waiting", "summary": "<一句话>", "artifacts": ["<产物路径或PR链接>"]}
-         7. 声明 ready 前确保没有仍在途的后台任务（后台任务先收尾或改报 progress；
-            G8 约定，0001 §3——ready 即交付，编排器随即读回工作区）
+         6. 声明 ready 前确保没有仍在途的后台任务（后台任务先收尾或改报 progress；
+            G8 约定，0001 §3——ready 即交付，编排器随即读回工作区）。
            state 语义：progress=进行中；ready=完成；blocked=被外部因素卡住；
            failed=失败（附原因）；waiting=等人的决策。
       tools:

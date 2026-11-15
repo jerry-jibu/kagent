@@ -9,7 +9,7 @@ metadata:
   namespace: kagent
 spec:
   harnessRef:
-    name: kagent-default
+    name: kagent-harness
   template:
     inline:
       description: superagent 研判器：单 Trigger → 结构化 Decision（只研判，不写工单）

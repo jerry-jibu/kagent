@@ -1,0 +1,99 @@
+# agentfs 集群内部署（真实组件，2026-11-15 入库 deploy/kagent-bridge）：
+#   kagent-bridge（9765 MCP streamable-HTTP）包装真 agentfs 引擎
+#   （`agentfs mcp` stdio，来自 jibudata/agent-data-workspace）。
+# 编排器（宿主 localhost:9765 端口转发）与 worker actor（集群内 DNS
+# agentfs.kagent.svc:9765）经同一 Pod 访问同一份数据（0002 §1-A5、0003）。
+# 数据卷：单副本 emptyDir（e2e 形态；长期部署换 PVC，原机器为宿主直挂）。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentfs
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: agentfs
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentfs
+        app.kubernetes.io/part-of: superagent-on-kagent
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bridge
+          image: localhost:5001/kagent-dev/kagent-bridge@sha256:2ef94352d5e7b1349692c19f59187cc210c88cbe1f1cd11406bd032fb0af639d
+          args:
+            - --addr
+            - :9765
+            - --home
+            - /data/.agenticfs
+          ports:
+            - name: mcp
+              containerPort: 9765
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentfs
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: agentfs
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  selector:
+    app.kubernetes.io/name: agentfs
+  ports:
+    - name: mcp
+      port: 9765
+      targetPort: mcp
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata:
+  name: agenticfs-mcp
+  namespace: kagent
+  labels:
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  description: agentfs workspace MCP bridge（工单工作区文件工具，0002 §1-A5）
+  protocol: STREAMABLE_HTTP
+  url: http://agentfs.kagent.svc.cluster.local:9765/mcp
