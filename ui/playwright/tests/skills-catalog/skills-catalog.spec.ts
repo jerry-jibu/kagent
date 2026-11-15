@@ -41,8 +41,9 @@ test("skills catalog: browse, add to an agent, and manage what it holds", async 
     await page.getByTestId("skills-catalog-apply").click();
 
     // The dialog is where the write's shape is decided, so the agent choice
-    // comes after the picks.
-    await expect(page.getByTestId("agent-skills-dialog")).toBeVisible();
+    // comes after the picks. antd hangs the modal's test id on a zero-size
+    // wrapper, so visibility is asserted on the panel's first control.
+    await expect(page.getByTestId("agent-skills-agent-picker")).toBeVisible();
     await selectOption(page, "agent-skills-agent-picker", "kagent/release-notes");
     await expect(page.getByText("Inline template")).toBeVisible();
     await page.getByTestId("agent-skills-save").click();
@@ -50,15 +51,21 @@ test("skills catalog: browse, add to an agent, and manage what it holds", async 
     await expect(page.getByTestId("agent-skills-dialog")).toHaveCount(0);
 
     // Read-back through the agent's own edit form, not the toast: the spec the
-    // backend stored is what matters.
-    await loadPage(page, "/agents/kagent/release-notes/edit");
-    await expect(page.getByTestId("template-form-skill-name-0")).toHaveValue(
+    // backend stored is what matters. The path goes through the UI because the
+    // mock backend lives in the page's JS context — a page reload would reset
+    // the fixtures and forget the save this step just made.
+    await page.getByTestId("nav-agents").click();
+    const row = page.getByRole("row").filter({ hasText: "release-notes" });
+    await row.getByTestId("edit-release-notes").click();
+    await expect(page).toHaveURL(/\/agents\/kagent\/release-notes\/edit$/);
+    // Catalog skills read back as builtin cards — recognized, tagged kagent —
+    // not as editable rows with a name input.
+    await expect(page.getByTestId("template-form-skill-0")).toContainText(
       "helm-release-management",
       { timeout: 30_000 },
     );
-    await expect(page.getByTestId("template-form-skill-name-1")).toHaveValue(
-      "prometheus-observability",
-    );
+    await expect(page.getByTestId("template-form-skill-0")).toContainText("kagent");
+    await expect(page.getByTestId("template-form-skill-1")).toContainText("prometheus-observability");
   });
 
   await test.step("3. a referenced template warns about everyone it serves", async () => {
@@ -69,7 +76,7 @@ test("skills catalog: browse, add to an agent, and manage what it holds", async 
     await expect(warning).toContainText("Template shared-brain is shared by 3 agents");
     // Looked at, not changed: the shared-template blast radius is the dialog's
     // message, and this journey does not need to pull that trigger.
-    await page.keyboard.press("Escape");
+    await page.getByRole("button", { name: "Close" }).click();
     await expect(page.getByTestId("agent-skills-dialog")).toHaveCount(0);
   });
 
@@ -77,17 +84,24 @@ test("skills catalog: browse, add to an agent, and manage what it holds", async 
     await page.getByTestId("skills-catalog-manage").click();
     await selectOption(page, "agent-skills-agent-picker", "kagent/k8s-agent-7f3a91c");
 
-    const helm = page.getByTestId("skills-catalog-check-helm-release-management");
+    // The catalog browser also lives on the page behind the dialog, so every
+    // assertion here scopes to the dialog's own browser.
+    const dialog = page.getByTestId("agent-skills-dialog");
+    const helm = dialog.getByTestId("skills-catalog-check-helm-release-management");
     await expect(helm).toBeChecked({ timeout: 30_000 });
-    await expect(page.getByTestId("skills-catalog-check-k8s-troubleshooting")).toBeChecked();
+    await expect(dialog.getByTestId("skills-catalog-check-k8s-troubleshooting")).toBeChecked();
 
     await helm.uncheck();
-    await page.getByTestId("skills-catalog-apply").click();
+    await dialog.getByTestId("skills-catalog-apply").click();
     await expect(page.getByText("Template k8s-agent-7f3a91c saved")).toBeVisible();
 
     // The template's own page says what survived: the custom Git skill the
-    // catalog never owned, and the kagent skill still there.
-    await loadPage(page, "/agent-templates/kagent/k8s-agent-7f3a91c");
+    // catalog never owned, and the kagent skill still there. In-context again,
+    // for the same reason as step 2.
+    await page.getByTestId("nav-agents").click();
+    await page.getByRole("tab", { name: /Templates/ }).click();
+    await page.getByTestId("template-link-k8s-agent-7f3a91c").click();
+    await page.waitForURL(new RegExp(`/agent-templates/kagent/k8s-agent-7f3a91c`));
     await expect(page.getByTestId("template-form-skill-0")).toContainText("k8s-troubleshooting", {
       timeout: 30_000,
     });

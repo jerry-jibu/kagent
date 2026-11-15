@@ -132,7 +132,9 @@ test("agent templates: a template is created, read, edited and deleted", async (
 
     await test.step("the catalog browser multi-selects, and locks what the form already holds", async () => {
       await page.getByTestId("template-form-browse-skills").click();
-      await expect(page.getByTestId("skills-catalog-picker")).toBeVisible();
+      // antd hangs the modal's test id on a zero-size wrapper, so visibility is
+      // asserted on the browser the modal hosts.
+      await expect(page.getByTestId("skills-catalog-search")).toBeVisible();
 
       // The skill added above is this form's already: offered, but not checkable.
       await expect(page.getByTestId("skills-catalog-check-k8s-troubleshooting")).toBeDisabled();
@@ -145,8 +147,11 @@ test("agent templates: a template is created, read, edited and deleted", async (
       await page.getByTestId("skills-catalog-apply").click();
       await expect(page.getByTestId("skills-catalog-picker")).toHaveCount(0);
 
-      await expect(page.getByTestId("template-form-skill-name-2")).toHaveValue("helm-release-management");
-      await expect(page.getByTestId("template-form-skill-name-3")).toHaveValue("prometheus-observability");
+      // Catalog picks render as builtin cards — tagged kagent, not editable
+      // name inputs — because the form recognizes them immediately.
+      await expect(page.getByTestId("template-form-skill-2")).toContainText("helm-release-management");
+      await expect(page.getByTestId("template-form-skill-2")).toContainText("kagent");
+      await expect(page.getByTestId("template-form-skill-3")).toContainText("prometheus-observability");
     });
 
 
