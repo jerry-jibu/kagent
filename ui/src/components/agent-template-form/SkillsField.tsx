@@ -1,7 +1,7 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Button, Card, Form, Input, Select, Space, Tag, Tooltip, Typography } from "antd";
 import { useTheme } from "@emotion/react";
-import { ExternalLink, Plus, Trash } from "lucide-react";
+import { ExternalLink, LayoutGrid, Plus, Trash } from "lucide-react";
 import { runtimeConfig } from "@/api/runtimeConfig";
 import {
   builtinSkillDraft,
@@ -10,6 +10,7 @@ import {
   type SkillDraft,
   type SkillSourceKind,
 } from "./agentTemplateDraft";
+import { SkillsCatalogPicker } from "@/components/skills/SkillsCatalogPicker";
 
 const { Text } = Typography;
 
@@ -30,6 +31,7 @@ export function SkillsField({
 }) {
   const theme = useTheme();
   const catalog = useMemo(() => runtimeConfig().builtinSkills, []);
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   const setSkill = (index: number, patch: Partial<SkillDraft>) => {
     const next = [...skills];
@@ -322,6 +324,16 @@ export function SkillsField({
                 />
               </div>
             ) : null}
+            {catalog && catalog.skills.length > 0 ? (
+              <Button
+                size="small"
+                icon={<LayoutGrid size={13} />}
+                data-testid="template-form-browse-skills"
+                onClick={() => setPickerOpen(true)}
+              >
+                Browse catalog…
+              </Button>
+            ) : null}
             <Button
               size="small"
               icon={<Plus size={13} />}
@@ -333,6 +345,23 @@ export function SkillsField({
           </Space>
         )}
       </div>
+      <SkillsCatalogPicker
+        open={pickerOpen}
+        catalog={catalog}
+        disabledNames={skills.map((row) => row.name.trim()).filter((name) => name !== "")}
+        onClose={() => setPickerOpen(false)}
+        onApply={(add) =>
+          onChange([
+            ...skills,
+            ...add.map((selection) => ({
+              ...emptySkillDraft(),
+              name: selection.name,
+              oci: selection.image,
+              path: selection.path,
+            })),
+          ])
+        }
+      />
     </Form.Item>
   );
 }
