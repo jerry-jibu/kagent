@@ -21,11 +21,22 @@ import (
 // hardening pass.
 type Receiver struct {
 	dispatcher *Dispatcher
+	// verifier may be nil: P0 dev mode (unauthenticated inside the cluster
+	// boundary, logged loudly at construction). Non-nil → every event must
+	// carry the gateway's signed Bearer JWT bound to the event's task id.
+	verifier *PushJWTVerifier
 }
 
 // NewReceiver returns the push receiver backed by the dispatcher.
-func NewReceiver(d *Dispatcher) *Receiver {
-	return &Receiver{dispatcher: d}
+// verifier comes from NewPushJWTVerifier (nil = unauthenticated dev mode).
+func NewReceiver(d *Dispatcher, verifier *PushJWTVerifier) *Receiver {
+	if verifier == nil {
+		// Loud, once: this mode is for local e2e / fake-gateway setups only.
+		// Non-dev deployments must pin the gateway key (PR #11 review,
+		// Required #12; design-R3-2).
+		println("WARNING: push receiver running WITHOUT JWT verification (dev mode) — set --push-jwt-public-key/--push-jwt-issuer for non-dev clusters")
+	}
+	return &Receiver{dispatcher: d, verifier: verifier}
 }
 
 // pushEvent mirrors a2a-go's StreamResponse event wrapper: exactly one of the
@@ -107,6 +118,26 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		// the gateway does not retry a permanently non-bindable payload.
 		writePushJSON(w, http.StatusOK, false, "event carries no task status")
 		return
+	}
+
+	// JWT verification (PR #11 review, Required #12): a valid token is
+	// bound to one task id — an event for a different task is a claim/event
+	// mismatch (403), a bad token is 401. nil verifier = dev mode.
+	if r.verifier != nil {
+		verifiedTaskID, verr := r.verifier.VerifyRequest(req)
+		if verr != nil {
+			if errors.Is(verr, ErrPushUnauthorized) {
+				writePushJSON(w, http.StatusUnauthorized, false, "push rejected: "+verr.Error())
+			} else {
+				writePushJSON(w, http.StatusForbidden, false, "push rejected: "+verr.Error())
+			}
+			return
+		}
+		if verifiedTaskID != task.ID {
+			writePushJSON(w, http.StatusForbidden, false,
+				"push rejected: token is bound to task "+verifiedTaskID+", event carries "+task.ID)
+			return
+		}
 	}
 
 	_, err := r.dispatcher.ApplyTerminal(req.Context(), task)

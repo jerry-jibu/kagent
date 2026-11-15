@@ -178,7 +178,7 @@ func TestDispatchIntent(t *testing.T) {
 		st, _, _, _, d := intentFixtureWith(t, func(inner *store.Store) dispatch.Options {
 			return restartOptions(t, inner)
 		})
-		receiver := dispatch.NewReceiver(d)
+		receiver := dispatch.NewReceiver(d, nil)
 
 		rec := postPush(t, receiver, `{"statusUpdate":{"taskId":"task-push-orphan","contextId":"ctx-adopt-me","status":{"state":"`+a2a.StateCompleted+`","message":{"parts":[{"text":"done"}]}}}}`)
 		if rec.Code != 200 {

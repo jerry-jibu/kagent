@@ -162,6 +162,52 @@ spec:
                   name: superagent-orchestrator-github
                   key: token
                   optional: true
+            # push JWT 验证（Required #12）：钉死 Gateway push signer 的
+            # Ed25519 公钥（PEM，PUBLIC KEY 块）与 issuer——非 dev 集群必须
+            # 设置（KAGENT_GATEWAY_PUSH_JWT_* 与 session 包 signer 同源）。
+            - name: PUSH_JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-push-jwt
+                  key: public-key.pem
+                  optional: true
+            - name: PUSH_JWT_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-push-jwt
+                  key: issuer
+                  optional: true
+            # admin 变更端点（retry/stop）的 bearer token；空 = dev 模式
+            - name: ORCHESTRATOR_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-admin
+                  key: token
+                  optional: true
+---
+# 默认拒绝入站：只放行同 namespace（gateway/controller/agentfs 调用方与
+# 探针来源）与 ingress 面的 oauth2-proxy（admin 走查用）。egress 不设限
+# （egress 白名单由 byo 编译期网关与集群网络策略另行约束——worker 侧红线，
+# 编排器自身需要 PG/Gateway/GitHub 的正常出站）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: superagent-orchestrator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}          # 同 namespace（kagent 控制面组件）
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kagent
           readinessProbe:
             httpGet:
               path: /healthz

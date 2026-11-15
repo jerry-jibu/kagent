@@ -17,7 +17,7 @@ import (
 func receiverFixture(t *testing.T) (*store.Store, string, http.Handler) {
 	t.Helper()
 	s, ticketID, _, _ := dispatchedFixture(t)
-	return s, ticketID, dispatch.NewReceiver(dispatch.New(s, a2a.NewFake(), dispatch.Options{WorkerAgent: "kagent/worker"}))
+	return s, ticketID, dispatch.NewReceiver(dispatch.New(s, a2a.NewFake(), dispatch.Options{WorkerAgent: "kagent/worker"}), nil)
 }
 
 func postPush(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {

@@ -149,11 +149,15 @@ sed -e "s|\${ORCH_IMAGE}|$ORCH_IMAGE|" \
 | `--workspace-mcp-endpoint` | agentfs MCP 桥端点（例 `http://agentfs.kagent.svc:9765/mcp`）；**为空时交付链关闭，且派工不再等待物化基线** | 物化/交付链关闭 |
 | `--workspace-base-branch` | 物化器逐工单克隆的默认基分支（Story 27：工单 Mandate scope 可带 `base-branch:` 行覆盖本默认） | `main` |
 | `--github-git-url` | git remote 基址（mandate 仓库名拼 `.git`） | `https://github.com` |
+| `--push-jwt-public-key` | Gateway push signer 的 Ed25519 **公钥** PEM（钉死后 push 强制 JWT 验证：EdDSA + kid + iss/aud + taskId 绑定）；空 = dev 模式（**非 dev 集群必须设置**） | 无验证（dev） |
+| `--push-jwt-issuer` | push token 的期望 issuer（与 `--push-jwt-public-key` 同设；公钥也可经 `PUSH_JWT_PUBLIC_KEY` env 注入） | — |
+| `--admin-token` | 变更 admin 端点（retry/stop）的 Bearer token（也可经 `ORCHESTRATOR_ADMIN_TOKEN` env）；空 = dev 模式，读端点不受限 | 无守卫（dev） |
 
 链路序（accept 事务提交后）：物化扫描（accept→物化→基线落库）→ 派工扫描（`RequireWorkspace`：基线未落库不派工）→ worker Report ready → 交付循环（工作区读回 → 编排器侧 diff → push 分支 → PR → 结果评论 effect）。
 
 ## P0 已接受边界（审查收口记录）
 
+- **入站面已硬化（2026-11-15，批次 #12）**：push 接收器支持 Gateway push JWT 验证（钉死公钥 = `--push-jwt-public-key`+`--push-jwt-issuer`，manifest 经 Secret 注入；token 绑定 taskId，claim/事件不匹配 403）；admin 变更端点（retry/stop）守 `--admin-token`；NetworkPolicy 默认拒绝入站、只放行同 namespace。三个开关空缺时保持 dev 模式（本地 e2e/fake 网关可用），**非 dev 集群部署前必须全部设置**——清单里以 optional SecretKeyRef 注入，缺 Secret 即 dev 模式（编排器启动日志有 WARNING）。
 - **Session 身份与 share（Stories 23/24）——本轮不写码**：编排器经 Gateway mTLS 以自身 ServiceAccount 身份调用，session 创建者=编排器 SA 是构造事实（`tickets.session_id` 只记录 contextId，归属无需额外字段）。**share 链接目前由用户在 UI 手动创建**（SessionService share），编排器自动签发并回贴 issue 归 **P1**。
 - **e2e 形态偏离已接受**：V1 全链路验收是独立 bash 脚本（`deploy/kagent/e2e-v1.sh`，fake GitHub 面 + 真集群组件），而非 `go/core/test/e2e` 套件内的 Go 测试。链路覆盖达意（store/g fake GitHub/bare git/egress 四处留证据）；集成形态的偏离已审查接受，go 套件内沉淀归后续票。
 

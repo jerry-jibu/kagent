@@ -7,10 +7,12 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/store"
@@ -41,8 +43,27 @@ type AdminService interface {
 // NewHandler builds the HTTP mux. A nil push receiver leaves the push path
 // unmounted (the dispatch chain disabled — probing it answers 404); a nil
 // admin service leaves the admin routes unmounted the same way.
-func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin AdminService) http.Handler {
+// adminToken guards the MUTATING admin endpoints (retry/stop) when set —
+// Authorization: Bearer <token> required (PR #11 review, Required #12 /
+// design-R3-2: a forged in-cluster retry/stop drives the ticket machine).
+// Empty keeps the P0 dev behavior; reads stay open (ClusterIP-only).
+func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin AdminService, adminToken string) http.Handler {
 	mux := http.NewServeMux()
+	guard := func(next http.HandlerFunc) http.HandlerFunc {
+		if adminToken == "" {
+			return next
+		}
+		return func(w http.ResponseWriter, r *http.Request) {
+			const prefix = "Bearer "
+			auth := r.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, prefix) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, prefix)), []byte(adminToken)) != 1 {
+				writeJSON(w, http.StatusUnauthorized,
+					map[string]string{"reason": "admin mutation requires the admin token (Authorization: Bearer)"})
+				return
+			}
+			next(w, r)
+		}
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := ready(); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable,
@@ -85,7 +106,7 @@ func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin Adm
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"tickets": rows})
 		})
-		mux.HandleFunc("POST /admin/tickets/{id}/retry", func(w http.ResponseWriter, r *http.Request) {
+		mux.HandleFunc("POST /admin/tickets/{id}/retry", guard(func(w http.ResponseWriter, r *http.Request) {
 			minted, err := admin.RetryTicket(r.Context(), r.PathValue("id"), actorOf(r))
 			switch {
 			case err == nil:
@@ -101,8 +122,8 @@ func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin Adm
 			default:
 				writeAdminError(w, http.StatusInternalServerError, err)
 			}
-		})
-		mux.HandleFunc("POST /admin/tickets/{id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		}))
+		mux.HandleFunc("POST /admin/tickets/{id}/stop", guard(func(w http.ResponseWriter, r *http.Request) {
 			err := admin.StopTicket(r.Context(), r.PathValue("id"), actorOf(r))
 			switch {
 			case err == nil:
@@ -117,7 +138,7 @@ func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin Adm
 			default:
 				writeAdminError(w, http.StatusInternalServerError, err)
 			}
-		})
+		}))
 	}
 	return mux
 }

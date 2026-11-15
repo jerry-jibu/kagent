@@ -88,6 +88,15 @@ type Config struct {
 	WorkspaceMCPEndpoint string
 	WorkspaceBaseBranch  string
 	GitHubGitBaseURL     string
+
+	// Push JWT verification (PR #11 Required #12): pin the GATEWAY's
+	// Ed25519 public key + issuer; unset = unauthenticated dev mode.
+	PushJWTPublicKey string
+	PushJWTIssuer    string
+
+	// AdminToken guards the mutating admin endpoints (retry/stop) when
+	// set; empty keeps the P0 dev behavior.
+	AdminToken string
 }
 
 func parseConfig() Config {
@@ -113,6 +122,9 @@ func parseConfig() Config {
 	flag.StringVar(&cfg.WorkspaceMCPEndpoint, "workspace-mcp-endpoint", "", "agentfs MCP bridge endpoint materializing ticket workspaces; required for the delivery loop (empty disables delivery)")
 	flag.StringVar(&cfg.WorkspaceBaseBranch, "workspace-base-branch", "main", "branch the workspace materializer clones per ticket by default (Story 27: a mandate scope may point at a specific branch)")
 	flag.StringVar(&cfg.GitHubGitBaseURL, "github-git-url", workspace.DefaultGitBaseURL, "git remote base the mandate-scope repo composes with for clone/push and PRs")
+	flag.StringVar(&cfg.PushJWTPublicKey, "push-jwt-public-key", "", "Ed25519 PUBLIC KEY PEM of the GATEWAY's push signer — pins push verification; empty = unauthenticated dev mode (non-dev clusters MUST set it)")
+	flag.StringVar(&cfg.PushJWTIssuer, "push-jwt-issuer", "", "expected issuer (iss) of gateway push tokens; required with --push-jwt-public-key")
+	flag.StringVar(&cfg.AdminToken, "admin-token", "", "bearer token guarding the mutating admin endpoints (retry/stop); empty = unauthenticated dev mode")
 	flag.Parse()
 
 	// Credential injection: in-cluster the Secret rides the environment, so
@@ -331,7 +343,11 @@ func main() {
 				RequireWorkspace: cfg.WorkspaceMCPEndpoint != "",
 				RecoveryCutoff:   dbNow,
 			})
-			pushReceiver = dispatch.NewReceiver(dispatcher)
+			verifier, verr := buildPushJWTVerifier(cfg)
+			if verr != nil {
+				failStart("invalid push JWT verification config", verr)
+			}
+			pushReceiver = dispatch.NewReceiver(dispatcher, verifier)
 			pass := dispatch.NewPass(st, dispatcher, outbox.New(st, ghTransport), dispatch.PassOptions{})
 
 			// 装载未终结 Assignment: audited per holding ticket before the
@@ -412,7 +428,7 @@ func main() {
 
 	handler := server.NewHandler(state.ready, func() (string, time.Time, bool) {
 		return watcher.Current().Version, watcher.LoadedAt(), true
-	}, pushReceiver, st)
+	}, pushReceiver, st, buildAdminToken(cfg))
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
@@ -452,6 +468,36 @@ func main() {
 		}
 	}
 	st.Close()
+}
+
+// buildPushJWTVerifier constructs the push receiver's token verifier from
+// the pinned gateway key. The PEM may ride --push-jwt-public-key or the
+// PUSH_JWT_PUBLIC_KEY environment variable (Secret-injected in-cluster);
+// the audience is this orchestrator's own push receiver URL — exactly what
+// the gateway registers in PushConfig.
+func buildAdminToken(cfg Config) string {
+	if cfg.AdminToken != "" {
+		return cfg.AdminToken
+	}
+	return os.Getenv("ORCHESTRATOR_ADMIN_TOKEN")
+}
+
+func buildPushJWTVerifier(cfg Config) (*dispatch.PushJWTVerifier, error) {
+	pemKey := cfg.PushJWTPublicKey
+	if pemKey == "" {
+		pemKey = os.Getenv("PUSH_JWT_PUBLIC_KEY")
+	}
+	if pemKey == "" {
+		return nil, nil // dev mode
+	}
+	if cfg.PushJWTIssuer == "" {
+		return nil, fmt.Errorf("--push-jwt-issuer is required with --push-jwt-public-key")
+	}
+	audience := dispatch.PushReceiverURL(derivePushBaseURL(cfg.ListenAddr))
+	if cfg.PushBaseURL != "" {
+		audience = dispatch.PushReceiverURL(cfg.PushBaseURL)
+	}
+	return dispatch.NewPushJWTVerifier(pemKey, cfg.PushJWTIssuer, audience)
 }
 
 // runLoop is the shared skeleton of the orchestrator's background loops: it

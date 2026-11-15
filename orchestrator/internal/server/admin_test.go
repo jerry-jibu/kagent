@@ -52,12 +52,17 @@ func (f *fakeAdmin) StopTicket(ctx context.Context, ticketID, actor string) erro
 	return f.stopErr
 }
 
-func newAdminHandler(admin server.AdminService) http.Handler {
+func newAdminHandler(admin server.AdminService, adminToken ...string) http.Handler {
+	tok := ""
+	if len(adminToken) > 0 {
+		tok = adminToken[0]
+	}
 	return server.NewHandler(
 		func() error { return nil },
 		func() (string, time.Time, bool) { return "abc123", time.Now(), true },
 		nil,
 		admin,
+		tok,
 	)
 }
 
@@ -129,6 +134,7 @@ func TestAdminNeedsAttentionList(t *testing.T) {
 			func() (string, time.Time, bool) { return "abc123", time.Now(), true },
 			nil,
 			nil,
+			"",
 		)
 
 		rec := httptest.NewRecorder()

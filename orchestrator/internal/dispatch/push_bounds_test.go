@@ -16,7 +16,7 @@ func TestPushReceiverBodyBound(t *testing.T) {
 		return dispatch.Options{WorkerAgent: "kagent/worker"}
 	})
 	_ = st
-	receiver := dispatch.NewReceiver(d)
+	receiver := dispatch.NewReceiver(d, nil)
 
 	huge := `{"task":{"id":"task-big","contextId":"ctx-big","status":{"state":"TASK_STATE_WORKING","message":{"parts":[{"text":"` +
 		strings.Repeat("x", 5<<20) + `"}]}}}}`
