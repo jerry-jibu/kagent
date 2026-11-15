@@ -56,6 +56,10 @@ export function AgentSkillsDialog({
   const [failure, setFailure] = useState<string>();
 
   const agents = agentsResource.data?.agents ?? [];
+  // The namespace read comes first and the agents read hangs off it, so either
+  // failing leaves the dialog without a list — and a failed read must not read
+  // as "no agents exist".
+  const readFailure = agentsResource.error ?? namespaces.error;
   const listedAgent = agents.find((agent) => agentKey(agent) === agentKeyChoice);
   // Manage mode re-reads the Agent so a dialog opened before a save edits what
   // is really stored; add mode can work from the list row it was given.
@@ -178,10 +182,21 @@ export function AgentSkillsDialog({
         </Space>
 
         {!agentKeyChoice ? (
-          <Paragraph css={muted}>
-            Skills live on the agent's template. Adding or removing them here writes that template; an
-            inline template changes only this agent, a referenced one every agent made from it.
-          </Paragraph>
+          <>
+            {readFailure ? (
+              <Alert
+                type="error"
+                showIcon
+                data-testid="agent-skills-agents-error"
+                title="Could not read the agents list"
+                description={readFailure instanceof Error ? readFailure.message : String(readFailure)}
+              />
+            ) : null}
+            <Paragraph css={muted}>
+              Skills live on the agent's template. Adding or removing them here writes that template; an
+              inline template changes only this agent, a referenced one every agent made from it.
+            </Paragraph>
+          </>
         ) : !agent ? (
           <Spin size="small" />
         ) : (

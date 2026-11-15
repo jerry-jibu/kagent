@@ -108,4 +108,28 @@ test("skills catalog: browse, add to an agent, and manage what it holds", async 
     await expect(page.getByTestId("template-form-skill-name-1")).toHaveText("incident-review");
     await expect(page.getByTestId("template-form-skill-2")).toHaveCount(0);
   });
+
+  await test.step("5. a failed agents read is named, not dressed up as an empty list", async () => {
+    // The catalog itself is config delivered with the page, not a read — it
+    // renders even when the control plane does not answer.
+    await loadPage(page, "/skills-catalog", { scenario: "error" });
+    await expect(page.getByTestId("skills-catalog-card-k8s-troubleshooting")).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.getByTestId("skills-catalog-manage").click();
+    await expect(page.getByTestId("agent-skills-agents-error")).toBeVisible({ timeout: 30_000 });
+    await page.getByRole("button", { name: "Close" }).click();
+  });
+
+  await test.step("6. an install with no agents offers nothing to add to", async () => {
+    await loadPage(page, "/skills-catalog", { scenario: "empty" });
+    await expect(page.getByTestId("skills-catalog-card-k8s-troubleshooting")).toBeVisible({
+      timeout: 30_000,
+    });
+    await page.getByTestId("skills-catalog-manage").click();
+    await expect(page.getByTestId("agent-skills-agents-error")).toHaveCount(0);
+    await page.getByTestId("agent-skills-agent-picker").click();
+    // antd's empty state renders twice — an SVG title and the description.
+    await expect(page.locator(".ant-empty-description")).toBeVisible();
+  });
 });
