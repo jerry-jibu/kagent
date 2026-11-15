@@ -10,6 +10,20 @@
 # DATABASE_URL / GITHUB_TOKEN 以 env 注入（Secret 引用），不进容器 argv——
 # 编排器侧缺省回退读同名环境变量，pod spec 不出现凭证。
 ---
+# The pod identity for the postgres pod-certificate signer whitelist
+# (README: --postgres-client=kagent/superagent-orchestrator=...). No RBAC
+# rules: the SA exists only so kubelet admission can resolve the identity
+# and the signer can mint the kagent_owner_user certificate (PR #11 review,
+# Required — the Deployment referenced an SA no manifest created).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -71,6 +85,16 @@ spec:
     spec:
       # Pod 证书认证：postgres signer 白名单绑定该 SA（见 README 部署节）
       serviceAccountName: superagent-orchestrator
+      # 本仓库对自有工作负载强制执行的安全基线（helm/kagent/tests/
+      # security-context_test.yaml 同款；PR #11 review, Required）。镜像
+      # USER 65532:65532 已非 root，此处为声明式收紧；readOnlyRootFilesystem
+      # 需要下面的 /tmp emptyDir（克隆落点 os.MkdirTemp）。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: orchestrator
           # 占位：以构建台账 digest 替换（源 SHA → digest）
@@ -110,6 +134,11 @@ spec:
             - ${WORKSPACE_BASE_BRANCH}
             - --github-git-url
             - ${GITHUB_GIT_URL}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
           ports:
             - name: http
               containerPort: 8080
@@ -150,6 +179,8 @@ spec:
             - name: postgres-client-certificate
               mountPath: /run/postgres.podcert.ate.dev
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: 100m
@@ -161,6 +192,10 @@ spec:
         - name: policy
           configMap:
             name: superagent-policy
+        # 克隆落点（os.MkdirTemp("", ...) 落 /tmp）：readOnlyRootFilesystem
+        # 下的可写卷。
+        - name: tmp
+          emptyDir: {}
         # 与 kagent-controller 同款 Pod 证书投影：postgres.podcert.ate.dev
         # signer 为本 Pod 铸造 kagent_owner_user 客户端证书（pg_hba 的 cert 认证）。
         - name: postgres-client-certificate

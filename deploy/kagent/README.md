@@ -101,14 +101,18 @@ export POLICY_SENDER='maintainer-login'    # Gate admission 名单
 export GITHUB_SOURCE_REPO='example/repo'   # Source 轮询仓库；空串 = Source 关闭（空转模式）
 export WORKSPACE_BASE_BRANCH='main'
 export GITHUB_GIT_URL='https://github.com'
+export ORCH_IMAGE='localhost:5000/superagent-orchestrator@sha256:<64hex>'   # 台账 digest
 for f in modelconfig-deepseek modelconfig-deepseek-openai harness-dsh-byo agent-worker agent-evaluator; do
   sed -e "s|\${DSH_BYO_IMAGE}|$DSH_BYO_IMAGE|" -e "s|\${SNAPSHOT_LOCATION}|$SNAPSHOT_LOCATION|" $f.yaml | kubectl apply -f -
 done
-sed -e "s|${ORCH_IMAGE}|localhost:5000/superagent-orchestrator@sha256:<64hex>|" \
-    -e "s|${POLICY_REPO}|$POLICY_REPO|" -e "s|${POLICY_SENDER}|$POLICY_SENDER|" \
-    -e "s|${GITHUB_SOURCE_REPO}|$GITHUB_SOURCE_REPO|" \
-    -e "s|${WORKSPACE_BASE_BRANCH}|$WORKSPACE_BASE_BRANCH|" \
-    -e "s|${GITHUB_GIT_URL}|$GITHUB_GIT_URL|" orchestrator.yaml | kubectl apply -f -
+# 占位符模式侧必须转义（\${...}）：双引号里未转义的 ${VAR} 会被 shell 先展开——
+# ORCH_IMAGE 未导出时展开成空正则（sed 给每行行首加前缀，YAML 全毁）；导出了也
+# 会变成拿值当模式、永远匹配不到清单里的字面占位符（PR #11 review, Required）。
+sed -e "s|\${ORCH_IMAGE}|$ORCH_IMAGE|" \
+    -e "s|\${POLICY_REPO}|$POLICY_REPO|" -e "s|\${POLICY_SENDER}|$POLICY_SENDER|" \
+    -e "s|\${GITHUB_SOURCE_REPO}|$GITHUB_SOURCE_REPO|" \
+    -e "s|\${WORKSPACE_BASE_BRANCH}|$WORKSPACE_BASE_BRANCH|" \
+    -e "s|\${GITHUB_GIT_URL}|$GITHUB_GIT_URL|" orchestrator.yaml | kubectl apply -f -
 ```
 
 ## 编排器 flags 全集（cmd/orchestrator）
