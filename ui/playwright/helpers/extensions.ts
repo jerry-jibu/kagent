@@ -52,9 +52,18 @@ export async function navOrder(page: Page): Promise<string[]> {
 }
 
 /** The nav entries the application itself ships, in the order it declares them. */
+/**
+ * The sidebar entries a default build ships, in DOM order.
+ *
+ * `nav-skills-catalog` is contributed by the first-party `skills-catalog`
+ * extension, which `activeExtensions.ts` installs by default — it is part of
+ * what "the application ships" means, even though it arrives through the
+ * extension framework rather than `navItems.ts`.
+ */
 export const CORE_NAV_ORDER = [
   "nav-dashboard",
   "nav-agents",
+  "nav-skills-catalog",
   "nav-scheduledRuns",
   "nav-models",
   "nav-mcpServers",

@@ -1,0 +1,97 @@
+import { test, expect } from "../../fixtures/test";
+import { loadPage } from "../../helpers/app";
+import { LIFECYCLE_TIMEOUT, pressOnce, selectOption, optionNamed } from "../../helpers/resource";
+
+/*
+ * A lifecycle is longer than a journey, so it gets its own budget — see
+ * `LIFECYCLE_TIMEOUT`. Set per file rather than across the suite, so the tight default
+ * keeps doing its job everywhere else.
+ */
+test.describe.configure({ timeout: LIFECYCLE_TIMEOUT });
+
+test("skills catalog: browse, add to an agent, and manage what it holds", async ({
+  page,
+}) => {
+  await test.step("1. the catalog lists the built-in skills, searchable and tag-filtered", async () => {
+    await loadPage(page, "/skills-catalog");
+    await expect(page.getByTestId("skills-catalog-card-k8s-troubleshooting")).toBeVisible({
+      timeout: 30_000,
+    });
+
+    // Search narrows on the name and the description.
+    await page.getByTestId("skills-catalog-search").fill("service mesh");
+    await expect(page.getByTestId(/^skills-catalog-card-/)).toHaveCount(1);
+    await expect(page.getByTestId("skills-catalog-card-istio-traffic-debugging")).toBeVisible();
+    await page.getByTestId("skills-catalog-search").fill("");
+
+    // Tags narrow to the skills carrying every selected tag.
+    await page.getByTestId("skills-catalog-tag-filter").click();
+    await pressOnce(optionNamed(page, "kubernetes"));
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId(/^skills-catalog-card-/)).toHaveCount(2);
+    await page.getByTestId("skills-catalog-tag-filter").click();
+    await pressOnce(optionNamed(page, "kubernetes"));
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId(/^skills-catalog-card-/)).toHaveCount(6);
+  });
+
+  await test.step("2. two picked skills land on an inline-template agent", async () => {
+    await page.getByTestId("skills-catalog-check-helm-release-management").check();
+    await page.getByTestId("skills-catalog-check-prometheus-observability").check();
+    await page.getByTestId("skills-catalog-apply").click();
+
+    // The dialog is where the write's shape is decided, so the agent choice
+    // comes after the picks.
+    await expect(page.getByTestId("agent-skills-dialog")).toBeVisible();
+    await selectOption(page, "agent-skills-agent-picker", "kagent/release-notes");
+    await expect(page.getByText("Inline template")).toBeVisible();
+    await page.getByTestId("agent-skills-save").click();
+    await expect(page.getByText("Agent release-notes saved")).toBeVisible();
+    await expect(page.getByTestId("agent-skills-dialog")).toHaveCount(0);
+
+    // Read-back through the agent's own edit form, not the toast: the spec the
+    // backend stored is what matters.
+    await loadPage(page, "/agents/kagent/release-notes/edit");
+    await expect(page.getByTestId("template-form-skill-name-0")).toHaveValue(
+      "helm-release-management",
+      { timeout: 30_000 },
+    );
+    await expect(page.getByTestId("template-form-skill-name-1")).toHaveValue(
+      "prometheus-observability",
+    );
+  });
+
+  await test.step("3. a referenced template warns about everyone it serves", async () => {
+    await loadPage(page, "/skills-catalog");
+    await page.getByTestId("skills-catalog-manage").click();
+    await selectOption(page, "agent-skills-agent-picker", "kagent/shared-brain-fast");
+    const warning = page.getByTestId("agent-skills-shared-template");
+    await expect(warning).toContainText("Template shared-brain is shared by 3 agents");
+    // Looked at, not changed: the shared-template blast radius is the dialog's
+    // message, and this journey does not need to pull that trigger.
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("agent-skills-dialog")).toHaveCount(0);
+  });
+
+  await test.step("4. managing an agent pre-checks its catalog skills, and unchecking removes", async () => {
+    await page.getByTestId("skills-catalog-manage").click();
+    await selectOption(page, "agent-skills-agent-picker", "kagent/k8s-agent-7f3a91c");
+
+    const helm = page.getByTestId("skills-catalog-check-helm-release-management");
+    await expect(helm).toBeChecked({ timeout: 30_000 });
+    await expect(page.getByTestId("skills-catalog-check-k8s-troubleshooting")).toBeChecked();
+
+    await helm.uncheck();
+    await page.getByTestId("skills-catalog-apply").click();
+    await expect(page.getByText("Template k8s-agent-7f3a91c saved")).toBeVisible();
+
+    // The template's own page says what survived: the custom Git skill the
+    // catalog never owned, and the kagent skill still there.
+    await loadPage(page, "/agent-templates/kagent/k8s-agent-7f3a91c");
+    await expect(page.getByTestId("template-form-skill-0")).toContainText("k8s-troubleshooting", {
+      timeout: 30_000,
+    });
+    await expect(page.getByTestId("template-form-skill-name-1")).toHaveText("incident-review");
+    await expect(page.getByTestId("template-form-skill-2")).toHaveCount(0);
+  });
+});

@@ -130,6 +130,25 @@ test("agent templates: a template is created, read, edited and deleted", async (
       await expect(page.getByTestId("template-form-model-availability")).toHaveCount(0);
     });
 
+    await test.step("the catalog browser multi-selects, and locks what the form already holds", async () => {
+      await page.getByTestId("template-form-browse-skills").click();
+      await expect(page.getByTestId("skills-catalog-picker")).toBeVisible();
+
+      // The skill added above is this form's already: offered, but not checkable.
+      await expect(page.getByTestId("skills-catalog-check-k8s-troubleshooting")).toBeDisabled();
+      await expect(page.getByTestId("skills-catalog-card-k8s-troubleshooting")).toContainText("Added");
+
+      // Two picks at once, which the single-add Select cannot do.
+      await page.getByTestId("skills-catalog-check-helm-release-management").check();
+      await page.getByTestId("skills-catalog-check-prometheus-observability").check();
+      await expect(page.getByTestId("skills-catalog-count")).toContainText("2 selected");
+      await page.getByTestId("skills-catalog-apply").click();
+      await expect(page.getByTestId("skills-catalog-picker")).toHaveCount(0);
+
+      await expect(page.getByTestId("template-form-skill-name-2")).toHaveValue("helm-release-management");
+      await expect(page.getByTestId("template-form-skill-name-3")).toHaveValue("prometheus-observability");
+    });
+
 
     // Only the name is required: a BYO harness runs a template with no model.
     await expect(page.getByTestId("template-submit")).toBeDisabled();
@@ -202,6 +221,12 @@ test("agent templates: a template is created, read, edited and deleted", async (
     await expect(repo).toHaveAttribute("target", "_blank");
     await expect(page.getByTestId("template-form-skill-git-commit-1")).toHaveText(GIT_COMMIT);
     await expect(page.getByTestId("template-form-skill-path-1")).toHaveText("skills/incident-review");
+    // Both skills the catalog browser added in one apply read back as kagent skills,
+    // still pinned to the catalog image this install ships.
+    await expect(page.getByTestId("template-form-skill-2")).toContainText("kagent");
+    await expect(page.getByTestId("template-form-skill-2")).toContainText("helm-release-management");
+    await expect(page.getByTestId("template-form-skill-3")).toContainText("kagent");
+    await expect(page.getByTestId("template-form-skill-3")).toContainText("prometheus-observability");
     // Each read-only source value shows in full, not cut off, even in a narrow window.
     const viewport = page.viewportSize()!;
     await page.setViewportSize({ width: 480, height: viewport.height });

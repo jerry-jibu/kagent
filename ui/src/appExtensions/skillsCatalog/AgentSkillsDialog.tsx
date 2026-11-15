@@ -79,6 +79,10 @@ export function AgentSkillsDialog({
   const unmanaged = effectiveSkills
     .filter((skill) => catalog && catalogSkillFor(skill, catalog) === undefined)
     .map((skill) => skill.name);
+  // A referenced template's skills arrive in a second read after the agent's.
+  // Every interaction below — pre-checked rows, Save — must wait for them, or
+  // the dialog would offer to save against a spec it has not seen.
+  const targetReady = !referenced || template.data !== undefined;
 
   // Sharing is computed from the loaded list, which is the same list the page
   // rendered — the confirm names that count honestly.
@@ -97,7 +101,7 @@ export function AgentSkillsDialog({
   };
 
   async function apply(add: CatalogSelection[], removeNames: string[]) {
-    if (!agent) return;
+    if (!agent || !targetReady) return;
     setSaving(true);
     setFailure(undefined);
     try {
@@ -203,6 +207,8 @@ export function AgentSkillsDialog({
                 No skills catalog is configured for this install, so there is nothing to add here.
                 Skills the agent already has stay untouched.
               </Text>
+            ) : !targetReady ? (
+              <Spin size="small" />
             ) : initialAdd.length > 0 ? (
               <div css={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 <div css={{ display: "flex", flexDirection: "column", gap: 4 }}>

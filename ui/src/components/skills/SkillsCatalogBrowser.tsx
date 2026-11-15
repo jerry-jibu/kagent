@@ -3,8 +3,7 @@ import { Button, Card, Checkbox, Input, Select, Tag, Typography } from "antd";
 import { useTheme } from "@emotion/react";
 import { Search } from "lucide-react";
 import type { BuiltinSkillsCatalog } from "@/api/runtimeConfig";
-import type { AgentTemplateSkill } from "@/api/domain/agentTemplates";
-import { catalogSkillFor, selectionForSkill, type CatalogSelection } from "./catalogSelection";
+import { selectionForSkill, type CatalogSelection } from "./catalogSelection";
 
 const { Text } = Typography;
 
@@ -210,10 +209,3 @@ function shortDigest(image: string): string {
   return digest.slice(0, "sha256:".length + 8) + "…";
 }
 
-/** The catalog skill names a target holds that the catalog itself does not own. */
-export function unmanagedSkillNames(
-  existing: AgentTemplateSkill[],
-  catalog: BuiltinSkillsCatalog | undefined,
-): string[] {
-  return existing.filter((skill) => catalogSkillFor(skill, catalog) === undefined).map((skill) => skill.name);
-}
