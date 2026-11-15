@@ -58,9 +58,17 @@ var ErrFileNotFound = errors.New("file not found in workspace")
 var ErrIsDirectory = errors.New("path is a directory in workspace")
 
 // validateWorkspacePath enforces workspace-relative, slash-separated paths
-// with no traversal, absolute reference, or NUL. The agentfs workspace also
-// enforces this (read_file/write_file containment); validating at the seam
-// keeps every backend honest.
+// with no traversal, absolute reference, NUL, or gitdir access. The agentfs
+// workspace also enforces containment (read_file/write_file); validating at
+// the seam keeps every backend honest.
+//
+// Any path segment named .git is rejected (case-insensitive): workspace
+// state is untrusted worker output, and a state key reaching the baseline
+// clone's .git (e.g. .git/hooks/pre-commit) would execute with the
+// orchestrator's credentials on the next git commit. The materializer skips
+// .git on the way in (materialize.go); this is the symmetric guard on the
+// way out. .github and friends remain legal — only the exact segment is
+// refused.
 func validateWorkspacePath(path string) error {
 	switch {
 	case path == "":
@@ -73,6 +81,9 @@ func validateWorkspacePath(path string) error {
 	for _, seg := range strings.Split(path, "/") {
 		if seg == "" || seg == "." || seg == ".." {
 			return fmt.Errorf("workspace path has an invalid segment: %q", path)
+		}
+		if strings.EqualFold(seg, ".git") {
+			return fmt.Errorf("workspace path may not access the git directory: %q", path)
 		}
 	}
 	return nil
