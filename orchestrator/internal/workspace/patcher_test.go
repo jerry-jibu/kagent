@@ -286,6 +286,137 @@ func (f *gitFixture) hasBranch(t *testing.T, branch string) bool {
 	return cmd.Run() == nil
 }
 
+// newGitFixtureWithSymlinks is newGitFixture plus tracked symlinks in the
+// seed commit (target → destination), so the baseline clone the patcher
+// works on carries them like any repo legitimately can.
+func newGitFixtureWithSymlinks(t *testing.T, files map[string][]byte, symlinks map[string]string) *gitFixture {
+	t.Helper()
+	f := &gitFixture{}
+	f.root = t.TempDir()
+	seed := filepath.Join(f.root, "seed")
+	f.origin = filepath.Join(f.root, "origin.git")
+
+	if err := os.MkdirAll(seed, 0o755); err != nil {
+		t.Fatalf("mkdir seed: %v", err)
+	}
+	runGit(t, seed, "init", "-b", "main")
+	writeTree(t, seed, files)
+	for link, dest := range symlinks {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(seed, link)), 0o755); err != nil {
+			t.Fatalf("mkdir symlink parent: %v", err)
+		}
+		if err := os.Symlink(dest, filepath.Join(seed, link)); err != nil {
+			t.Fatalf("symlink %s -> %s: %v", link, dest, err)
+		}
+	}
+	runGit(t, seed, "add", "-A")
+	runGit(t, seed, "commit", "-m", "seed")
+	f.baseSHA = runGit(t, seed, "rev-parse", "HEAD")
+
+	runGit(t, f.root, "clone", "--bare", "--no-hardlinks", seed, f.origin)
+	runGit(t, f.origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+	f.remoteURL = "file://" + f.origin
+	return f
+}
+
+// Given a baseline that legitimately tracks a file symlink pointing outside
+// the clone, when worker state rewrites that path, assert the write lands as
+// a regular file inside the clone and the symlink's target is untouched —
+// following the symlink would write outside as the orchestrator user.
+func TestPatcherSymlinkEscape(t *testing.T) {
+	t.Run("Given a tracked file symlink, when state overwrites it, assert the escape target stays untouched and the branch holds a regular file", func(t *testing.T) {
+		f := newGitFixtureWithSymlinks(t,
+			map[string][]byte{"a.txt": []byte("original a\n")},
+			map[string]string{"Makefile": "../escape/victim.txt"},
+		)
+		escape := filepath.Join(f.root, "escape", "victim.txt")
+		if err := os.MkdirAll(filepath.Dir(escape), 0o755); err != nil {
+			t.Fatalf("mkdir escape dir: %v", err)
+		}
+		if err := os.WriteFile(escape, []byte("precious\n"), 0o644); err != nil {
+			t.Fatalf("seed escape target: %v", err)
+		}
+
+		patcher := workspace.NewPatcher(workspace.PatcherOptions{})
+		if _, err := patcher.Patch(context.Background(), workspace.PatchRequest{
+			RepoURL:    f.remoteURL,
+			BaseCommit: f.baseSHA,
+			Branch:     "ticket-sym1",
+			Message:    "ticket-sym1: replace symlink",
+			State: map[string][]byte{
+				"a.txt":    []byte("rewritten a\n"),
+				"Makefile": []byte("new makefile\n"),
+			},
+		}); err != nil {
+			t.Fatalf("Patch failed: %v", err)
+		}
+
+		if got, err := os.ReadFile(escape); err != nil || string(got) != "precious\n" {
+			t.Fatalf("escape target must stay untouched, got %q (%v)", got, err)
+		}
+		tree := f.branchTree(t, "ticket-sym1")
+		if string(tree["Makefile"]) != "new makefile\n" {
+			t.Fatalf("branch must hold the regular-file Makefile, got %q", tree["Makefile"])
+		}
+	})
+
+	t.Run("Given a tracked directory symlink, when state writes beneath it, assert the patch is refused and the target directory stays untouched", func(t *testing.T) {
+		f := newGitFixtureWithSymlinks(t,
+			map[string][]byte{"a.txt": []byte("original a\n")},
+			map[string]string{"sub": "../escape-dir"},
+		)
+		escapeDir := filepath.Join(f.root, "escape-dir")
+		if err := os.MkdirAll(escapeDir, 0o755); err != nil {
+			t.Fatalf("mkdir escape dir: %v", err)
+		}
+
+		patcher := workspace.NewPatcher(workspace.PatcherOptions{})
+		_, err := patcher.Patch(context.Background(), workspace.PatchRequest{
+			RepoURL:    f.remoteURL,
+			BaseCommit: f.baseSHA,
+			Branch:     "ticket-sym2",
+			Message:    "ticket-sym2: write under dir symlink",
+			State: map[string][]byte{
+				"a.txt":       []byte("rewritten a\n"),
+				"sub/new.txt": []byte("escape attempt\n"),
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("writing beneath a directory symlink must be refused with a symlink error, got: %v", err)
+		}
+		entries, readErr := os.ReadDir(escapeDir)
+		if readErr != nil || len(entries) != 0 {
+			t.Fatalf("escape dir must stay empty, got %v (%v)", entries, readErr)
+		}
+		if f.hasBranch(t, "ticket-sym2") {
+			t.Fatalf("a refused patch must not push its branch")
+		}
+	})
+}
+
+// Given worker state naming the git directory, when Patch runs, assert the
+// state is refused before any clone work — a state key reaching the baseline
+// clone's .git (e.g. hooks/pre-commit) would execute with the orchestrator's
+// credentials on the next git commit.
+func TestPatcherGitdirState(t *testing.T) {
+	t.Run("Given a hook-injection state key, when Patch runs, assert the state is refused naming the git directory", func(t *testing.T) {
+		f := newGitFixture(t, map[string][]byte{"a.txt": []byte("a\n")})
+		patcher := workspace.NewPatcher(workspace.PatcherOptions{})
+		_, err := patcher.Patch(context.Background(), workspace.PatchRequest{
+			RepoURL:    f.remoteURL,
+			BaseCommit: f.baseSHA,
+			Branch:     "ticket-gitdir",
+			Message:    "ticket-gitdir: hook injection",
+			State: map[string][]byte{
+				".git/hooks/pre-commit": []byte("#!/bin/sh\ntouch /tmp/pwned\n"),
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "git directory") {
+			t.Fatalf("gitdir state must be refused naming the git directory, got: %v", err)
+		}
+	})
+}
+
 func keys(m map[string][]byte) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

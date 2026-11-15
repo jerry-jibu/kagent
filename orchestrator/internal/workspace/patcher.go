@@ -201,10 +201,20 @@ func (p *Patcher) Patch(ctx context.Context, req PatchRequest) (PatchOutcome, er
 // applyState writes every state file over the baseline tree, creating parent
 // directories. Writing an unchanged file with identical content is a no-op
 // for git — the commit captures only real deltas.
+//
+// State is untrusted worker output applied onto a live checkout, so every
+// write is symlink-safe (ensureWritableRegularPath): a symlink at the target
+// is replaced by a regular file (overwrite semantics), a symlink in any
+// parent component is refused — a repo legitimately tracks symlinks, and
+// writing "through" one would land outside the clone as the orchestrator
+// user.
 func applyState(dir string, state map[string][]byte) error {
 	for rel, content := range state {
 		if content == nil {
 			return fmt.Errorf("patch state for %s is nil; the read-back snapshot never yields nil content", rel)
+		}
+		if err := ensureWritableRegularPath(dir, rel); err != nil {
+			return err
 		}
 		target := filepath.Join(dir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -212,6 +222,48 @@ func applyState(dir string, state map[string][]byte) error {
 		}
 		if err := os.WriteFile(target, content, 0o644); err != nil {
 			return fmt.Errorf("failed to write %s onto the baseline: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// ensureWritableRegularPath verifies that rel can be written under dir as a
+// regular file without following symlinks. Components are checked with Lstat
+// from the clone root down: a symlink at the final component is removed (the
+// state replaces it with a regular file); a symlink at any parent component
+// is an error. A missing component ends the walk — nothing below a
+// not-yet-existing prefix can be a symlink, and MkdirAll creates the rest as
+// real directories.
+func ensureWritableRegularPath(dir, rel string) error {
+	cur := dir
+	segs := strings.Split(rel, "/")
+	for i, seg := range segs {
+		cur = filepath.Join(cur, seg)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("failed to inspect %s on the baseline: %w", rel, err)
+		}
+		last := i == len(segs)-1
+		if info.Mode()&os.ModeSymlink != 0 {
+			if !last {
+				return fmt.Errorf("refusing to write %s: parent component %q is a symlink (the write would escape the baseline clone)", rel, seg)
+			}
+			if err := os.Remove(cur); err != nil {
+				return fmt.Errorf("failed to replace the symlink at %s with a regular file: %w", rel, err)
+			}
+			return nil
+		}
+		if last {
+			if info.IsDir() {
+				return fmt.Errorf("refusing to write %s: the target is a directory on the baseline", rel)
+			}
+			return nil
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("refusing to write %s: component %q is not a directory", rel, seg)
 		}
 	}
 	return nil
