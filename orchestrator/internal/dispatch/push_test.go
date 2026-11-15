@@ -61,12 +61,19 @@ func TestPushReceiver(t *testing.T) {
 		}
 	})
 
-	t.Run("Given a push event for a task the orchestrator never dispatched, when it arrives, assert that the endpoint answers 404 so the mismatch is loud", func(t *testing.T) {
-		_, _, h := receiverFixture(t)
+	t.Run("Given a push event for a task the orchestrator never dispatched, when it arrives, assert that the endpoint records it for adoption and accepts the push (write-ahead intent: the binding write may have been lost to a crash)", func(t *testing.T) {
+		s, _, h := receiverFixture(t)
 
-		rec := postPush(t, h, `{"task":{"id":"task-foreign","status":{"state":"TASK_STATE_COMPLETED"}}}`)
-		if rec.Code != http.StatusNotFound {
-			t.Fatalf("status = %d, want 404", rec.Code)
+		rec := postPush(t, h, `{"task":{"id":"task-foreign","contextId":"ctx-foreign","status":{"state":"TASK_STATE_COMPLETED","message":{"parts":[{"text":"the lost report"}]}}}}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 with the observation recorded (body: %s)", rec.Code, rec.Body.String())
+		}
+		obs, found, err := s.TakeOrphanTask(ctx, "ctx-foreign")
+		if err != nil || !found {
+			t.Fatalf("TakeOrphanTask = %+v, %v, %v; want the unbound push recorded for adoption", obs, found, err)
+		}
+		if obs.TaskID != "task-foreign" || obs.StatusText != "the lost report" {
+			t.Fatalf("orphan observation = %+v, want the pushed task verbatim", obs)
 		}
 	})
 

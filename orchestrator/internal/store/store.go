@@ -430,6 +430,12 @@ func (s *Store) IngestEvents(ctx context.Context, src SourceRef, events []Event,
 
 	stats := IngestStats{}
 	for _, e := range events {
+		// PostgreSQL timestamptz keeps microseconds; a caller-supplied
+		// nanosecond time would read back truncated and break cursor
+		// equality. Normalize at the boundary so everything persisted from
+		// this event — trigger, thread activity, cursor — carries the same
+		// value.
+		e.OccurredAt = e.OccurredAt.Truncate(time.Microsecond)
 		// Thread attribution: create the thread at first sight with the
 		// event's occurrence time; an existing thread keeps its history.
 		if _, err := tx.Exec(ctx, `
@@ -508,10 +514,13 @@ func (s *Store) IngestEvents(ctx context.Context, src SourceRef, events []Event,
 	return stats, nil
 }
 
-// batchMax returns the newest occurrence time in a batch.
+// batchMax returns the newest occurrence time in a batch, normalized to the
+// microsecond precision PostgreSQL timestamptz keeps (IngestEvents truncates
+// each event at the boundary; batchMax re-asserts it for the cursor).
 func batchMax(events []Event) time.Time {
-	max := events[0].OccurredAt
+	max := events[0].OccurredAt.Truncate(time.Microsecond)
 	for _, e := range events[1:] {
+		e.OccurredAt = e.OccurredAt.Truncate(time.Microsecond)
 		if e.OccurredAt.After(max) {
 			max = e.OccurredAt
 		}

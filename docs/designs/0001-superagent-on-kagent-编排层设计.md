@@ -231,6 +231,7 @@ sequenceDiagram
 - **Thread 视线（sightline）**：无活 Ticket（pending/running/needs-attention）的 Thread 保留 **14 天视线**；超视线线程的新事件在 intake 丢弃（`DefaultSightline = 14 * 24h`，`intake.go:18-21`）。注意 `failed`/`ended` 均为终态、不计活——"失败线程永不脱离视线"是已知实现缺陷，随 PR 代码修复批次更正。
 - **Assignment deadline（G7）**：派发即记 started_deadline（可配窗口）；Pass 对"已派发但超期仍未进入终态"的 Assignment 转 needs-attention——task 受理与执行之间必须有期限、滞留必须有显式释放者，不自动重放。（教训源自 claude-managed-agents lease 模型：ack 后永不心跳的 item 永不回收。）
 - **TaskStore 对账**：push 是优化不是正确性依赖——Pass 周期把 running Assignment 与 TaskStore 真实终态对账（D2）。
+- **派发 write-ahead intent（2026-11-15 补，PR #11 C3）**：send 前先计数（`BeginDispatchAttempt`），杜绝"landed but unrecorded"被读成首次派发。恢复序：① mid-flight 死亡（attempts>0 且无失败记录）→ **收养** orphan task observation（以 assignment id 为键，先经 `TaskState` 到 gateway 验证再绑定——push 接收器 P0 无认证，未验证的 observation 不可作绑定依据）；② 无 observation → **重派隔离窗**（默认同 G7 窗口，可配/可关）后才重发；③ 已记录失败（transport 层错误，"没落 task 可安全重放"语义）→ 下拍即时重试，携确定性 per-attempt MessageID（`assign-<assignment>-<attempt>`）供 gateway 侧关联。send 已落 task 但绑定写失败 → 孤儿 observation + `dispatch.unbound` 审计行（告警级，不静默重试）。
 
 ## 7. 安全与授权
 

@@ -131,6 +131,7 @@ type DispatchCall struct {
 	ContextID string
 	PushURL   string
 	PushID    string
+	MessageID string
 }
 
 // TaskStateCall is one recorded task status query.
@@ -198,6 +199,7 @@ func (f *Fake) Dispatch(ctx context.Context, req DispatchRequest) (DispatchResul
 		ContextID: req.ContextID,
 		PushURL:   req.PushURL,
 		PushID:    req.PushID,
+		MessageID: req.MessageID,
 	})
 	if err := f.dispatchFailures[req.Agent]; err != nil {
 		f.mu.Unlock()

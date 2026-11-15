@@ -188,8 +188,12 @@ func TestIngestSightline(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read cursor failed: %v", err)
 		}
-		if !ok || !cursor.Equal(fresh) {
-			t.Fatalf("cursor must advance past dropped events: want %s, got %s (ok=%v)", fresh, cursor, ok)
+		// The store normalizes occurrence times to the microsecond
+		// precision PostgreSQL timestamptz keeps (PR #11: boundary
+		// truncation); the cursor equals the normalized high-water mark.
+		if !ok || !cursor.Equal(fresh.Truncate(time.Microsecond)) {
+			t.Fatalf("cursor must advance past dropped events: want %s, got %s (ok=%v)",
+				fresh.Truncate(time.Microsecond), cursor, ok)
 		}
 	})
 }

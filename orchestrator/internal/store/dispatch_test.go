@@ -93,6 +93,12 @@ func TestRecordDispatchFailure(t *testing.T) {
 		s, ticketID := dispatchFixture(t)
 		assignments, _ := s.Assignments(ctx, ticketID)
 
+		// Write-ahead intent (PR #11 C3): the attempt counter is owned by
+		// BeginDispatchAttempt before the send; the failure recording keeps
+		// only the error ledger and the audit row.
+		if _, err := s.BeginDispatchAttempt(ctx, assignments[0].ID); err != nil {
+			t.Fatalf("BeginDispatchAttempt failed: %v", err)
+		}
 		if err := s.RecordDispatchFailure(ctx, assignments[0].ID, "gateway timed out"); err != nil {
 			t.Fatalf("RecordDispatchFailure failed: %v", err)
 		}

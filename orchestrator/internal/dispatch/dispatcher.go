@@ -26,6 +26,13 @@ const (
 	// has produced no outcome (terminal or pause) within it trips the Pass's
 	// stuck branch — needs-attention, never an automatic replay.
 	DefaultStartDeadline = 10 * time.Minute
+	// DefaultRedispatchQuarantine bounds the window an attempted-but-unbound
+	// dispatch waits before the dispatcher may re-send: an earlier attempt
+	// may have landed a live task at the gateway whose terminal push has not
+	// arrived yet, and a resend would fork a second worker onto the same
+	// ticket workspace. Defaults to the same grace a bound task gets before
+	// the stuck branch fires.
+	DefaultRedispatchQuarantine = DefaultStartDeadline
 )
 
 // Options configures the dispatch chain.
@@ -52,10 +59,16 @@ type Options struct {
 	// arm — dispatch-failure retries keep annotating via the ledger.
 	RecoveryCutoff time.Time
 	// RequireWorkspace gates the dispatch scan on the materialization
-	// baseline (docs/designs 0003 路线 A: accept 后、派工前物化): set it when
+	// baseline (docs/designs/0003 路线 A: accept 后、派工前物化): set it when
 	// the orchestrator runs the workspace pipeline so a pending assignment
 	// waits until its ticket's workspace has been materialized.
 	RequireWorkspace bool
+	// RedispatchQuarantine bounds how long an attempted-but-unbound dispatch
+	// waits before the dispatcher may re-send it (write-ahead intent, PR #11
+	// C3): an earlier attempt may hold a live task at the gateway whose
+	// terminal push has not arrived. 0 → default; negative disables the
+	// quarantine (immediate resend).
+	RedispatchQuarantine time.Duration
 }
 
 func (o Options) maxFollowups() int {
@@ -75,6 +88,32 @@ func (o Options) startDeadlineAt(t time.Time) time.Time {
 	default:
 		return t.Add(DefaultStartDeadline)
 	}
+}
+
+// quarantineWindow is how long an attempted-but-unbound dispatch waits
+// before the dispatcher may re-send it.
+func (o Options) quarantineWindow() time.Duration {
+	switch {
+	case o.RedispatchQuarantine > 0:
+		return o.RedispatchQuarantine
+	case o.RedispatchQuarantine < 0:
+		return 0 // explicit "no quarantine"
+	default:
+		return DefaultRedispatchQuarantine
+	}
+}
+
+// quarantineRemaining reports how much of the resend quarantine is still in
+// effect for a dispatch whose last attempt was recorded at lastAttempt.
+func (o Options) quarantineRemaining(now, lastAttempt time.Time) time.Duration {
+	window := o.quarantineWindow()
+	if window <= 0 {
+		return 0
+	}
+	if elapsed := now.Sub(lastAttempt); elapsed < window {
+		return window - elapsed
+	}
+	return 0
 }
 
 // Dispatcher owns the push side of the advancement chain (docs/designs/0001
@@ -102,7 +141,16 @@ type DispatchStats struct {
 	// Failed counts dispatch attempts that failed and were recorded for the
 	// next tick (docs/designs/0001 §4.3: 到期重派入口).
 	Failed int
+	// Quarantined counts attempted-but-unbound dispatches held back this
+	// run: an earlier attempt may hold a live task at the gateway, so the
+	// resend waits out the quarantine window (write-ahead intent, PR #11
+	// C3). Not a failure — the next ticks retry.
+	Quarantined int
 }
+
+// errRedispatchQuarantined marks a dispatch held back by the resend
+// quarantine; DispatchPending counts it, the beat treats it as deferred.
+var errRedispatchQuarantined = errors.New("redispatch quarantined: a prior attempt may hold a live task")
 
 // DispatchPending dispatches every pending assignment of a live ticket. One
 // failure does not block the others: it is recorded on the assignment
@@ -118,6 +166,10 @@ func (d *Dispatcher) DispatchPending(ctx context.Context) (DispatchStats, error)
 	var stats DispatchStats
 	for _, c := range candidates {
 		if err := d.dispatchOne(ctx, c); err != nil {
+			if errors.Is(err, errRedispatchQuarantined) {
+				stats.Quarantined++
+				continue
+			}
 			stats.Failed++
 			continue
 		}
@@ -126,8 +178,55 @@ func (d *Dispatcher) DispatchPending(ctx context.Context) (DispatchStats, error)
 	return stats, nil
 }
 
+// dispatchOne lands one pending assignment as a gateway task.
+//
+// Write-ahead intent discipline (PR #11 C3): the attempt is counted before
+// the send, so a crash between send and bind leaves an
+// attempted-but-unbound assignment that restart recovery handles by order:
+//  1. adopt the context's orphan task observation (a task this dispatch —
+//     or its push — already minted), verifying it still exists at the
+//     gateway before binding;
+//  2. otherwise wait out the resend quarantine before re-sending: a live
+//     task from the earlier attempt may still deliver its terminal push;
+//  3. only then send, with a deterministic per-attempt message id.
+//
+// A send that lands a task but fails its binding write is recorded as an
+// orphan observation plus a dispatch.unbound audit row — an alert-worthy
+// condition, never a silent retry.
 func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate) error {
-	request, err := d.buildRequest(ctx, c)
+	// The resend quarantine guards only a MID-FLIGHT death: the write-ahead
+	// intent counted an attempt and no failure was ever recorded, so a task
+	// may be live at the gateway. An attempt with a recorded failure failed
+	// observably (the transport errored before landing) — the documented
+	// "never landed a task is safe to replay" replay applies and the next
+	// tick retries immediately, correlated by the deterministic message id.
+	if c.Assignment.DispatchAttempts > 0 && c.Assignment.LastError == "" {
+		adopted, err := d.adoptOrphanedTask(ctx, c)
+		if err != nil {
+			// Not a recordFailure: the prior attempt's death must not read
+			// as an observable send failure, or the resend quarantine would
+			// be bypassed on the next tick. The orphan observation (if any)
+			// is persisted; the error is loud and counted as failed.
+			return fmt.Errorf("adoption recovery of %s failed: %w", c.Assignment.ID, err)
+		}
+		if adopted {
+			return nil
+		}
+		if remaining := d.opts.quarantineRemaining(time.Now(), c.Assignment.UpdatedAt); remaining > 0 {
+			return errRedispatchQuarantined
+		}
+	}
+
+	attempt, err := d.store.BeginDispatchAttempt(ctx, c.Assignment.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrAssignmentNotPending) {
+			// A concurrent dispatch won; the task id it bound stands.
+			return nil
+		}
+		return fmt.Errorf("failed to begin the dispatch attempt of %s: %w", c.Assignment.ID, err)
+	}
+
+	request, err := d.buildRequest(ctx, c, attempt)
 	if err != nil {
 		// A malformed trigger payload is malformed durable data: loud
 		// failure, recorded on the assignment like any dispatch failure.
@@ -145,9 +244,102 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate)
 			// A concurrent dispatch won; the task id it bound stands.
 			return nil
 		}
-		return fmt.Errorf("failed to register the landed dispatch of %s: %w", c.Assignment.ID, err)
+		// The task is live at the gateway but unbound here: record it for
+		// adoption and alert. Returning the error keeps the dispatch
+		// counted as failed — the next tick adopts instead of re-sending.
+		if obsErr := d.store.RecordOrphanTask(ctx, store.OrphanTask{
+			Key:        c.Assignment.ID,
+			TaskID:     result.TaskID,
+			State:      result.State,
+			StatusText: "",
+		}); obsErr != nil {
+			return fmt.Errorf("dispatch of %s landed task %s but could neither bind nor record it (unbound live task): bind: %v; record: %w",
+				c.Assignment.ID, result.TaskID, err, obsErr)
+		}
+		if auditErr := d.store.RecordAudit(ctx, c.Ticket.ID, "dispatch.unbound", map[string]any{
+			"assignment_id": c.Assignment.ID,
+			"task_id":       result.TaskID,
+			"error":         err.Error(),
+		}); auditErr != nil {
+			return fmt.Errorf("dispatch of %s landed task %s, recorded for adoption, but its audit failed: %w", c.Assignment.ID, result.TaskID, auditErr)
+		}
+		return fmt.Errorf("dispatch of %s landed task %s but could not bind it (recorded for adoption; alert-worthy unbound live task): %w",
+			c.Assignment.ID, result.TaskID, err)
 	}
 	return nil
+}
+
+// RecordUnclaimedTask persists a task observation that belongs to no
+// assignment (the push receiver's ErrUnknownTask path): the restart recovery
+// adopts it instead of re-sending. Keyed by the ticket session's context id,
+// so only a pending assignment continuing that session can consume it.
+func (d *Dispatcher) RecordUnclaimedTask(ctx context.Context, task a2a.Task) error {
+	if task.ContextID == "" || task.ID == "" {
+		return fmt.Errorf("unclaimed task observation carries no identity (task %q context %q)", task.ID, task.ContextID)
+	}
+	return d.store.RecordOrphanTask(ctx, store.OrphanTask{
+		Key:        task.ContextID,
+		TaskID:     task.ID,
+		State:      task.State,
+		StatusText: task.StatusText,
+	})
+}
+
+// adoptOrphanedTask binds and applies the context's orphan task observation,
+// if one exists and the gateway still knows the task (verification is not
+// optional: the push receiver is unauthenticated in P0, and an unverified
+// observation would be a binding-spoofing primitive). The observation is
+// consumed exactly once — TakeOrphanTask deletes it transactionally.
+func (d *Dispatcher) adoptOrphanedTask(ctx context.Context, c store.DispatchCandidate) (bool, error) {
+	obs, found, err := d.store.TakeOrphanTask(ctx, c.Assignment.ID)
+	if err != nil || !found {
+		return false, err
+	}
+
+	// Verify against the gateway before trusting the observation: a live
+	// snapshot also carries the freshest state.
+	snapshot, err := d.transport.TaskState(ctx, d.opts.WorkerAgent, obs.TaskID)
+	if err != nil {
+		if errors.Is(err, a2a.ErrTaskNotFound) {
+			// The task is gone (spoofed observation, or a vanished task):
+			// drop the observation and fall through to quarantine/resend.
+			return false, nil
+		}
+		// Transport failure: put the observation back for the next tick
+		// rather than falling into a resend.
+		if putErr := d.store.RecordOrphanTask(ctx, store.OrphanTask{
+			Key:        c.Assignment.ID,
+			TaskID:     obs.TaskID,
+			State:      obs.State,
+			StatusText: obs.StatusText,
+		}); putErr != nil {
+			return false, fmt.Errorf("adoption of task %s failed (%v) and re-recording the observation failed: %w", obs.TaskID, err, putErr)
+		}
+		return false, err
+	}
+
+	if err := d.store.MarkAssignmentDispatched(ctx, c.Assignment.ID, c.Ticket.ID,
+		snapshot.ID, snapshot.ContextID, d.opts.startDeadlineAt(time.Now())); err != nil &&
+		!errors.Is(err, store.ErrAssignmentNotPending) {
+		// The binding failed with the observation consumed: put it back.
+		if putErr := d.store.RecordOrphanTask(ctx, store.OrphanTask{
+			Key:        c.Assignment.ID,
+			TaskID:     snapshot.ID,
+			State:      snapshot.State,
+			StatusText: snapshot.StatusText,
+		}); putErr != nil {
+			return false, fmt.Errorf("binding the adopted task %s failed (%v) and re-recording the observation failed: %w", snapshot.ID, err, putErr)
+		}
+		return false, err
+	}
+
+	// ErrAssignmentNotPending here means a concurrent dispatch won the
+	// binding — ApplyTerminal still funnels the observation through the
+	// winning binding (it resolves assignments by task id).
+	if _, err := d.ApplyTerminal(ctx, snapshot); err != nil {
+		return true, fmt.Errorf("applying the adopted task %s failed: %w", snapshot.ID, err)
+	}
+	return true, nil
 }
 
 // isRestartRedispatch reports whether the assignment was minted before the
@@ -168,8 +360,11 @@ func (d *Dispatcher) recordFailure(ctx context.Context, c store.DispatchCandidat
 
 // buildRequest builds the A2A DispatchRequest for one candidate: the
 // dispatch document as the message, the ticket session's contextId for
-// continuity, and the push receiver registration for terminal states.
-func (d *Dispatcher) buildRequest(ctx context.Context, c store.DispatchCandidate) (*a2a.DispatchRequest, error) {
+// continuity, the push receiver registration for terminal states, and the
+// deterministic per-attempt message id (write-ahead intent: a re-sent
+// attempt stays correlatable at the gateway after a crash between send and
+// bind).
+func (d *Dispatcher) buildRequest(ctx context.Context, c store.DispatchCandidate, attempt int) (*a2a.DispatchRequest, error) {
 	message, err := d.buildDocument(ctx, c)
 	if err != nil {
 		return nil, err
@@ -180,6 +375,7 @@ func (d *Dispatcher) buildRequest(ctx context.Context, c store.DispatchCandidate
 		ContextID: c.Ticket.SessionID,
 		PushURL:   PushReceiverURL(d.opts.PushBaseURL),
 		PushID:    PushIDFor(c.Assignment.ID),
+		MessageID: MessageIDFor(c.Assignment.ID, attempt),
 	}, nil
 }
 
@@ -316,6 +512,13 @@ func PushReceiverURL(base string) string {
 // accumulating registrations.
 func PushIDFor(assignmentID string) string {
 	return "push-" + assignmentID
+}
+
+// MessageIDFor derives the deterministic A2A message id of one dispatch
+// attempt: a re-sent attempt is correlatable at the gateway and in logs even
+// after a crash between send and bind (write-ahead intent, PR #11 C3).
+func MessageIDFor(assignmentID string, attempt int) string {
+	return fmt.Sprintf("assign-%s-%d", assignmentID, attempt)
 }
 
 // ErrUnknownTask reports that a pushed/queried task id does not belong to any

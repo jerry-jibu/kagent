@@ -108,7 +108,7 @@ func (t *HTTPTransport) Dispatch(ctx context.Context, req DispatchRequest) (Disp
 		Message: wireMessage{
 			Role:      "ROLE_USER",
 			Parts:     []wirePart{{Text: req.Message}},
-			MessageID: newMessageID(),
+			MessageID: dispatchMessageID(req.MessageID),
 			ContextID: req.ContextID,
 		},
 		Config: &sendMessageConfig{
@@ -406,4 +406,13 @@ func newMessageID() string {
 		return fmt.Sprintf("orch-%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// dispatchMessageID resolves the message id of a dispatch: the request's
+// deterministic id when set, a random one otherwise.
+func dispatchMessageID(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return newMessageID()
 }

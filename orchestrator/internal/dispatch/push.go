@@ -101,7 +101,17 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case err == nil:
 		writePushJSON(w, http.StatusOK, true, "")
 	case errors.Is(err, ErrUnknownTask):
-		writePushJSON(w, http.StatusNotFound, false, err.Error())
+		// The task belongs to no assignment — most likely a dispatch whose
+		// binding write was lost to a crash (write-ahead intent, PR #11 C3).
+		// Record it for adoption instead of discarding: the restart
+		// recovery binds and applies it rather than re-sending. Adoption
+		// verifies the task at the gateway before trusting it, so an
+		// unverified push cannot spoof a binding.
+		if recErr := r.dispatcher.RecordUnclaimedTask(req.Context(), task); recErr != nil {
+			writePushJSON(w, http.StatusInternalServerError, false, recErr.Error())
+			return
+		}
+		writePushJSON(w, http.StatusOK, true, "task recorded for adoption")
 	default:
 		writePushJSON(w, http.StatusInternalServerError, false, err.Error())
 	}

@@ -237,6 +237,14 @@ func main() {
 	// one buffered slot, a scan already covers every awaiting ticket.
 	materializeNotify := make(chan struct{}, 1)
 
+	// loopDone is signalled once per background loop; shutdown drains it
+	// before closing the store — a beat racing a closed pool widens exactly
+	// the landed-but-unbound dispatch window the write-ahead intent exists
+	// to shrink (PR #11 C3). loopCount must match the number of runLoop
+	// spawns below.
+	loopCount := 4
+	loopDone := make(chan struct{}, loopCount)
+
 	// failStart tears the process down on a refused start (AC: 拒绝启动):
 	// every partially started subsystem is stopped and the process exits
 	// nonzero. One teardown sequence instead of one per refusal site.
@@ -284,7 +292,7 @@ func main() {
 			engine := eval.NewEngine(st, eval.NewEvaluator(
 				a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: cfg.A2AGatewayURL}),
 				cfg.EvaluatorAgent))
-			go runEvalLoop(pollerCtx, cfg.GitHubSource, engine, watcher, cfg.EvalInterval, materializeNotify, log)
+			go runEvalLoop(pollerCtx, cfg.GitHubSource, engine, watcher, cfg.EvalInterval, materializeNotify, log, loopDone)
 			log.Info("eval loop started",
 				"agent", cfg.EvaluatorAgent,
 				"gateway", cfg.A2AGatewayURL,
@@ -338,7 +346,7 @@ func main() {
 			log.Info("startup recovery loaded the non-terminal manifest",
 				"tickets", recovered.Tickets, "pending", recovered.Pending, "running", recovered.Running)
 
-			go runPassLoop(pollerCtx, pass, cfg.PassInterval, log)
+			go runPassLoop(pollerCtx, pass, cfg.PassInterval, log, loopDone)
 			log.Info("pass beat started",
 				"worker", cfg.WorkerAgent,
 				"gateway", cfg.A2AGatewayURL,
@@ -368,7 +376,7 @@ func main() {
 				Token:      cfg.GitHubToken,
 				Log:        log,
 			})
-			go runDeliveryLoop(pollerCtx, deliverer, cfg.PassInterval, log)
+			go runDeliveryLoop(pollerCtx, deliverer, cfg.PassInterval, log, loopDone)
 			log.Info("delivery loop started",
 				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
 				"git_base_url", cfg.GitHubGitBaseURL,
@@ -391,7 +399,7 @@ func main() {
 				Token:      cfg.GitHubToken,
 				Log:        log,
 			})
-			go runMaterializeLoop(pollerCtx, materializer, cfg.PassInterval, materializeNotify, log)
+			go runMaterializeLoop(pollerCtx, materializer, cfg.PassInterval, materializeNotify, log, loopDone)
 			log.Info("materialize loop started",
 				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
 				"git_base_url", cfg.GitHubGitBaseURL,
@@ -431,6 +439,18 @@ func main() {
 	_ = httpSrv.Shutdown(shutdownCtx)
 	cancelPoller()
 	watcher.Stop()
+	// Drain the background loops before closing the store: a beat racing a
+	// closed pool widens the landed-but-unbound dispatch window (PR #11 C3)
+	// and litters the log with pool errors. The drain shares the HTTP
+	// shutdown budget — a hung beat waits at most the remaining deadline.
+	for i := 0; i < loopCount; i++ {
+		select {
+		case <-loopDone:
+		case <-shutdownCtx.Done():
+			log.Warn("shutdown deadline reached with loops still running", "drained", i, "of", loopCount)
+			break
+		}
+	}
 	st.Close()
 }
 
@@ -439,16 +459,24 @@ func main() {
 // when a channel is wired (the materialize loop's accept nudge) — until ctx
 // is done. Per-beat failures are logged inside the beat closures and never
 // stop the loop; the next beat retries. name names the loop in the stop log.
+// done is signalled when the loop exits, so shutdown can drain every beat
+// before closing the store — a beat racing a closed pool widens exactly the
+// dispatch window the write-ahead intent exists to shrink (PR #11 C3).
 func runLoop(ctx context.Context, name string, interval time.Duration,
-	wake <-chan struct{}, beat func(), log *slog.Logger) {
+	wake <-chan struct{}, beat func(), log *slog.Logger, done chan<- struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	defer func() {
+		log.Debug("loop stopped", "loop", name)
+		if done != nil {
+			done <- struct{}{}
+		}
+	}()
 
 	beat()
 	for {
 		select {
 		case <-ctx.Done():
-			log.Debug("loop stopped", "loop", name)
 			return
 		case <-ticker.C:
 			beat()
@@ -466,7 +494,7 @@ func runLoop(ctx context.Context, name string, interval time.Duration,
 // materialized at once (docs/designs/0003 路线 A: accept 后、派工前物化).
 func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
 	watcher *policy.Watcher, interval time.Duration, materializeNotify chan<- struct{},
-	log *slog.Logger) {
+	log *slog.Logger, done chan<- struct{}) {
 
 	source := github.SourceName(repo)
 	runLoop(ctx, "eval", interval, nil, func() {
@@ -484,14 +512,14 @@ func runEvalLoop(ctx context.Context, repo string, engine *eval.Engine,
 			default:
 			}
 		}
-	}, log)
+	}, log, done)
 }
 
 // runPassLoop beats the advancement chain (docs/designs/0001 §4.3): each
 // tick dispatches, reconciles, schedules follow-ups and drains the outbox.
 // Per-item failures are already absorbed inside the tick; only a broken
 // store scan errors here and the next tick retries it.
-func runPassLoop(ctx context.Context, pass *dispatch.Pass, interval time.Duration, log *slog.Logger) {
+func runPassLoop(ctx context.Context, pass *dispatch.Pass, interval time.Duration, log *slog.Logger, done chan<- struct{}) {
 	runLoop(ctx, "pass", interval, nil, func() {
 		stats, err := pass.Tick(ctx)
 		if err != nil {
@@ -507,7 +535,7 @@ func runPassLoop(ctx context.Context, pass *dispatch.Pass, interval time.Duratio
 				"followups", stats.Followups,
 				"delivered", stats.Delivered)
 		}
-	}, log)
+	}, log, done)
 }
 
 // derivePushBaseURL falls back to a loopback push base from the listen
@@ -528,7 +556,7 @@ func derivePushBaseURL(listenAddr string) string {
 // runDeliveryLoop ships pending results on the Pass cadence. Per-candidate
 // failures are classified and recorded inside DeliverPending; only a broken
 // store scan errors, and the next beat retries it.
-func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interval time.Duration, log *slog.Logger) {
+func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interval time.Duration, log *slog.Logger, done chan<- struct{}) {
 	runLoop(ctx, "delivery", interval, nil, func() {
 		stats, err := deliverer.DeliverPending(ctx)
 		if err != nil {
@@ -541,7 +569,7 @@ func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interva
 				"failed", stats.Failed,
 				"retried", stats.Retried)
 		}
-	}, log)
+	}, log, done)
 }
 
 // runMaterializeLoop materializes the workspaces of freshly accepted tickets
@@ -551,7 +579,7 @@ func runDeliveryLoop(ctx context.Context, deliverer *delivery.Deliverer, interva
 // runs here — never inside the Pass tick — so the 2s reconciliation beat
 // stays responsive while workspaces are being prepared.
 func runMaterializeLoop(ctx context.Context, materializer *workspace.Materializer,
-	interval time.Duration, materializeNotify <-chan struct{}, log *slog.Logger) {
+	interval time.Duration, materializeNotify <-chan struct{}, log *slog.Logger, done chan<- struct{}) {
 	runLoop(ctx, "materialize", interval, materializeNotify, func() {
 		stats, err := materializer.MaterializePending(ctx)
 		if err != nil {
@@ -562,5 +590,5 @@ func runMaterializeLoop(ctx context.Context, materializer *workspace.Materialize
 				"materialized", stats.Materialized,
 				"failed", stats.Failed)
 		}
-	}, log)
+	}, log, done)
 }

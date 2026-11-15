@@ -45,6 +45,11 @@ type DispatchRequest struct {
 	ContextID string
 	PushURL   string
 	PushID    string
+	// MessageID is the A2A message id of the dispatch. Optional: empty mints
+	// a random id. The dispatcher sets a deterministic per-attempt id
+	// (assign-<assignment>-<attempt>) so a re-sent attempt stays correlatable
+	// at the gateway and in logs after a crash between send and bind.
+	MessageID string
 }
 
 // DispatchResult is the immediate answer of a ReturnImmediately dispatch:

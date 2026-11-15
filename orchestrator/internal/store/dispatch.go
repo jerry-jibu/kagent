@@ -326,6 +326,11 @@ func (s *Store) MarkAssignmentDispatched(ctx context.Context, assignmentID, tick
 // (attempt counter + error) and the audit row land together, and the
 // assignment stays pending for the next Pass tick. The retry past the first
 // failure carries the recovery annotation (docs/designs/0001 §4.3: 恢复注记).
+//
+// Since the write-ahead intent (BeginDispatchAttempt) began counting sends,
+// the failure path only keeps the ledger's error column and the audit row —
+// a failed attempt is counted once, at its beginning, not once per failure
+// bookkeeping call.
 func (s *Store) RecordDispatchFailure(ctx context.Context, assignmentID, errText string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -336,8 +341,7 @@ func (s *Store) RecordDispatchFailure(ctx context.Context, assignmentID, errText
 	var ticketID string
 	if err := tx.QueryRow(ctx, `
 		UPDATE assignments
-		SET dispatch_attempts = dispatch_attempts + 1,
-		    last_error = $2,
+		SET last_error = $2,
 		    updated_at = now()
 		WHERE id = $1
 		RETURNING ticket_id`, assignmentID, errText).Scan(&ticketID); err != nil {
@@ -355,6 +359,87 @@ func (s *Store) RecordDispatchFailure(ctx context.Context, assignmentID, errText
 	}
 
 	return tx.Commit(ctx)
+}
+
+// BeginDispatchAttempt is the write-ahead intent of one dispatch send: it
+// counts the attempt BEFORE the transport call, so a crash between the send
+// and the binding write leaves an attempted-but-unbound assignment — a state
+// the restart recovery recognizes (adoption of an orphan task observation,
+// or a quarantined resend), instead of a blind resend that reads as a first
+// attempt. The error ledger is cleared for the in-flight attempt. Refuses a
+// non-pending assignment with ErrAssignmentNotPending.
+func (s *Store) BeginDispatchAttempt(ctx context.Context, assignmentID string) (int, error) {
+	var attempt int
+	err := s.pool.QueryRow(ctx, `
+		UPDATE assignments
+		SET dispatch_attempts = dispatch_attempts + 1,
+		    last_error = '',
+		    updated_at = now()
+		WHERE id = $1 AND status = $2
+		RETURNING dispatch_attempts`,
+		assignmentID, AssignmentStatusPending).Scan(&attempt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrAssignmentNotPending
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin dispatch attempt of %s: %w", assignmentID, err)
+	}
+	return attempt, nil
+}
+
+// OrphanTask is one recorded observation of a gateway task no assignment is
+// bound to (migration 0008): a dispatch whose binding write was lost to a
+// crash, or a pushed task no assignment binds. Key is the lookup handle:
+// the assignment id from the unbound-send path (authoritative), the gateway
+// context id from the push receiver (adoptable where a session id exists).
+type OrphanTask struct {
+	Key        string
+	TaskID     string
+	State      string
+	StatusText string
+}
+
+// RecordOrphanTask upserts the latest orphan observation under key. The
+// dispatcher's restart recovery adopts it instead of re-sending — a blind
+// resend would fork a second worker onto the same ticket workspace.
+func (s *Store) RecordOrphanTask(ctx context.Context, obs OrphanTask) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO orphan_task_observations (observation_key, task_id, state, status_text, observed_at)
+		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (observation_key) DO UPDATE
+		SET task_id = EXCLUDED.task_id,
+		    state = EXCLUDED.state,
+		    status_text = EXCLUDED.status_text,
+		    observed_at = EXCLUDED.observed_at`,
+		obs.Key, obs.TaskID, obs.State, obs.StatusText)
+	if err != nil {
+		return fmt.Errorf("failed to record the orphan task of %s: %w", obs.Key, err)
+	}
+	return nil
+}
+
+// TakeOrphanTask claims and deletes the key's orphan observation in one
+// transaction: exactly one caller can adopt a given observation.
+func (s *Store) TakeOrphanTask(ctx context.Context, key string) (OrphanTask, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return OrphanTask{}, false, fmt.Errorf("failed to begin orphan-adoption transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var obs OrphanTask
+	err = tx.QueryRow(ctx, `
+		DELETE FROM orphan_task_observations
+		WHERE observation_key = $1
+		RETURNING observation_key, task_id, state, status_text`,
+		key).Scan(&obs.Key, &obs.TaskID, &obs.State, &obs.StatusText)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return OrphanTask{}, false, nil
+	}
+	if err != nil {
+		return OrphanTask{}, false, fmt.Errorf("failed to claim the orphan task of %s: %w", key, err)
+	}
+	return obs, true, tx.Commit(ctx)
 }
 
 // TerminalOutcome reports what ApplyAssignmentTerminal did.
