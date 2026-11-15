@@ -707,31 +707,48 @@ export const mockBuiltinSkills: BuiltinSkillsCatalog = {
       name: "argo-rollouts-progressive-delivery",
       path: "opt/kagent-tools-skills/skills/argo-rollouts-progressive-delivery",
       description: "Operate Argo Rollouts canary and blue-green releases.",
+      tags: ["delivery"],
+      versions: [],
     },
     {
       name: "helm-release-management",
       path: "opt/kagent-tools-skills/skills/helm-release-management",
       description: "Inspect, upgrade and uninstall Helm releases.",
+      tags: ["kubernetes", "delivery"],
+      versions: [],
     },
     {
       name: "istio-traffic-debugging",
       path: "opt/kagent-tools-skills/skills/istio-traffic-debugging",
       description: "Debug Istio service mesh traffic: 503s, mTLS failures, routing not applied.",
+      tags: ["networking"],
+      versions: [],
     },
     {
       name: "k8s-troubleshooting",
       path: "opt/kagent-tools-skills/skills/k8s-troubleshooting",
       description: "Diagnose unhealthy Kubernetes workloads: CrashLoopBackOff, Pending, ImagePullBackOff.",
+      tags: ["kubernetes", "troubleshooting"],
+      versions: [
+        {
+          image: "ghcr.io/kagent-dev/kagent/tools@sha256:9e8d7c6b5a493827160504f3e2d1c0b99e8d7c6b5a493827160504f3e2d1c0b9",
+          label: "0.3.0",
+        },
+      ],
     },
     {
       name: "kubescape-security-posture",
       path: "opt/kagent-tools-skills/skills/kubescape-security-posture",
       description: "Review cluster security posture with Kubescape scan results.",
+      tags: ["security"],
+      versions: [],
     },
     {
       name: "prometheus-observability",
       path: "opt/kagent-tools-skills/skills/prometheus-observability",
       description: "Answer questions about cluster and application metrics with Prometheus queries.",
+      tags: ["monitoring"],
+      versions: [],
     },
   ],
 };

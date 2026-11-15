@@ -5,6 +5,12 @@ set -euo pipefail
 # deploys, pinned by digest, and the name, description and path of every skill
 # in it. Rerun with make builtin-skills-catalog after you bump kagent-tools in
 # helm/kagent/Chart-template.yaml.
+#
+# The emitted catalog carries the current pin only. The browser-side schema also
+# accepts, per skill, optional "tags" (strings for the catalog browser's filter)
+# and optional "versions" (alternative pinings, newest first, each
+# {image: repo@sha256:<64 hex>, label?, path?}); hand-editing the generated
+# catalog to add them is valid — the UI validates both shapes.
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 repository="ghcr.io/kagent-dev/kagent/tools"
 skills_root="opt/kagent-tools-skills/skills"

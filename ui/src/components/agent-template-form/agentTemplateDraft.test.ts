@@ -373,7 +373,15 @@ describe("cross-namespace references", () => {
 const DIGEST = "sha256:" + "0".repeat(64);
 const CATALOG = {
   image: `ghcr.io/kagent-dev/kagent/tools@${DIGEST}`,
-  skills: [{ name: "k8s-troubleshooting", description: "Diagnose unhealthy workloads.", path: "opt/kagent-tools-skills/skills/k8s-troubleshooting" }],
+  skills: [
+    {
+      name: "k8s-troubleshooting",
+      description: "Diagnose unhealthy workloads.",
+      path: "opt/kagent-tools-skills/skills/k8s-troubleshooting",
+      tags: ["kubernetes"],
+      versions: [],
+    },
+  ],
 };
 
 function draftWithSkills(...skills: Partial<AgentTemplateDraft["skills"][number]>[]): AgentTemplateDraft {

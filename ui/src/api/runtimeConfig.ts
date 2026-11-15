@@ -17,6 +17,26 @@ export interface BuiltinSkill {
   description: string;
   /** The skill's directory inside the catalog image. */
   path: string;
+  /** Grouping labels the catalog browser filters on. */
+  tags: string[];
+  /**
+   * Alternative pinings of this skill, newest first. Each pins its own catalog
+   * image digest and may read the skill from a different directory inside it.
+   * The top-level catalog `image` plus the skill's own `path` is the current
+   * version and stays the default selection; an entry that repeats it is
+   * redundant but harmless.
+   */
+  versions: BuiltinSkillVersion[];
+}
+
+/** One alternative version of a `BuiltinSkill`, as the picker offers it. */
+export interface BuiltinSkillVersion {
+  /** The digest-pinned image this version's content comes from. */
+  image: string;
+  /** A human-readable name; absent renders a short digest. */
+  label?: string;
+  /** Where the skill lives inside `image`; defaults to the skill's own `path`. */
+  path?: string;
 }
 
 /** The skills kagent ships, all in one digest-pinned image. */
@@ -90,13 +110,54 @@ function parseBuiltinSkills(text: string): BuiltinSkillsCatalog | undefined {
   const skills: BuiltinSkill[] = [];
   for (const skill of value.skills) {
     if (!isRecord(skill) || !isText(skill.name) || !isText(skill.path)) return undefined;
+    const tags = parseTags(skill.tags);
+    if (tags === undefined) return undefined;
+    const versions = parseVersions(skill.versions);
+    if (versions === undefined) return undefined;
     skills.push({
       name: skill.name,
       description: typeof skill.description === "string" ? skill.description : "",
       path: skill.path,
+      tags,
+      versions,
     });
   }
   return { image: value.image, skills };
+}
+
+/** An absent or malformed tag list is an empty list; a bad entry rejects the catalog. */
+function parseTags(value: unknown): string[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  const tags: string[] = [];
+  for (const tag of value) {
+    if (!isText(tag)) return undefined;
+    tags.push(tag);
+  }
+  return tags;
+}
+
+/**
+ * An absent list is no versions; a malformed entry rejects the whole catalog, as
+ * every other parse failure here does — a version the form cannot pin is worse
+ * than no versions, because selecting it would produce a spec the CRD refuses.
+ */
+function parseVersions(value: unknown): BuiltinSkillVersion[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  const versions: BuiltinSkillVersion[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry) || !isText(entry.image)) return undefined;
+    if (!OCI_DIGEST_REF.test(entry.image)) return undefined;
+    if (entry.path !== undefined && !isText(entry.path)) return undefined;
+    if (entry.label !== undefined && !isText(entry.label)) return undefined;
+    versions.push({
+      image: entry.image,
+      ...(entry.label !== undefined ? { label: entry.label } : {}),
+      ...(entry.path !== undefined ? { path: entry.path } : {}),
+    });
+  }
+  return versions;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -106,3 +167,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isText(value: unknown): value is string {
   return typeof value === "string" && value !== "";
 }
+
+/** The digest pin a skill source must carry; the same shape the CRD's CEL accepts. */
+const OCI_DIGEST_REF = /^[^\s@]+@sha256:[0-9a-f]{64}$/;

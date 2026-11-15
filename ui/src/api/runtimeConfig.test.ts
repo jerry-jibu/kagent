@@ -18,7 +18,45 @@ describe("runtimeConfig builtinSkills", () => {
     };
     expect(runtimeConfig().builtinSkills).toEqual({
       image: IMAGE,
-      skills: [{ name: "k8s-troubleshooting", description: "Diagnose unhealthy workloads.", path: "opt/kagent-tools-skills/skills/k8s-troubleshooting" }],
+      skills: [
+        {
+          name: "k8s-troubleshooting",
+          description: "Diagnose unhealthy workloads.",
+          path: "opt/kagent-tools-skills/skills/k8s-troubleshooting",
+          tags: [],
+          versions: [],
+        },
+      ],
+    });
+  });
+
+  it("reads tags and alternative versions when the catalog carries them", () => {
+    const older = "ghcr.io/kagent-dev/kagent/tools@sha256:" + "b".repeat(64);
+    window.environmentVariables = {
+      BUILTIN_SKILLS: JSON.stringify({
+        image: IMAGE,
+        skills: [
+          {
+            name: "k8s-troubleshooting",
+            description: "Diagnose unhealthy workloads.",
+            path: "opt/kagent-tools-skills/skills/k8s-troubleshooting",
+            tags: ["kubernetes", "troubleshooting"],
+            versions: [{ image: older, label: "v0.3.0", path: "opt/kagent-tools-skills/skills/k8s-troubleshooting" }],
+          },
+        ],
+      }),
+    };
+    expect(runtimeConfig().builtinSkills).toEqual({
+      image: IMAGE,
+      skills: [
+        {
+          name: "k8s-troubleshooting",
+          description: "Diagnose unhealthy workloads.",
+          path: "opt/kagent-tools-skills/skills/k8s-troubleshooting",
+          tags: ["kubernetes", "troubleshooting"],
+          versions: [{ image: older, label: "v0.3.0", path: "opt/kagent-tools-skills/skills/k8s-troubleshooting" }],
+        },
+      ],
     });
   });
 
@@ -37,6 +75,13 @@ describe("runtimeConfig builtinSkills", () => {
     ["no skills list", JSON.stringify({ image: IMAGE })],
     ["a skill without a name", JSON.stringify({ image: IMAGE, skills: [{ description: "x", path: "opt/kagent-tools-skills/skills/x" }] })],
     ["a skill without a path", JSON.stringify({ image: IMAGE, skills: [{ name: "x", description: "x" }] })],
+    ["a skill whose tags are not strings", JSON.stringify({ image: IMAGE, skills: [{ name: "x", path: "p", tags: [3] }] })],
+    ["a version without an image", JSON.stringify({ image: IMAGE, skills: [{ name: "x", path: "p", versions: [{ label: "old" }] }] })],
+    [
+      "a version whose image is not digest-pinned",
+      JSON.stringify({ image: IMAGE, skills: [{ name: "x", path: "p", versions: [{ image: "ghcr.io/org/tools:latest" }] }] }),
+    ],
+    ["a version with an empty path", JSON.stringify({ image: IMAGE, skills: [{ name: "x", path: "p", versions: [{ image: IMAGE, path: "" }] }] })],
   ])("warns and offers nothing for %s", (_, value) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     window.environmentVariables = { BUILTIN_SKILLS: value };
