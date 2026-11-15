@@ -76,6 +76,9 @@ type session struct {
 func (s *session) upstreamRequest(method string, params json.RawMessage) (json.RawMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	start := time.Now()
+	log.Printf("upstream %s begin", method)
+	defer func() { log.Printf("upstream %s done in %s", method, time.Since(start)) }()
 
 	s.nextID++
 	id := s.nextID
@@ -105,6 +108,10 @@ func (s *session) upstreamRequest(method string, params json.RawMessage) (json.R
 		if err := json.Unmarshal(resp.ID, &gotID); err != nil || gotID != id {
 			continue // response for a different request — keep scanning
 		}
+		// The agentfs engine omits the jsonrpc tag on responses; downstream
+		// MCP clients (the DSH bridge) require "2.0" — normalize at the
+		// adapter (PR #11 e2e).
+		resp.JSONRPC = "2.0"
 		out, err := json.Marshal(resp)
 		if err != nil {
 			return nil, fmt.Errorf("re-encode upstream response: %w", err)
@@ -232,6 +239,38 @@ func (b *bridge) handleMCP(w http.ResponseWriter, r *http.Request) {
 			b.endSession(sid)
 		}
 		w.WriteHeader(http.StatusOK)
+	case http.MethodGet:
+		// The standalone SSE stream (MCP spec §2.2.3): hold an
+		// event-stream open for the session's lifetime, sending nothing.
+		// Clients that require the stream (the DSH bridge's go-sdk treats
+		// a failed GET as a session failure) keep their logical session
+		// alive; keep-alive comments defeat proxy idle timeouts.
+		sid := r.Header.Get("Mcp-Session-Id")
+		_, ok := b.getSession(sid)
+		if !ok {
+			http.Error(w, "unknown session", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		flusher, canFlush := w.(http.Flusher)
+		if canFlush {
+			flusher.Flush()
+		}
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				if canFlush {
+					fmt.Fprint(w, ": keep-alive\n\n")
+					flusher.Flush()
+				}
+			}
+		}
 	default:
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 	}
@@ -243,6 +282,7 @@ func (b *bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad JSON-RPC body", http.StatusBadRequest)
 		return
 	}
+	log.Printf("http %s session=%q", req.Method, r.Header.Get("Mcp-Session-Id"))
 
 	// Notifications carry no id: accept with no response body (202) — the
 	// upstream never answers them (see mcp.go's documented deviation).
@@ -291,6 +331,7 @@ func (b *bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("upstream failure: %v", err), http.StatusBadGateway)
 			return
 		}
+		out = rewriteResponseID(out, req.ID)
 		out = prefixToolNames(out)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
@@ -318,6 +359,7 @@ func (b *bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("upstream failure: %v", err), http.StatusBadGateway)
 		return
 	}
+	out = rewriteResponseID(out, req.ID)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(out)
 }
@@ -363,23 +405,67 @@ func (b *bridge) withBlankBase(params json.RawMessage) json.RawMessage {
 	return out
 }
 
-// prefixToolNames rewrites a tools/list result: every tool name gains the
-// agenticfs_ prefix (the deployed MCP surface).
-func prefixToolNames(result json.RawMessage) json.RawMessage {
-	var framed struct {
-		Result struct {
-			Tools []struct {
-				Name string `json:"name"`
-			} `json:"tools"`
-		} `json:"result"`
+// rewriteResponseID replaces the response's JSON-RPC id with the CLIENT's
+// request id: the upstream was asked with the bridge's internal numbering,
+// and the go-sdk client matches responses to pending calls by id — a
+// mismatched id is silently discarded and the call waits out its deadline.
+func rewriteResponseID(resp json.RawMessage, clientID json.RawMessage) json.RawMessage {
+	// Whole-envelope rewrite via RawMessage map: the result/error content
+	// must survive untouched.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(resp, &fields); err != nil {
+		return resp
 	}
-	if err := json.Unmarshal(result, &framed); err != nil {
+	fields["jsonrpc"] = json.RawMessage(`"2.0"`)
+	if clientID != nil {
+		fields["id"] = clientID
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return resp
+	}
+	return out
+}
+
+// prefixToolNames rewrites a tools/list RESPONSE ENVELOPE: every tool name
+// gains the agenticfs_ prefix (the deployed MCP surface). The envelope's
+// jsonrpc/id fields are preserved and the version tag is forced to "2.0" —
+// downstream clients (the DSH bridge's go-sdk) validate it on every frame.
+func prefixToolNames(result json.RawMessage) json.RawMessage {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(result, &envelope); err != nil {
 		return result // not a tools/list shape — pass through
 	}
-	for i := range framed.Result.Tools {
-		framed.Result.Tools[i].Name = "agenticfs_" + framed.Result.Tools[i].Name
+	rawTools, ok := envelope["result"]
+	if !ok {
+		return result
 	}
-	out, err := json.Marshal(framed)
+	var resultList struct {
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal(rawTools, &resultList); err != nil {
+		return result
+	}
+	for i := range resultList.Tools {
+		name, _ := resultList.Tools[i]["name"].(string)
+		resultList.Tools[i]["name"] = "agenticfs_" + name
+		if _, ok := resultList.Tools[i]["inputSchema"]; !ok {
+			// The engine declares some tools without an inputSchema; the
+			// go-sdk's server-side AddTool refuses schema-less tools —
+			// inject the empty-object schema these tools actually take.
+			resultList.Tools[i]["inputSchema"] = map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			}
+		}
+	}
+	patched, err := json.Marshal(resultList)
+	if err != nil {
+		return result
+	}
+	envelope["result"] = patched
+	envelope["jsonrpc"] = json.RawMessage(`"2.0"`)
+	out, err := json.Marshal(envelope)
 	if err != nil {
 		return result
 	}

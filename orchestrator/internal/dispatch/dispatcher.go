@@ -63,6 +63,13 @@ type Options struct {
 	// the orchestrator runs the workspace pipeline so a pending assignment
 	// waits until its ticket's workspace has been materialized.
 	RequireWorkspace bool
+	// MessageIDSalt is a per-process unique string baked into every dispatch
+	// message id (MessageIDFor). Within one process the id stays
+	// deterministic per attempt (write-ahead intent); across process
+	// lifetimes it differs — A2A gateways treat a repeated messageId as a
+	// resend and return the EXISTING task, which would resurrect a dead
+	// task from a previous run (PR #11 e2e: gateway idempotency collision).
+	MessageIDSalt string
 	// RedispatchQuarantine bounds how long an attempted-but-unbound dispatch
 	// waits before the dispatcher may re-send it (write-ahead intent, PR #11
 	// C3): an earlier attempt may hold a live task at the gateway whose
@@ -399,7 +406,7 @@ func (d *Dispatcher) buildRequest(ctx context.Context, c store.DispatchCandidate
 		ContextID: c.Ticket.SessionID,
 		PushURL:   PushReceiverURL(d.opts.PushBaseURL),
 		PushID:    PushIDFor(c.Assignment.ID),
-		MessageID: MessageIDFor(c.Assignment.ID, attempt),
+		MessageID: MessageIDFor(c.Assignment.ID, attempt, d.opts.MessageIDSalt),
 	}, nil
 }
 
@@ -538,8 +545,13 @@ func PushIDFor(assignmentID string) string {
 
 // MessageIDFor derives the deterministic A2A message id of one dispatch
 // attempt: a re-sent attempt is correlatable at the gateway and in logs even
-// after a crash between send and bind (write-ahead intent, PR #11 C3).
-func MessageIDFor(assignmentID string, attempt int) string {
+// after a crash between send and bind (write-ahead intent, PR #11 C3). salt
+// scopes the determinism to one orchestrator process lifetime — gateways
+// dedup by messageId, so a cross-run collision would return a stale task.
+func MessageIDFor(assignmentID string, attempt int, salt string) string {
+	if salt != "" {
+		return fmt.Sprintf("assign-%s-%d-%s", assignmentID, attempt, salt)
+	}
 	return fmt.Sprintf("assign-%s-%d", assignmentID, attempt)
 }
 

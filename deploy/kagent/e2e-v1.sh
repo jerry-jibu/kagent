@@ -173,7 +173,7 @@ ORC_PID=$!
 sleep 2
 curl -sf "$ORC_URL/healthz" >/dev/null && ok "重启后 healthz green" || { echo "orchestrator not healthy after restart"; tail "$WORK/logs/orchestrator.err"; exit 2; }
 
-RESTART_DEADLINE=$(($(date +%s) + 120))
+RESTART_DEADLINE=$(($(date +%s) + 420))   # 冷 actor + DSH turn 需 2-4 分钟
 while [ "$(date +%s)" -lt "$RESTART_DEADLINE" ]; do
   pr_line=$(grep "pull request" "$WORK/logs/fake.err" 2>/dev/null | tail -1 || true)
   result_line=$( { grep "superagent:effect:result:" "$WORK/logs/fake.err" 2>/dev/null || true; } | tail -1)

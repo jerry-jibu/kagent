@@ -10,6 +10,8 @@ metadata:
   name: superagent-worker
   namespace: kagent
 spec:
+  egressPolicyRefs:
+    - name: agentfs-bridge
   harnessRef:
     name: dsh-byo
   template:

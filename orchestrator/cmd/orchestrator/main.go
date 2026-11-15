@@ -342,6 +342,10 @@ func main() {
 				// baseline (docs/designs/0003 路线 A: 派工前物化).
 				RequireWorkspace: cfg.WorkspaceMCPEndpoint != "",
 				RecoveryCutoff:   dbNow,
+				// Per-process salt: keeps message-id determinism within this
+				// lifetime while avoiding gateway messageId-idempotency
+				// collisions across restarts/e2e schema resets.
+				MessageIDSalt: fmt.Sprintf("boot%d", dbNow.Unix()),
 			})
 			verifier, verr := buildPushJWTVerifier(cfg)
 			if verr != nil {

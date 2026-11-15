@@ -127,7 +127,7 @@ func TestDispatchIntent(t *testing.T) {
 		if len(calls) != 1 {
 			t.Fatalf("send calls = %d, want the expired-window resend", len(calls))
 		}
-		want := dispatch.MessageIDFor(assign.ID, 2)
+		want := dispatch.MessageIDFor(assign.ID, 2, "")
 		if calls[0].MessageID != want {
 			t.Fatalf("resend message id = %q, want the deterministic %q", calls[0].MessageID, want)
 		}
@@ -210,7 +210,7 @@ func TestDispatchIntent(t *testing.T) {
 			t.Fatalf("send calls = %d, want 1", len(calls))
 		}
 		assignments, _ := s.Assignments(ctx, tk.ID)
-		want := dispatch.MessageIDFor(assignments[0].ID, 1)
+		want := dispatch.MessageIDFor(assignments[0].ID, 1, "")
 		if calls[0].MessageID != want {
 			t.Fatalf("first-send message id = %q, want %q", calls[0].MessageID, want)
 		}
