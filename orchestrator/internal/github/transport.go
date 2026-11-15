@@ -47,6 +47,50 @@ type TransportConfig struct {
 	Client *http.Client
 }
 
+// RateLimitError reports a GitHub primary/secondary rate limit: the response
+// carried 403/429 with rate-limit headers. RetryAfter is when the block
+// lifts — callers (the deliverer's retry path) skip the candidate until
+// then instead of hammering every 2s beat, which is exactly the pattern
+// GitHub's abuse detection escalates (PR #11 review, Required).
+type RateLimitError struct {
+	// StatusCode is the HTTP status (403 or 429).
+	StatusCode int
+	// RetryAfter is when requests may resume; zero when the headers carried
+	// no usable deadline (treat as "unclassified 403" — retry with care).
+	RetryAfter time.Time
+	// Endpoint is the request URL the limit hit.
+	Endpoint string
+}
+
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter.IsZero() {
+		return fmt.Sprintf("github rate limit at %s: HTTP %d (no reset deadline in headers)", e.Endpoint, e.StatusCode)
+	}
+	return fmt.Sprintf("github rate limit at %s: HTTP %d, retry after %s", e.Endpoint, e.StatusCode, e.RetryAfter.Format(time.RFC3339))
+}
+
+// classifyGitHubStatus converts a non-2xx response into a typed error when
+// it is a rate limit, nil otherwise (the caller keeps its plain error).
+func classifyGitHubStatus(resp *http.Response, endpoint string) error {
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		return nil
+	}
+	rl := &RateLimitError{StatusCode: resp.StatusCode, Endpoint: endpoint}
+	if v := resp.Header.Get("Retry-After"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			rl.RetryAfter = time.Now().Add(time.Duration(secs) * time.Second)
+		}
+	}
+	if rl.RetryAfter.IsZero() {
+		if v := resp.Header.Get("X-RateLimit-Reset"); v != "" {
+			if epoch, err := strconv.ParseInt(v, 10, 64); err == nil && epoch > 0 {
+				rl.RetryAfter = time.Unix(epoch, 0)
+			}
+		}
+	}
+	return rl
+}
+
 // IssueComment is one GitHub conversation comment (issue or PR conversation),
 // the trigger source of the P0 pipeline.
 type IssueComment struct {
@@ -172,6 +216,9 @@ func (t *httpTransport) pollPage(ctx context.Context, repo string, since time.Ti
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if rlErr := classifyGitHubStatus(resp, endpoint); rlErr != nil {
+			return nil, false, rlErr
+		}
 		return nil, false, fmt.Errorf("poll request to %s failed: HTTP %d", endpoint, resp.StatusCode)
 	}
 
@@ -254,6 +301,9 @@ func (t *httpTransport) issueCommentsPage(ctx context.Context, repo string, issu
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if rlErr := classifyGitHubStatus(resp, endpoint); rlErr != nil {
+			return nil, false, rlErr
+		}
 		return nil, false, fmt.Errorf("comment list request to %s failed: HTTP %d", endpoint, resp.StatusCode)
 	}
 
@@ -308,6 +358,9 @@ func (t *httpTransport) PostIssueComment(ctx context.Context, repo string, issue
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if rlErr := classifyGitHubStatus(resp, endpoint); rlErr != nil {
+			return 0, rlErr
+		}
 		return 0, fmt.Errorf("comment post request to %s failed: HTTP %d", endpoint, resp.StatusCode)
 	}
 

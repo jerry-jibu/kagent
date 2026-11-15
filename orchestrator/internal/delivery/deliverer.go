@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/github"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/store"
@@ -81,6 +82,9 @@ type Stats struct {
 	// Failed counts permanent failures: the patch is missing, corrupted or
 	// empty — the ticket transitions to failed with its audit, no PR.
 	Failed int
+	// RateLimited counts candidates deferred behind a GitHub rate limit
+	// (they stay pending; the block lifts per the recorded Retry-After).
+	RateLimited int
 	// Retried counts transient failures that stay pending for the next beat
 	// (backend outage, git failure, GitHub failure).
 	Retried int
@@ -116,6 +120,8 @@ func (d *Deliverer) DeliverPending(ctx context.Context) (Stats, error) {
 			stats.Failed++
 		case outcomeRetried:
 			stats.Retried++
+		case outcomeRateLimited:
+			stats.RateLimited++
 		}
 	}
 	return stats, nil
@@ -127,6 +133,10 @@ const (
 	outcomeConfirmed
 	outcomeFailed
 	outcomeRetried
+	// outcomeRateLimited is outcomeRetried's rate-limit flavor: the
+	// candidate stays pending and the stats report it separately so an
+	// operator sees WHY nothing shipped (PR #11 review, Required).
+	outcomeRateLimited
 )
 
 // errStore marks a store failure that leaves the beat's bookkeeping unknown
@@ -247,16 +257,33 @@ func (d *Deliverer) failPermanently(ctx context.Context, ticketID, reason string
 }
 
 // retryTransient records a transient failure (audit observation) and keeps
-// the candidate pending for the next beat.
+// the candidate pending for the next beat. A GitHub rate limit skips the
+// candidate until the block lifts (PR #11 review, Required): re-hitting the
+// API every 2s beat is the hammering pattern GitHub's abuse detection
+// escalates.
 func (d *Deliverer) retryTransient(ctx context.Context, ticketID string, cause error, stage string) (int, error) {
-	if err := d.store.RecordAudit(ctx, ticketID, "delivery.failed", map[string]any{
+	detail := map[string]any{
 		"stage":     stage,
 		"error":     cause.Error(),
 		"permanent": false,
-	}); err != nil {
+	}
+	var rl *github.RateLimitError
+	if errors.As(cause, &rl) {
+		detail["rate_limited"] = true
+		if !rl.RetryAfter.IsZero() {
+			detail["retry_after"] = rl.RetryAfter.Format(time.RFC3339)
+		}
+	}
+	if err := d.store.RecordAudit(ctx, ticketID, "delivery.failed", detail); err != nil {
 		// The failure observation did not land: the ledger is behind the
 		// world, so the beat aborts instead of shipping against a blind spot.
 		return 0, fmt.Errorf("%w: failed to record the transient failure of %s: %w", errStore, ticketID, err)
+	}
+	if errors.As(cause, &rl) {
+		d.log.Warn("github rate limit — delivery deferred",
+			"ticket", ticketID, "stage", stage,
+			"retry_after", rl.RetryAfter.Format(time.RFC3339))
+		return outcomeRateLimited, nil
 	}
 	d.log.Warn("ticket delivery retried on the next beat",
 		"ticket", ticketID, "stage", stage, "error", cause)
