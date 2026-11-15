@@ -227,3 +227,4 @@ python/packages/kagent-adk/tests/fixtures/certs/*.srl
 
 # Weaver live-check report
 /telemetry/conformance/report/
+orchestrator/orchestrator
