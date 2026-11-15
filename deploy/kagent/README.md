@@ -210,3 +210,17 @@ deploy/kagent/e2e-v1.sh /tmp/kagent-v1-e2e
 **真 GitHub 走查（协调者步骤）**：需要用户 GitHub token（Secret `superagent-orchestrator-github`）+
 `--github-source`/`--github-api-url`/`--github-git-url` 指向真实仓库（`https://github.com`）；
 编排器 flags 全集见上表。
+
+## 脚本套件（e2e 全流程，按序执行）
+
+| 脚本 | 做什么 | 何时跑 |
+|---|---|---|
+| `scripts/env-setup.sh` | 环境体检+准备：kind 集群、t1-pg 测试 PG、DeepSeek Secret、controller `push.allowHttp` 补丁、DeepSeek API 余额连通性 | 每次 e2e 前（幂等） |
+| `scripts/build.sh` | 构建编排器与 fake GitHub 二进制 | e2e 前 |
+| `scripts/image-build.sh` | 构建 kagent-bridge 镜像（真 agentfs 引擎+桥双二进制）、推送、校验 registry、digest 钉死 agentfs.yaml | 桥/引擎代码变更后 |
+| `scripts/deploy-local.sh` | 部署全套 manifest：agentfs → EgressPolicy → modelconfigs → harness×2 → agents（等 Ready） | 首次/manifest 变更后 |
+| `scripts/e2e.sh` | e2e 运行器：清理陈旧编排器（实例锁）与端口转发 → 起 8083/9765 转发 → 跑 `e2e-v1.sh` | 每次 e2e |
+
+踩坑记录（脚本注释里有细节）：buildx COPY 内容缓存旧二进制、digest 拉取校验需 OCI Accept 头、
+`:tag` 引用被节点 containerd IfNotPresent 缓存、`egressPolicyRefs` 在 Agent spec 级、
+DeepSeek 402 表现为评估器回散文（JSON 解析错）、陈旧编排器进程占 PG 实例锁。
