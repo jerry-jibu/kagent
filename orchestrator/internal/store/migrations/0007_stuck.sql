@@ -1,4 +1,4 @@
--- 0006_stuck — stuck-assignment detection (T6, G7 from the substrate
+-- 0007_stuck — stuck-assignment detection (T6, G7 from the substrate
 -- reference review; docs/designs/0009 §4 red line).
 --
 -- assignments.started_deadline  when a dispatched task must have produced

@@ -1,4 +1,4 @@
--- 0008_dispatch_intent: orphan task observations for dispatch restart
+-- 0009_dispatch_intent: orphan task observations for dispatch restart
 -- recovery (PR #11 C3).
 --
 -- A dispatch that landed a task at the gateway but whose binding write was

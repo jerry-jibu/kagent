@@ -32,7 +32,7 @@
 | **presence/cognition split**（agent-substrate/always-on-agent 参考实现：常驻网关持渠道连接，agent=可挂起 actor；webhook 类渠道无需 presence 层） | Sources/Pass/Engine 常驻 + 进程层按需 | 0001 §2.1 三层模型 + §2.1.1 红线（Source 住编排器、worker 永可挂起、渠道两族分类） | substrate 挂起/唤醒（snapshotPolicy） | ✅ 强互证（G10：socket 渠道扩展 = 编排器加 Source 插件，零架构变化） |
 | **poll&ack + lease hand-off + 事件队列**（claude-managed-agents：Valkey stream、reclaim 窗口、lease heartbeat） | —（无对应机制） | A2A push + Pass 对账 + 事务性 Outbox（0001 §6） | — | ✅ 反向互证（CMA Improvements 自认双队列漂移，正在移除）+ **G7 真增量**：受理与执行之间必须有期限与显式释放者（滞留检测已落地，见 G7） |
 | **状态放置三态**（Hermes：turn 间一切在 /data 磁盘 + VOLUMES；CMA：per-session actor 快照；OpenClaw：FULL 内存快照） | — | DSH state.json + DATA + VOLUMES（0003 V2） | substrate DATA 快照 | ✅ 强互证（OpenClaw FULL 快照为**反例**：55–61MiB/actor、restore 3.3–4.7s、模板重指丢全部会话态——其 roadmap 正向我们位置移动） |
-| **busy-signal + 模板不可变 + 调度外置**（hermes turn-signal"deliberately not a heartbeat"、Templates immutable、scheduled work outside sleeping actors） | Ticket follow-up（Passes 节拍） | G1 timers（0001 §6）+ 通道 2 requireApproval（0002 A3）+ digest 台账（0002 A4） | — | ✅ 互证（暴露 **G8 盲点**：worker 后台在途保护——P0 约定未落 prompt，见 G8） |
+| **busy-signal + 模板不可变 + 调度外置**（hermes turn-signal"deliberately not a heartbeat"、Templates immutable、scheduled work outside sleeping actors） | Ticket follow-up（Passes 节拍） | G1 timers（0001 §6）+ 通道 2 requireApproval（0002 A3）+ digest 台账（0002 A4） | — | ✅ 互证（G8 盲点已收口：约定已落 worker prompt，见 G8） |
 
 **MA 平台能力对照**：长 loop 断点续跑/异常重试 ≈ substrate 快照 + DATA 恢复 + completion barrier（0009）；session 隔离弹性 ≈ substrate actor 按需/挂起；File API+对象存储 ≈ agentfs + SeaweedFS（我们还多 checkpoint）；trace 重放 ≈ TaskStore 历史 + OTel（全状态重放是我们的弱项，见 G5）。
 
@@ -44,8 +44,8 @@
 *   **G4（P2）发送频率评测**：最小打扰原则目前是静态规则（只在 attention/result 发）；按 Anthropic 建议，对通知建立评测集，从少发逐步放宽。
 *   **G5（P2）trace/重放强化**：编排器侧把 Trigger→Decision→Assignment→Outbox effect 全链路事件化（现有 Store 已存全部中间态，缺统一 trace 视图/重放），对齐 MA 的调试体验。
 *   **G6（P2）记忆整理（dreaming）**：离线任务回看历史会话、清理过时条目、提炼跨 run 模式——P2 之后再议。
-*   **G7（部分落地）滞留检测**：已落地部分 = `assignments.started_deadline` 字段（0006_stuck 迁移）+ Pass 滞留分支（超期非终态 → needs-attention，不自动重放；`pass.go:162-186`）。**未落地部分**：重派防抖间隔下限——人驱 `RetryTicket` 无时间下限、派发失败每 tick 重试，均无防抖（列入 P1 实码）。0001 §6/§8 对应文档行已并入（仅滞留检测部分）。来源：CMA lease 教训。（T 工单编号对照：T6 = fork 仓库 Issue #7。）
-*   **G8（约定未落 + P2 信号）worker 后台在途保护**：拟议的 P0 约定"Report 声明 ready 前无在途后台任务"**尚未写入 worker prompt**（现 prompt 五条约束无此条，Report 线上契约亦无相关字段）——补 prompt 一行走 PR 代码修复批次，未落前这里如实记为缺口；P2 = hermes busy-signal 类信号机制。
+*   **G7（部分落地）滞留检测**：已落地部分 = `assignments.started_deadline` 字段（0007_stuck 迁移）+ Pass 滞留分支（超期非终态 → needs-attention，不自动重放；`pass.go:162-186`）。**未落地部分**：重派防抖间隔下限——人驱 `RetryTicket` 无时间下限、派发失败每 tick 重试，均无防抖（列入 P1 实码）。0001 §6/§8 对应文档行已并入（仅滞留检测部分）。来源：CMA lease 教训。（T 工单编号对照：T6 = fork 仓库 Issue #7。）
+*   **G8（约定已落 prompt + P2 信号）worker 后台在途保护**：P0 约定"Report 声明 ready 前无在途后台任务"已写入 worker prompt（2026-11-15，代码修复批次 #4；原缺口记录见 git 历史）；P2 = hermes busy-signal 类信号机制。
 *   **G9（P2）WorkerPool 容量方法论**：OpenClaw duty-cycle 实测（0.72%、1000 agent 投影 47:1、"Size a pool on the peak"）+ CMA benchmarks 工具；**适用性警告**：编码 agent duty cycle ≠ 个人助理，数字只借方法不借结论。
 *   **G10（P1 文档）presence/cognition 红线与渠道两族分类**：已并入 0001 §2.1.1。
 *   **G11（观察项）substrate 官方 GC/挂起能力**：就绪即弃自管逻辑（对齐 CMA Improvements 姿态）。

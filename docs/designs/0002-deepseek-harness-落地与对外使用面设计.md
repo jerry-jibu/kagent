@@ -373,7 +373,7 @@ sequenceDiagram
 
 *   **Type / Scope**: k8s manifest（Agent CR ×2）。
 *   **Proposed Changes**: worker = **inline template** + HarnessRef(dsh-byo)（P0 内联，免多一个 AgentTemplate CR），tools 绑定 agentfs 的 RemoteMCPServer（`MCPToolBinding.server`，kind=RemoteMCPServer）；~~"等人后继续"操作用一等字段 `requireApproval: true`（`agenttemplate_types.go:63-67`）+ 通道 1 禁用写进 prompt~~——**实施期变更（A3 更正）**：现桥拒绝非空 `Tools` 圈定，P0 worker 不设 requireApproval，"等人"走 Report `state=waiting` 终态 + 编排器 needs-attention；通道 2/requireApproval 列 P1（前置=桥支持 Tools 圈定）。evaluator = HarnessRef(`kagent-default`——1.0.1 onboarding 内置 kagent harness，env.md 已录）+ inline template + `outputSchema` 结构化 Decision（`agenttemplate_types.go:194`；`compiler.go:332-334` 使其必须用 kagent harness）。`Harness.Spec.Env` P0 置空（bridge 无需额外字面量），待需求出现再加。
-*   **已知偏离（evaluator prompt，2026-11-15 记录）**: 交付的 evaluator systemPrompt 宣称输入含 "Trigger 批次（JSON）、Thread 快照、相关 Ticket 历史"（`agent-evaluator.yaml:15,19-20`），而 P0 wire 只发单 Trigger + strength + policy_version（`eval/engine.go:309-342`；0001 §4.1 已记 wire 缩水）——prompt 与 wire 不一致，按 prompt 修（对齐单 Trigger 输入描述）随代码修复批次；批输入/Thread 快照为 P2 增强项，届时 prompt 与 wire 同步放宽。
+*   **evaluator prompt（2026-11-15 已对齐）**: 原交付 prompt 宣称输入含 "Trigger 批次/Thread 快照/Ticket 历史" 而 wire 只发单 Trigger（偏离记录见 git 历史）——prompt 已改写为单 Trigger 形态并注明 P2 放宽路径（批次 #3 落地）。
 *   **交付补充（不在原目标清单，实施期新增）**: `deploy/kagent/orchestrator.yaml`（Deployment+Service+ConfigMap）、`deploy/kagent/e2e-v1.sh`、`orchestrator/cmd/fakegithub`、`orchestrator/` 全模块——收编记录见 0001 §9.1 与本文 A1 更正。
 
 **本仓库同分支（P1）**——编排器代码亦落本 fork 探索分支

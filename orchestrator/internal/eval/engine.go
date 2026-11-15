@@ -88,8 +88,11 @@ func (e *Engine) EvaluatePending(ctx context.Context, source string, pol policy.
 //     under poll overlap and crash-retry replays);
 //   - an unavailable record (evaluator unreachable/timeout) is retryable:
 //     re-evaluation continues the trail in the same decisions table;
-//   - a payload the decode contract cannot read fails loudly and records
-//     nothing — malformed durable data is never silently omitted.
+//   - a payload the decode contract cannot read is rejected TERMINALLY
+//     (PR #11 review, Required): the decision row carries the decode error
+//     and the trigger leaves the pending queue. Loudly failing without a
+//     record left poison rows re-decoding forever, and a batch of them
+//     head-of-line blocked every newer trigger.
 func (e *Engine) EvaluateTrigger(ctx context.Context, source string, tr store.Trigger, pol policy.Policy) (store.Decision, error) {
 	if latest, found, err := e.store.TriggerDecision(ctx, source, tr.DeterministicID); err != nil {
 		return store.Decision{}, fmt.Errorf("failed to read prior decisions for trigger %s/%s: %w",
@@ -102,8 +105,19 @@ func (e *Engine) EvaluateTrigger(ctx context.Context, source string, tr store.Tr
 
 	pl, err := intake.DecodeCommentPayload(tr.Payload)
 	if err != nil {
-		return store.Decision{}, fmt.Errorf("trigger %s/%s payload violates the decode contract: %w",
-			source, tr.DeterministicID, err)
+		// A poison payload is judged, not retried: recording the terminal
+		// rejection removes it from the pending queue — the decision row
+		// does not need the payload to decode (PR #11 review, Required).
+		rejected, rerr := e.record(ctx, source, tr.DeterministicID, store.DecisionInput{
+			Outcome:       store.DecisionRejected,
+			PolicyVersion: pol.Version,
+			Reason:        fmt.Sprintf("payload violates the decode contract: %v", err),
+		})
+		if rerr != nil {
+			return store.Decision{}, fmt.Errorf("trigger %s/%s payload violates the decode contract and the rejection could not be recorded: decode: %w; record: %w",
+				source, tr.DeterministicID, err, rerr)
+		}
+		return rejected, nil
 	}
 
 	// Gate first: deterministic code owns admission; the evaluator never

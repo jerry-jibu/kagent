@@ -68,7 +68,7 @@ type PassStats struct {
 	// state machine this tick (terminal backfill or input-required pause).
 	Reconciled int
 	// Redlined counts assignments marked unresolved this tick (task missing
-	// at the gateway — no automatic replay, docs/designs/0009 §4).
+	// at the gateway — no automatic replay, docs/designs/0001 §8, 0009 §4 内联).
 	Redlined int
 	// ReconcileFailed counts tasks whose status query failed this tick
 	// (gateway error — retried next beat; the outcome stays unknown).
@@ -137,7 +137,7 @@ func (p *Pass) Tick(ctx context.Context) (PassStats, error) {
 // path the push receiver uses — so a push that DID arrive makes the
 // reconcile a no-op, and a swallowed push is backfilled here. A task the
 // gateway no longer knows trips the red line: unresolved assignment,
-// needs-attention ticket, no replay (docs/designs/0009 §4 — full recovery
+// needs-attention ticket, no replay (docs/designs/0001 §8 (0009 §4 内联) — full recovery
 // semantics land in T8). A gateway error keeps the assignment running: an
 // unknown outcome is not the red line.
 func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
@@ -162,7 +162,7 @@ func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
 				Event:            "assignment.unresolved",
 				Detail: map[string]any{
 					"task_id": taskID,
-					"reason":  "task not found at the gateway; outcome indeterminate — no automatic replay (docs/designs/0009 §4)",
+					"reason":  "task not found at the gateway; outcome indeterminate — no automatic replay (docs/designs/0001 §8, 0009 §4 内联)",
 				},
 			}); aerr != nil {
 				// Per-item failure: count and continue — one poisoned row
@@ -179,7 +179,7 @@ func (p *Pass) reconcile(ctx context.Context, stats *PassStats) error {
 				// G7: the task was accepted but never produced an outcome
 				// within its start window — the poll&ack lesson of a forever
 				// unacknowledged item. Needs-attention with an audit row;
-				// the red line forbids replay (docs/designs/0009 §4). The
+				// the red line forbids replay (docs/designs/0001 §8, 0009 §4 内联). The
 				// assignment keeps running: the task may still be alive, a
 				// person decides.
 				changed, merr := p.store.MarkTicketNeedsAttention(ctx, c.Ticket.ID,

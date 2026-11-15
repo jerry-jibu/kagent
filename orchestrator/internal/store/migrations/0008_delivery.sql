@@ -1,4 +1,4 @@
--- 0007_delivery — result delivery state (T7, docs/designs/0003 Alternative E:
+-- 0008_delivery — result delivery state (T7, docs/designs/0003 Alternative E:
 -- the orchestrator computes the patch from the workspace read-back and ships
 -- branch/PR/comment; 0001 §4.1 ⑥⑦).
 --

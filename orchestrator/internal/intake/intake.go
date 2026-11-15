@@ -16,7 +16,7 @@ import (
 )
 
 // DefaultSightline is how long a thread without a live ticket stays
-// ingestible after its last ingested activity (docs/designs/0001: 无活
+// ingestible after its last ingested activity (docs/designs/0001 §6: 无活
 // Ticket 的 Thread 保留 14 天视线).
 const DefaultSightline = 14 * 24 * time.Hour
 

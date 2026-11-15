@@ -134,7 +134,7 @@ flowchart TB
 | Assignment（Ticket↔Executor 绑定） | **一个 A2A task**（SendMessage 到 worker agent）；pending→running→ended 跟随 task 生命周期 | Store.assignments.task_id |
 | Subscription（Ticket↔Thread 多对多） | **P0 未实现**（无 subscriptions 表；owned-thread 消息记为 ignore + follow-up input，随下次派工送达，见 `eval/engine.go:121-148`；`Store.subscriptions` 与免评估直送列 P1） | Store.subscriptions（P1） |
 | Channel（写侧） | Outbox 的 Channel 适配器：GitHub 评论/review 回复、飞书话题回复 | 代码 |
-| Report（progress/waiting/ready/blocked/failed/dropped） | worker agent 的**结构化报告约定**（prompt 约定 + 代码解析）。P0 现状：worker prompt 只教五态（progress/ready/blocked/failed/waiting），`dropped` 仅为编排器解析端终态；"ready 前无在途后台任务"约定（G8）**未写入 P0 prompt**——补 prompt 一行走 PR 代码修复批次，P2 再议信号机制 | Dispatcher/代码 |
+| Report（progress/waiting/ready/blocked/failed/dropped） | worker agent 的**结构化报告约定**（prompt 约定 + 代码解析）。P0 现状：worker prompt 只教五态（progress/ready/blocked/failed/waiting），`dropped` 仅为编排器解析端终态；"ready 前无在途后台任务"约定（G8）**已写入 P0 prompt**（2026-11-15，约束第 7 条），P2 再议信号机制 | Dispatcher/代码 |
 | Attention（等人的问题） | worker 的 input-required → Attention bridge → 飞书卡片/panel | ATT 组件 |
 
 **沿用两条关键谓词**（superagent 验证过的状态一致性规则）：`waitsForPerson`（最近 Assignment blocked/failed 且此后无人发言 → 自动输入挂起）；`followupOwners`（还欠人回复的 Ticket 持有 Thread 上的 follow-up，Engine 只许 stop）。
@@ -266,7 +266,7 @@ P0 实际交付为 `orchestrator/` Go 模块（94 个 .go 文件：45 非测试 
 
 | 包 | 职责 |
 |---|---|
-| `orchestrator/internal/store` | PostgreSQL 持久层：8 个迁移文件（triggers/threads/tickets/assignments/decisions/audit/outbox…；注：`0002_audit`/`0002_intake` 共用 0002 前缀，排序按文件名字典序——重编号列代码修复批次）、全部状态迁移（单事务、状态+审计原子） |
+| `orchestrator/internal/store` | PostgreSQL 持久层：8 个迁移文件（triggers/threads/tickets/assignments/decisions/audit/outbox…；注：`0002_audit`/`0003_intake` 共用 0002 前缀，排序按文件名字典序——重编号列代码修复批次）、全部状态迁移（单事务、状态+审计原子） |
 | `orchestrator/internal/intake` | 触发去重、Thread 归属、14 天视线 |
 | `orchestrator/internal/gate` | 纯函数门控（名单 + admission 表 → strength） |
 | `orchestrator/internal/eval` | Assessment invoke 与 Decision 落账（独立 5s 循环） |

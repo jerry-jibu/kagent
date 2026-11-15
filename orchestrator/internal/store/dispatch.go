@@ -434,7 +434,7 @@ func (s *Store) BeginDispatchAttempt(ctx context.Context, assignmentID string) (
 }
 
 // OrphanTask is one recorded observation of a gateway task no assignment is
-// bound to (migration 0008): a dispatch whose binding write was lost to a
+// bound to (migration 0009_dispatch_intent): a dispatch whose binding write was lost to a
 // crash, or a pushed task no assignment binds. Key is the lookup handle:
 // the assignment id from the unbound-send path (authoritative), the gateway
 // context id from the push receiver (adoptable where a session id exists).

@@ -27,7 +27,7 @@ import (
 var migrationsFS embed.FS
 
 // ErrInstanceLocked is returned when another orchestrator instance already
-// holds the instance lock (docs/designs/0001 §9: P0 is single-replica).
+// holds the instance lock (docs/designs/0001 §10 开放问题 3: P0 is single-replica).
 var ErrInstanceLocked = errors.New("instance lock held by another orchestrator")
 
 // ErrPolicyNotFound is returned by LatestPolicyVersion when no policy

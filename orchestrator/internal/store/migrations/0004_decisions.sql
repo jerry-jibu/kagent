@@ -1,4 +1,4 @@
--- 0003_decisions — Eval decision records (T3, docs/designs/0001 §3 Eval/
+-- 0004_decisions — Eval decision records (T3, docs/designs/0001 §3 Eval/
 -- Decision rows and §7 门在编排器).
 --
 -- decisions is the evaluation audit trail: one row per evaluation attempt

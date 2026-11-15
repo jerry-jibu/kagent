@@ -132,11 +132,49 @@ trap cleanup EXIT
 
 step "5. 等待全链路（确认评论 → 物化基线 → 派工 → worker ready → PR → 结果评论）"
 deadline=$(( $(date +%s) + TIMEOUT_CHAIN ))
-pr_line=""
 ack_line=""
+pr_line=""
 result_line=""
+
+# 先等开工确认（kill -9 的确定性锚点：ack = 派工已发生，PR 在 worker 完成后才出现）
 while [ "$(date +%s)" -lt "$deadline" ]; do
   ack_line=$(grep -c "posted comment" "$WORK/logs/fake.err" 2>/dev/null || true)
+  [ "${ack_line:-0}" -ge 1 ] && break
+  sleep 3
+done
+grep -q "posted comment" "$WORK/logs/fake.err" && ok "确认评论已投递（fake GitHub 收到 ack）" || fail "确认评论未出现"
+
+# ---- P0 判据：orchestrator kill -9 后重启恢复不重不漏（readiness-R1-4）----
+# 中途 kill -9（派工已落、交付未落），同 schema 重启：链路必须续推完成，
+# 且不产生第二个 ticket / 第二个 PR / 重复效果。
+step "5b. orchestrator kill -9 + 重启（恢复判据）"
+kill -9 "$ORC_PID" 2>/dev/null || true
+wait "$ORC_PID" 2>/dev/null || true
+ok "orchestrator 已 kill -9（exit 137 预期）"
+"$ORC_BIN" \
+  --database-url "$PG_URL" \
+  --schema "$SCHEMA" \
+  --policy-dir "$WORK/policy" \
+  --listen-addr ":8080" \
+  --github-source "$REPO" \
+  --github-api-url "$FAKE_URL" \
+  --github-poll-interval 5s \
+  --github-token e2e-dummy \
+  --a2a-gateway-url "$GATEWAY" \
+  --evaluator-agent superagent-evaluator \
+  --worker-agent superagent-worker \
+  --push-base-url "http://$HOST_DIAL:8080" \
+  --pass-interval 2s \
+  --workspace-mcp-endpoint "$AGENTFS" \
+  --workspace-base-branch main \
+  --github-git-url "file://$WORK/gitbase" \
+  >> "$WORK/logs/orchestrator.out" 2>> "$WORK/logs/orchestrator.err" &
+ORC_PID=$!
+sleep 2
+curl -sf "$ORC_URL/healthz" >/dev/null && ok "重启后 healthz green" || { echo "orchestrator not healthy after restart"; tail "$WORK/logs/orchestrator.err"; exit 2; }
+
+RESTART_DEADLINE=$(($(date +%s) + 120))
+while [ "$(date +%s)" -lt "$RESTART_DEADLINE" ]; do
   pr_line=$(grep "pull request" "$WORK/logs/fake.err" 2>/dev/null | tail -1 || true)
   result_line=$( { grep "superagent:effect:result:" "$WORK/logs/fake.err" 2>/dev/null || true; } | tail -1)
   if [ -n "$pr_line" ] && [ -n "$result_line" ]; then
@@ -144,10 +182,13 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   fi
   sleep 5
 done
+[ -n "$pr_line" ] && ok "重启后链路续推：PR 建立：$pr_line" || fail "重启后 PR 未建立（恢复判据失败）"
+[ -n "$result_line" ] && ok "重启后结果评论已投递（含 PR 链接与 marker）" || fail "重启后结果评论未出现"
 
-grep -q "posted comment" "$WORK/logs/fake.err" && ok "确认评论已投递（fake GitHub 收到 ack）" || fail "确认评论未出现"
-[ -n "$pr_line" ] && ok "PR 建立：$pr_line" || fail "PR 未建立"
-[ -n "$result_line" ] && ok "结果评论已投递（含 PR 链接与 marker）" || fail "结果评论未出现"
+TICKETS=$(docker exec t1-pg psql -U postgres -d postgres -Atc "SELECT count(*) FROM \"$SCHEMA\".tickets" 2>/dev/null || echo "?")
+[ "$TICKETS" = "1" ] && ok "恢复不重：全库仅 1 个 ticket（got $TICKETS）" || fail "恢复出现重复 ticket：$TICKETS"
+PRS=$(curl -s "$FAKE_URL/repos/$REPO/pulls?state=all" | grep -o '"number"' | wc -l)
+[ "$PRS" = "1" ] && ok "恢复不漏不重：fake GitHub 仅 1 个 PR（got $PRS）" || fail "PR 数量 = $PRS，want 1"
 
 step "6. 编排器状态断言（store 是权威视图）"
 psqlq() { docker exec t1-pg psql -U postgres -d postgres -Atc "$1" 2>/dev/null; }

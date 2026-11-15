@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// Delivery states of a ticket's result (migration 0007_delivery). Only a
+// Delivery states of a ticket's result (migration 0008_delivery). Only a
 // ready report makes a result deliverable; ” means there is nothing to
 // deliver and the delivery scan never sees the ticket.
 const (

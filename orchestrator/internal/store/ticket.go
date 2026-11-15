@@ -14,7 +14,7 @@ import (
 )
 
 // Ticket and assignment statuses. The Engine owns the full status
-// vocabularies; see migrations/0004_tickets.sql and 0001_init.sql for the
+// vocabularies; see migrations/0005_tickets.sql and 0001_init.sql for the
 // CHECK-enforced lists.
 const (
 	TicketStatusPending        = "pending"

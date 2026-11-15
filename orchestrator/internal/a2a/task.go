@@ -19,7 +19,7 @@ const (
 // ErrTaskNotFound reports that the gateway has no task under the queried id.
 // The Pass beat treats it as the red-line trigger: an assignment whose task
 // cannot be found marks unresolved and never auto-replays
-// (docs/designs/0001 §8, docs/designs/0009 §4).
+// (docs/designs/0001 §8, docs/designs/0001 §8, 0009 §4 内联).
 var ErrTaskNotFound = errors.New("task not found")
 
 // IsTerminalTaskState reports whether the wire state is immutable: a task in

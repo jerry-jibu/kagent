@@ -1,4 +1,4 @@
--- 0005_dispatch — dispatch-chain state (T6, docs/designs/0001 D2 + §4.3).
+-- 0006_dispatch — dispatch-chain state (T6, docs/designs/0001 D2 + §4.3).
 --
 -- assignments.report      last report state the assignment settled under
 --                         (progress/waiting/ready/blocked/failed/dropped);

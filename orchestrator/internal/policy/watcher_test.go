@@ -67,13 +67,21 @@ func TestWatcher(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reload failed: %v", err)
 		}
-		waitFor(t, "watcher to observe the new policy version", func() bool {
-			return w.Current().Version == want.Version
+		// The watcher is a two-stage tick: version N updates Current() on
+		// one tick and delivers the callback on the NEXT tick. Waiting on
+		// Current() alone raced the delivery stage — poll the assertion
+		// condition itself (the delivered slice) like the malformed-file
+		// subtest below does (PR #11 review, Required: flaky under -race
+		// and -count>1).
+		waitFor(t, "watcher to observe and deliver the new policy version", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(updates) > 0 && updates[len(updates)-1].Version == want.Version
 		})
 		mu.Lock()
 		defer mu.Unlock()
-		if len(updates) == 0 || updates[len(updates)-1].Version != want.Version {
-			t.Fatalf("update callback must deliver the new policy, got %+v", updates)
+		if w.Current().Version != want.Version {
+			t.Fatalf("current policy version %s != want %s", w.Current().Version, want.Version)
 		}
 	})
 

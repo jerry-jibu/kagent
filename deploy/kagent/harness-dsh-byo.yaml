@@ -1,7 +1,10 @@
 # Harness: DSH BYO（0002 §1-A2/D7）——零 CRD 扩展，digest 钉死镜像 + 固定 command
-# 镜像源: kagent-dev/byo-ext PR #2（未合入 main），分支 pr-2 @ 19771c8
-#   构建: git fetch origin pull/2/head:pr-2 && docker build -f harnesses/deepseek/Dockerfile -t <registry>/kagent-dsh-byo .
-#   记录 源SHA → 镜像digest 对应关系（风险表：显式重同步，不自动漂移）
+# 镜像源: kagent-dev/byo-ext PR #2（未合入 main），源基线 pr-2 @ 8632d5e
+#   （19771c8 为旧 env 契约基线；现网已是 bootstrap 契约——0002 A4）
+#   构建: 仓库外配方 kagent-dev/.superagent-notes/build/Dockerfile.dsh
+#   （--target production，CN 源+vendor；完整步骤见 README 构建节）——
+#   钉死 digest 不对应分支直接构建，按台账"源 SHA + 构建配方"双记录
+#   （风险表：显式重同步，不自动漂移）
 # 占位符用 envsubst 代入后 apply（见 README.md）
 apiVersion: api.kagent.dev/v1alpha3
 kind: Harness

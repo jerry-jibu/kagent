@@ -1,4 +1,4 @@
--- 0002_intake — Source/intake state (T2, docs/designs/0001 §2 and §6).
+-- 0003_intake — Source/intake state (T2, docs/designs/0001 §2 and §6).
 --
 -- sources   per-Source read position (cursor); the Source instance row is
 --           created by the first ingested batch and the cursor only moves

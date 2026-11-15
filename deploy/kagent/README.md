@@ -93,6 +93,15 @@ docker push localhost:5000/superagent-orchestrator:t9   # 运行时含系统 git
 
 ## 应用
 
+DeepSeek Secret（值不入库；两份 ModelConfig 共用，键名见清单注释）：
+
+```bash
+kubectl -n kagent create secret generic kagent-deepseek \
+  --from-literal=ANTHROPIC_API_KEY='<deepseek key>' \
+  --from-literal=OPENAI_API_KEY='<deepseek key>' \
+  --dry-run=client -o yaml | kubectl apply -f -   # 幂等重建
+```
+
 ```bash
 export DSH_BYO_IMAGE='localhost:5000/kagent-dsh-byo@sha256:<64hex>'   # 台账 digest
 export SNAPSHOT_LOCATION='s3://ate-snapshots/kagent/'                 # 与集群既有 Harness 一致
@@ -167,6 +176,24 @@ kubectl -n kagent get agent superagent-worker -o jsonpath='{.status.conditions[?
 
 - 流式应答走 DeepSeek 模型（经 egress）；`kubectl -n kagent logs deploy/kagent-controller` 无编译错误。
 - bridge 沙箱零凭证：atelet Run 日志的 env 只含模型凭证占位 + 平台注入（无 GitHub token）。
+
+**流式走查（CUJ2 第二段，2026-11-15 补——此前仅非流式 curl）**：UI `/agents/:ns/:name` 开
+`superagent-worker` 对话，确认回复逐块渲染（SendStreamingMessage/SSE）而非整段一次到达；
+`kubectl -n kagent logs deploy/kagent-controller | grep -i stream` 见流式转发记录。
+
+**HITL 审批走查（CUJ2 第三段，T9 验证项）**：让 worker 触发一次 ACP 权限请求
+（如让它执行需要审批的操作），确认 UI 渲染审批卡片（AskUserPrompt）且批准后任务续跑；
+BYO agent card 不声明 HITL 扩展时的卡片渲染行为一并记录（0002 A4 T9 项）。
+
+## 验证（CUJ3 走查记录，2026-11-15 补）
+
+- **编排器建的 session 归属**：`kubectl -n kagent logs deploy/kagent-controller | grep -i session`，
+  会话创建者显示为编排器 SA；UI 会话列表默认视角下不串入个人会话。
+- **all_creators 视图 403 回退**：非特权用户访问编排器建的会话 → 403（`useAgentInstances.ts:11-25`
+  的回退路径），UI 显示空列表而非报错。
+- **share 只读旁观**：编排器建的工单 session 在 UI 手动创建 share 链接
+  （P0 边界，见上节），干系人以只读视角看到执行历史。
+- **chat 页即执行细节视图**：进度/流式输出/checkpoint 分隔符照常渲染（UI 内核零改动）。
 
 ## V1 全链路 e2e（fake GitHub 面，可重复）
 
