@@ -12,7 +12,7 @@
 
 **材料**：
 
-1. Anthropic《Building always-on agents》（claude.com/resources/articles，两个中文译本）——五组件架构：事件收件箱 / 计时器 / 记忆 / 权限 / 发件箱。
+1. Anthropic《Building always-on agents》（claude.com/resources/articles，中文译本见文末链接）——五组件架构：事件收件箱 / 计时器 / 记忆 / 权限 / 发件箱。
 2. 火山引擎《基于 Managed Agents 搭建主动式个人 Agent（Open Muse）》——托管 AaaS：长 loop 断点续跑、session 隔离弹性、File API+对象存储文件流转、trace 重放；上层补设备连接器、主动触达、账号托管、审批卡片。
 
 **核心命题（两份材料一致）**："始终在线"是使用体验，不是常驻进程——大部分时间休眠、事件/计时器唤醒、run 短、循环长。这与三层长跑对照（编排层常驻、会话/进程层按需——外部工作区笔记 0009 §7.2 的结论，已内联于 0001 §2.1；0009 原文不在本仓库）完全同构。
@@ -49,7 +49,7 @@
 *   **G9（P2）WorkerPool 容量方法论**：OpenClaw duty-cycle 实测（0.72%、1000 agent 投影 47:1、"Size a pool on the peak"）+ CMA benchmarks 工具；**适用性警告**：编码 agent duty cycle ≠ 个人助理，数字只借方法不借结论。
 *   **G10（P1 文档）presence/cognition 红线与渠道两族分类**：已并入 0001 §2.1.1。
 *   **G11（观察项）substrate 官方 GC/挂起能力**：就绪即弃自管逻辑（对齐 CMA Improvements 姿态）。
-*   **G12（P1）运行成本上限**：Anthropic daily-brief 为每次运行设花费预算（初值=正常运行的 3–5 倍），触及即**暂停**（非报错）并需监测暂停态避免误判"无事可报"。我们按 assignment 粒度对齐：worker Report/网关用量上报累加进 assignments（字段已可扩展），超限转 needs-attention 人工核，不自动终止。evidence：Mandate 已持 policy_version，预算归编排器判定不进模型。
+*   **G12（P1）运行成本上限**：Anthropic daily-brief 为每次运行设花费预算（初值=正常运行的 3–5 倍），触及即**暂停**（非报错）并需监测暂停态避免误判"无事可报"。我们按 assignment 粒度对齐：worker Report/网关用量上报累加进 assignments（字段已可扩展），超限转 needs-attention 人工核，不自动终止。evidence：Mandate 已持 policy_version，预算归编排器判定不进模型。经济前提（always-on 译本数据）：Opus 5.5 长任务单任务成本较 5 降 78%、常规任务降 40%——智力变便宜使全天候运作在商业上成立，也让预算护栏从"省成本"升级为"可预测的成本治理"。
 
 
 ## 补充对照（2026-11-16）：Anthropic daily-brief 参考实现（第二篇 blog）
@@ -86,7 +86,7 @@ Anthropic《Building effective agent automations》给出完整参考实现（�
 
 ## Additional Resources
 
-*   https://claude.com/resources/articles/building-always-on-agents （及两个中文译本，即用户提供的前后两篇链接）
+*   https://claude.com/resources/articles/building-always-on-agents （中文译本 ×3，均用户提供；always-on 五组件即本文互证表第 1–5 行的输入）
 *   火山引擎 Managed Agents / Open Muse：https://mp.weixin.qq.com/s/7sA7rSfsGMWz4vMPQsQFag
 *   **agent-substrate/always-on-agent**（presence/cognition split 参考实现：hermes 舰队 + openclaw，含实测数字）：https://github.com/agent-substrate/always-on-agent
 *   **agent-substrate/claude-managed-agents**（Claude MA 自托管沙箱 × substrate actor：poll&ack/queue/reconcile/lease heartbeat 生产化实现 + benchmarks）：https://github.com/agent-substrate/claude-managed-agents
