@@ -43,6 +43,10 @@ fi
 echo "pushed+verified: $IMAGE@$NEWDIG"
 
 # 4. 钉死 agentfs.yaml 并生效（rollout restart 防止 containerd 缓存旧镜像）
-sed -i "s|kagent-bridge@sha256:[a-f0-9]*|kagent-bridge@$NEWDIG|" "$SCRIPT_DIR/../agentfs.yaml"
+# BSD/macOS 的 sed -i 必须带备份后缀参数，GNU 的 -i 后缀可选——直接落临时
+# 文件再 mv，两种 sed 通用（PR #11 review）。
+sed "s|kagent-bridge@sha256:[a-f0-9]*|kagent-bridge@$NEWDIG|" "$SCRIPT_DIR/../agentfs.yaml" \
+  > "$SCRIPT_DIR/../agentfs.yaml.tmp"
+mv "$SCRIPT_DIR/../agentfs.yaml.tmp" "$SCRIPT_DIR/../agentfs.yaml"
 grep -n 'image:' "$SCRIPT_DIR/../agentfs.yaml"
 echo "下一步: kubectl apply -f deploy/kagent/agentfs.yaml && kubectl -n kagent rollout restart deploy/agentfs"

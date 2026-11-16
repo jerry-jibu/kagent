@@ -41,7 +41,14 @@ fail() { printf '  FAIL %s\n' "$*"; FAILURES=$((FAILURES+1)); }
 step "0. 准备工作区与本地 bare git 仓（编排器物化/交付的 clone/push 对象）"
 rm -rf "$WORK"; mkdir -p "$WORK/policy" "$WORK/gitbase/$REPO.git" "$WORK/logs"
 WORK=$WORK   # normalize
-export PATH="$HOME/sdk/go1.27.3/bin:$PATH"
+# Go 工具链：优先 PATH 上的 go，GOTOOLCHAIN=auto 按 go.mod 声明自动对齐/拉取
+# 版本（scripts/build.sh 同一约定）——不再硬性依赖 $HOME/sdk/go1.27.3（PR #11
+# review：该硬编码只在构建机成立）；PATH 无 go 时保留本机 sdk 路径作兜底。
+export GOTOOLCHAIN=auto
+if ! command -v go >/dev/null 2>&1 && [ -d "$HOME/sdk/go1.27.3/bin" ]; then
+  export PATH="$HOME/sdk/go1.27.3/bin:$PATH"
+fi
+command -v go >/dev/null || { echo "go required on PATH（GOTOOLCHAIN=auto 按 go.mod 自动拉取匹配版本）"; exit 2; }
 command -v git >/dev/null || { echo "git required on PATH"; exit 2; }
 git init --bare -q -b main "$WORK/gitbase/$REPO.git"
 git -C "$WORK/gitbase/$REPO.git" config uploadpack.allowAnySHA1InWant true
