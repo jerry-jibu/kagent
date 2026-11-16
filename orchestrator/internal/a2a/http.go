@@ -101,7 +101,8 @@ func (t *HTTPTransport) InvokeAgent(ctx context.Context, agent, message string) 
 func (t *HTTPTransport) Dispatch(ctx context.Context, req DispatchRequest) (DispatchResult, error) {
 	route, err := agentRoute(req.Agent)
 	if err != nil {
-		return DispatchResult{}, err
+		// Unsendable request: observably failed before any bytes flew.
+		return DispatchResult{}, &StatusDispatchError{Detail: err.Error()}
 	}
 
 	params := sendMessageParams{
@@ -124,7 +125,12 @@ func (t *HTTPTransport) Dispatch(ctx context.Context, req DispatchRequest) (Disp
 
 	task, err := taskFromResult(result)
 	if err != nil {
-		return DispatchResult{}, fmt.Errorf("agent %s dispatch returned no task identity: %w", req.Agent, err)
+		// The gateway answered the dispatch but the answer carries no task
+		// identity: the send's fate is observable (and unusable) — never
+		// ambiguous.
+		return DispatchResult{}, &StatusDispatchError{
+			Detail: fmt.Sprintf("dispatch of agent %s returned no task identity: %v", req.Agent, err),
+		}
 	}
 	return DispatchResult{
 		TaskID:    task.ID,
@@ -184,26 +190,46 @@ func (t *HTTPTransport) rpc(ctx context.Context, route, method string, params an
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s of agent %s failed: %w", method, route, err)
+		// No answer arrived: the gateway may still have accepted the request
+		// and landed it. Typed at the seam (dispatch_failure.go) so the
+		// dispatcher can quarantine an ambiguous send instead of forking a
+		// second task with a fresh message id.
+		return nil, &AmbiguousDispatchError{
+			Err: fmt.Errorf("%s of agent %s failed: %w", method, route, err),
+		}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s of agent %s failed: HTTP %d", method, route, resp.StatusCode)
+		return nil, &StatusDispatchError{
+			StatusCode: resp.StatusCode,
+			Detail:     fmt.Sprintf("%s of agent %s was refused", method, route),
+		}
 	}
 
 	var wire jsonrpcResponse
 	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
-		return nil, fmt.Errorf("failed to decode the response of agent %s: %w", route, err)
+		// The gateway answered but the body is unusable: the failure of THIS
+		// request is observable even though the answer carries nothing.
+		return nil, &StatusDispatchError{
+			StatusCode: resp.StatusCode,
+			Detail:     fmt.Sprintf("%s of agent %s answered an undecodable body: %v", method, route, err),
+		}
 	}
 	if wire.Error != nil {
 		if wire.Error.Code == codeTaskNotFound {
 			return nil, ErrTaskNotFound
 		}
-		return nil, fmt.Errorf("agent %s answered a JSON-RPC error %d: %s", route, wire.Error.Code, wire.Error.Message)
+		return nil, &StatusDispatchError{
+			StatusCode: resp.StatusCode,
+			Detail:     fmt.Sprintf("%s of agent %s answered a JSON-RPC error %d: %s", method, route, wire.Error.Code, wire.Error.Message),
+		}
 	}
 	if len(wire.Result) == 0 {
-		return nil, fmt.Errorf("agent %s answered without a result", route)
+		return nil, &StatusDispatchError{
+			StatusCode: resp.StatusCode,
+			Detail:     fmt.Sprintf("%s of agent %s answered without a result", method, route),
+		}
 	}
 	return wire.Result, nil
 }

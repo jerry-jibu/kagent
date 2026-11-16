@@ -145,9 +145,14 @@ func New(st *store.Store, tr a2a.Transport, opts Options) *Dispatcher {
 type DispatchStats struct {
 	// Dispatched counts assignments that landed a task this run.
 	Dispatched int
-	// Failed counts dispatch attempts that failed and were recorded for the
-	// next tick (docs/designs/0001 §4.3: 到期重派入口).
+	// Failed counts dispatch attempts that failed observably and were
+	// recorded for the next tick (docs/designs/0001 §4.3: 到期重派入口).
 	Failed int
+	// Ambiguous counts sends that failed without an observable answer
+	// (timeout, connection reset): the gateway may still land the task, so
+	// no failure is recorded and the assignment stays attempted-but-unbound
+	// for the adopt/quarantine recovery path (PR #11 review, Required).
+	Ambiguous int
 	// Quarantined counts attempted-but-unbound dispatches held back this
 	// run: an earlier attempt may hold a live task at the gateway, so the
 	// resend waits out the quarantine window (write-ahead intent, PR #11
@@ -159,11 +164,18 @@ type DispatchStats struct {
 // quarantine; DispatchPending counts it, the beat treats it as deferred.
 var errRedispatchQuarantined = errors.New("redispatch quarantined: a prior attempt may hold a live task")
 
+// errAmbiguousDispatch marks a dispatch whose send failed without an
+// observable answer; DispatchPending counts it and the beat treats it as
+// deferred recovery work, not a recorded failure.
+var errAmbiguousDispatch = errors.New("send outcome at the gateway is unknown")
+
 // DispatchPending dispatches every pending assignment of a live ticket. One
-// failure does not block the others: it is recorded on the assignment
-// (dispatch ledger + audit) and the next Pass tick retries it with the
-// recovery annotation — a dispatch that never landed a task is safe to
-// replay, unlike a task with an uncertain outcome (docs/designs/0001 §8).
+// failure does not block the others. An observable failure is recorded on
+// the assignment (dispatch ledger + audit) and the next Pass tick retries it
+// with the recovery annotation — a dispatch that demonstrably never landed a
+// task is safe to replay. An ambiguous failure records nothing (docs/
+// designs/0001 §8: a task with an uncertain outcome must never be blindly
+// replayed) and stays attempted-but-unbound for the adopt/quarantine path.
 func (d *Dispatcher) DispatchPending(ctx context.Context) (DispatchStats, error) {
 	candidates, err := d.store.PendingDispatches(ctx, d.opts.RequireWorkspace)
 	if err != nil {
@@ -173,11 +185,14 @@ func (d *Dispatcher) DispatchPending(ctx context.Context) (DispatchStats, error)
 	var stats DispatchStats
 	for _, c := range candidates {
 		if err := d.dispatchOne(ctx, c); err != nil {
-			if errors.Is(err, errRedispatchQuarantined) {
+			switch {
+			case errors.Is(err, errRedispatchQuarantined):
 				stats.Quarantined++
-				continue
+			case errors.Is(err, errAmbiguousDispatch):
+				stats.Ambiguous++
+			default:
+				stats.Failed++
 			}
-			stats.Failed++
 			continue
 		}
 		stats.Dispatched++
@@ -197,16 +212,25 @@ func (d *Dispatcher) DispatchPending(ctx context.Context) (DispatchStats, error)
 //     task from the earlier attempt may still deliver its terminal push;
 //  3. only then send, with a deterministic per-attempt message id.
 //
+// The same recovery path governs an AMBIGUOUS send failure (PR #11 review,
+// Required): a send that died without an observable answer — a client
+// timeout after the gateway may have accepted SendMessage — records no
+// failure, so the assignment stays attempted-but-unbound and the next tick
+// adopts or quarantines instead of forking a second task with a fresh
+// message id. Only a StatusDispatchError-class failure (the gateway answered
+// and refused) proves nothing landed and takes the recordFailure path.
+//
 // A send that lands a task but fails its binding write is recorded as an
 // orphan observation plus a dispatch.unbound audit row — an alert-worthy
 // condition, never a silent retry.
 func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate) error {
-	// The resend quarantine guards only a MID-FLIGHT death: the write-ahead
-	// intent counted an attempt and no failure was ever recorded, so a task
-	// may be live at the gateway. An attempt with a recorded failure failed
-	// observably (the transport errored before landing) — the documented
-	// "never landed a task is safe to replay" replay applies and the next
-	// tick retries immediately, correlated by the deterministic message id.
+	// The resend quarantine guards only an attempted-but-unbound state: the
+	// write-ahead intent counted an attempt and no failure was ever recorded
+	// (a mid-flight death, or an ambiguous send failure), so a task may be
+	// live at the gateway. An attempt with a recorded failure failed
+	// observably (the gateway answered and refused) — the documented "never
+	// landed a task is safe to replay" replay applies and the next tick
+	// retries immediately, correlated by the deterministic message id.
 	if c.Assignment.DispatchAttempts > 0 && c.Assignment.LastError == "" {
 		adopted, err := d.adoptOrphanedTask(ctx, c)
 		if err != nil {
@@ -242,6 +266,13 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate)
 
 	result, err := d.transport.Dispatch(ctx, *request)
 	if err != nil {
+		if a2a.IsAmbiguousDispatchFailure(err) {
+			// The gateway may still land this send: never record a failure
+			// (a last_error would license an immediate worker-forking
+			// resend) — the write-ahead intent above already holds the
+			// assignment in the adopt/quarantine state.
+			return d.recordAmbiguousFailure(ctx, c, err)
+		}
 		return d.recordFailure(ctx, c, err)
 	}
 
@@ -292,7 +323,8 @@ func (d *Dispatcher) dispatchOne(ctx context.Context, c store.DispatchCandidate)
 // RecordUnclaimedTask persists a task observation that belongs to no
 // assignment (the push receiver's ErrUnknownTask path): the restart recovery
 // adopts it instead of re-sending. Keyed by the ticket session's context id,
-// so only a pending assignment continuing that session can consume it.
+// so only a pending assignment continuing that session can consume it —
+// adoptOrphanedTask probes this session key first.
 func (d *Dispatcher) RecordUnclaimedTask(ctx context.Context, task a2a.Task) error {
 	if task.ContextID == "" || task.ID == "" {
 		return fmt.Errorf("unclaimed task observation carries no identity (task %q context %q)", task.ID, task.ContextID)
@@ -305,13 +337,40 @@ func (d *Dispatcher) RecordUnclaimedTask(ctx context.Context, task a2a.Task) err
 	})
 }
 
-// adoptOrphanedTask binds and applies the context's orphan task observation,
-// if one exists and the gateway still knows the task (verification is not
-// optional: the push receiver is unauthenticated in P0, and an unverified
-// observation would be a binding-spoofing primitive). The observation is
-// consumed exactly once — TakeOrphanTask deletes it transactionally.
+// adoptOrphanedTask binds and applies the candidate's orphan task
+// observation, if one exists and the gateway still knows the task
+// (verification is not optional: the push receiver is unauthenticated in P0,
+// and an unverified observation would be a binding-spoofing primitive).
+//
+// The observation is probed under BOTH keys, session id first: the push
+// receiver records an unclaimed task under its contextId — the ticket's
+// session id (RecordUnclaimedTask), which is exactly the key a pending
+// continuation assignment can be recovered from; the unbound-send path
+// records under the assignment id (dispatchOne). TakeOrphanTask consumes
+// exactly once, so probing two keys still adopts at most one observation —
+// and the assignment-id probe stays for observations recorded before a
+// session existed (PR #11 review, Required: the keys must collide somewhere,
+// or a kill -9 between send and bind stays unrecoverable).
 func (d *Dispatcher) adoptOrphanedTask(ctx context.Context, c store.DispatchCandidate) (bool, error) {
-	obs, found, err := d.store.TakeOrphanTask(ctx, c.Assignment.ID)
+	keys := make([]string, 0, 2)
+	if c.Ticket.SessionID != "" {
+		keys = append(keys, c.Ticket.SessionID) // the push-recorded observation
+	}
+	keys = append(keys, c.Assignment.ID) // the unbound-send observation
+	for _, key := range keys {
+		adopted, err := d.adoptObservation(ctx, c, key)
+		if adopted || err != nil {
+			return adopted, err
+		}
+	}
+	return false, nil
+}
+
+// adoptObservation probes one observation key and, when an observation is
+// there, verifies and binds its task. found=false carries no error — the
+// caller probes the next key.
+func (d *Dispatcher) adoptObservation(ctx context.Context, c store.DispatchCandidate, key string) (bool, error) {
+	obs, found, err := d.store.TakeOrphanTask(ctx, key)
 	if err != nil || !found {
 		return false, err
 	}
@@ -326,9 +385,10 @@ func (d *Dispatcher) adoptOrphanedTask(ctx context.Context, c store.DispatchCand
 			return false, nil
 		}
 		// Transport failure: put the observation back for the next tick
-		// rather than falling into a resend.
+		// rather than falling into a resend — under the key it was taken
+		// from, so the recovery keeps looking in the same place.
 		if putErr := d.store.RecordOrphanTask(ctx, store.OrphanTask{
-			Key:        c.Assignment.ID,
+			Key:        key,
 			TaskID:     obs.TaskID,
 			State:      obs.State,
 			StatusText: obs.StatusText,
@@ -352,9 +412,10 @@ func (d *Dispatcher) adoptOrphanedTask(ctx context.Context, c store.DispatchCand
 			}
 			return true, nil
 		}
-		// The binding failed with the observation consumed: put it back.
+		// The binding failed with the observation consumed: put it back —
+		// under the key it was taken from.
 		if putErr := d.store.RecordOrphanTask(ctx, store.OrphanTask{
-			Key:        c.Assignment.ID,
+			Key:        key,
 			TaskID:     snapshot.ID,
 			State:      snapshot.State,
 			StatusText: snapshot.StatusText,
@@ -387,6 +448,28 @@ func (d *Dispatcher) recordFailure(ctx context.Context, c store.DispatchCandidat
 		return fmt.Errorf("failed to record the dispatch failure of %s: %w", c.Assignment.ID, err)
 	}
 	return fmt.Errorf("dispatch of assignment %s failed: %w", c.Assignment.ID, cause)
+}
+
+// recordAmbiguousFailure handles a send that died without an observable
+// answer (PR #11 review, Required): the gateway may still land the task, so
+// it must NOT read as an observable failure — a recorded last_error would
+// license an immediate resend with a fresh message id while the earlier send
+// may hold a live task (the worker-forking bug). The write-ahead intent
+// (BeginDispatchAttempt counted the attempt and cleared the ledger) already
+// holds the assignment attempted-but-unbound, so the next tick routes
+// through the same adopt/quarantine recovery path as a mid-flight death:
+// orphan adoption binds the landed task via its push, and the quarantine
+// expiry governs the resend. Only the audit trail notes the ambiguity — the
+// failure ledger stays clean.
+func (d *Dispatcher) recordAmbiguousFailure(ctx context.Context, c store.DispatchCandidate, cause error) error {
+	if err := d.store.RecordAudit(ctx, c.Ticket.ID, "dispatch.ambiguous", map[string]any{
+		"assignment_id": c.Assignment.ID,
+		"error":         cause.Error(),
+	}); err != nil {
+		return fmt.Errorf("dispatch of assignment %s failed ambiguously and its audit failed: %w", c.Assignment.ID, err)
+	}
+	return fmt.Errorf("dispatch of assignment %s failed without an observable answer: %w: %w",
+		c.Assignment.ID, errAmbiguousDispatch, cause)
 }
 
 // buildRequest builds the A2A DispatchRequest for one candidate: the

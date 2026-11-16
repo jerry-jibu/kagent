@@ -3,7 +3,6 @@ package dispatch_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -191,16 +190,21 @@ func TestDispatcherDispatchPending(t *testing.T) {
 		}
 	})
 
-	t.Run("Given a dispatch that failed once, when the next cycle retries it, assert that the retry carries the recovery annotation and lands (AC: 到期重派带恢复注记)", func(t *testing.T) {
+	t.Run("Given a dispatch that failed observably once, when the next cycle retries it, assert that the retry carries the recovery annotation and lands (AC: 到期重派带恢复注记)", func(t *testing.T) {
 		s, fake, d := dispatcherFixture(t)
 		storeTriggerPayload(t, s)
-		fake.FailDispatch("kagent/worker", errors.New("gateway timed out"))
+		// An observable failure: the gateway answered and refused the send —
+		// nothing landed, so an immediate resend cannot fork a second worker.
+		fake.FailDispatch("kagent/worker", &a2a.StatusDispatchError{
+			StatusCode: 503,
+			Detail:     "SendMessage of agent kagent/worker was refused",
+		})
 
 		stats, err := d.DispatchPending(ctx)
 		if err != nil {
 			t.Fatalf("DispatchPending (failing) returned an error: %v", err)
 		}
-		if stats.Failed != 1 || stats.Dispatched != 0 {
+		if stats.Failed != 1 || stats.Dispatched != 0 || stats.Ambiguous != 0 {
 			t.Fatalf("stats = %+v, want one recorded failure", stats)
 		}
 
@@ -224,7 +228,7 @@ func TestDispatcherDispatchPending(t *testing.T) {
 		if err := json.Unmarshal([]byte(fake.DispatchCalls()[1].Message), &doc); err != nil {
 			t.Fatalf("retry message is not a dispatch document: %v", err)
 		}
-		if doc.Recovery.Attempt != 2 || doc.Recovery.PreviousError != "gateway timed out" {
+		if doc.Recovery.Attempt != 2 || doc.Recovery.PreviousError != "SendMessage of agent kagent/worker was refused: HTTP 503" {
 			t.Fatalf("recovery annotation = %+v, want attempt 2 with the recorded error (恢复注记)", doc.Recovery)
 		}
 	})

@@ -2,6 +2,7 @@ package dispatch_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -130,6 +131,169 @@ func TestDispatchIntent(t *testing.T) {
 		want := dispatch.MessageIDFor(assign.ID, 2, "")
 		if calls[0].MessageID != want {
 			t.Fatalf("resend message id = %q, want the deterministic %q", calls[0].MessageID, want)
+		}
+	})
+
+	t.Run("Given a send that timed out after the gateway may have accepted it, when the ticks follow, assert that no failure is recorded, the resend waits out the quarantine, and the expiry resends as attempt 2 (PR #11 review, Required: 模糊失败不得 fork worker)", func(t *testing.T) {
+		s, fake, tk, assign, d := intentFixtureWith(t, func(*store.Store) dispatch.Options {
+			return dispatch.Options{
+				WorkerAgent:  "kagent/worker",
+				PushBaseURL:  "http://orchestrator:8080",
+				MaxFollowups: 3,
+				// The failure is moments old: the window holds the resend.
+				RedispatchQuarantine: time.Minute,
+			}
+		})
+
+		// Ambiguous failure class: no answer arrived, so the gateway may
+		// still be running (or may have landed) this send.
+		fake.FailDispatch("kagent/worker", &a2a.AmbiguousDispatchError{
+			Err: errors.New("context deadline exceeded"),
+		})
+		stats, err := d.DispatchPending(ctx)
+		if err != nil {
+			t.Fatalf("DispatchPending (ambiguous) failed: %v", err)
+		}
+		if stats.Ambiguous != 1 || stats.Failed != 0 || stats.Dispatched != 0 {
+			t.Fatalf("stats = %+v, want one ambiguous attempt", stats)
+		}
+
+		// No failure on the ledger: a recorded last_error would license the
+		// worker-forking immediate resend on the next tick.
+		got, err := s.Assignments(ctx, tk.ID)
+		if err != nil || len(got) != 1 {
+			t.Fatalf("Assignments = %+v, %v", got, err)
+		}
+		if got[0].LastError != "" || got[0].DispatchAttempts != 1 {
+			t.Fatalf("assignment ledger = attempts %d error %q, want attempt 1 with a clean error", got[0].DispatchAttempts, got[0].LastError)
+		}
+		events, err := s.AuditEvents(ctx, tk.ID)
+		if err != nil {
+			t.Fatalf("AuditEvents failed: %v", err)
+		}
+		ambiguous := 0
+		for _, ev := range events {
+			if ev.Event == "dispatch.ambiguous" {
+				ambiguous++
+			}
+		}
+		if ambiguous != 1 {
+			t.Fatalf("dispatch.ambiguous rows = %d, want the ambiguity audited once", ambiguous)
+		}
+
+		// The immediate next tick holds the resend inside the quarantine
+		// window: only adoption or the expiry may touch the send again.
+		sendsBefore := len(fake.DispatchCalls())
+		stats, err = d.DispatchPending(ctx)
+		if err != nil {
+			t.Fatalf("quarantined DispatchPending failed: %v", err)
+		}
+		if stats.Quarantined != 1 || stats.Dispatched != 0 {
+			t.Fatalf("stats = %+v, want the resend quarantined", stats)
+		}
+		if len(fake.DispatchCalls()) != sendsBefore {
+			t.Fatalf("a quarantined resend must not send; calls grew to %d", len(fake.DispatchCalls()))
+		}
+
+		// The window expires (modeled by the disabled quarantine): the
+		// resend goes out as attempt 2 — its deterministic message id keeps
+		// it correlatable even though the earlier send may still land.
+		expired := dispatch.New(s, fake, dispatch.Options{
+			WorkerAgent:          "kagent/worker",
+			PushBaseURL:          "http://orchestrator:8080",
+			MaxFollowups:         3,
+			RedispatchQuarantine: -1,
+		})
+		fake.FailDispatch("kagent/worker", nil)
+		fake.ScriptDispatch("kagent/worker", a2a.DispatchResult{TaskID: "task-2", ContextID: "ctx-2"})
+		stats, err = expired.DispatchPending(ctx)
+		if err != nil {
+			t.Fatalf("expired DispatchPending failed: %v", err)
+		}
+		if stats.Dispatched != 1 {
+			t.Fatalf("Dispatched = %d, want the resend after the window expired", stats.Dispatched)
+		}
+		calls := fake.DispatchCalls()
+		if len(calls) != sendsBefore+1 {
+			t.Fatalf("send calls = %d, want exactly the expired-window resend", len(calls))
+		}
+		want := dispatch.MessageIDFor(assign.ID, 2, "")
+		if calls[len(calls)-1].MessageID != want {
+			t.Fatalf("resend message id = %q, want the deterministic %q", calls[len(calls)-1].MessageID, want)
+		}
+	})
+
+	t.Run("Given a push-recorded orphan observation keyed by the ticket session, when the attempted-but-unbound follow-up dispatches, assert that the session-keyed observation is adopted and bound instead of resent (PR #11 review, Required: adoption keys must collide)", func(t *testing.T) {
+		s, fake, tk, _, d := intentFixtureWith(t, func(st *store.Store) dispatch.Options {
+			return restartOptions(t, st)
+		})
+
+		// The first dispatch lands and binds the ticket session ctx-1.
+		fake.ScriptDispatch("kagent/worker", a2a.DispatchResult{TaskID: "task-1", ContextID: "ctx-1"})
+		if _, err := d.DispatchPending(ctx); err != nil {
+			t.Fatalf("first dispatch failed: %v", err)
+		}
+
+		// The assignment settles under progress; a follow-up is minted.
+		assignments, err := s.Assignments(ctx, tk.ID)
+		if err != nil || len(assignments) != 1 {
+			t.Fatalf("Assignments = %+v, %v", assignments, err)
+		}
+		if _, err := s.ApplyAssignmentTerminal(ctx, store.TerminalPlan{
+			AssignmentID:     assignments[0].ID,
+			AssignmentStatus: store.AssignmentStatusEnded,
+			ReportState:      dispatch.ReportProgress,
+			TicketID:         tk.ID,
+		}); err != nil {
+			t.Fatalf("progress apply failed: %v", err)
+		}
+		followup, err := s.CreateFollowupAssignment(ctx, tk.ID)
+		if err != nil {
+			t.Fatalf("CreateFollowupAssignment failed: %v", err)
+		}
+
+		// The kill -9 between the send and the bind: the write-ahead intent
+		// counted the send, the send landed task-followup-1, and its push was
+		// recorded for adoption under the SESSION key (RecordUnclaimedTask).
+		if _, err := s.BeginDispatchAttempt(ctx, followup.ID); err != nil {
+			t.Fatalf("BeginDispatchAttempt failed: %v", err)
+		}
+		if err := d.RecordUnclaimedTask(ctx, a2a.Task{
+			ID:         "task-followup-1",
+			ContextID:  "ctx-1",
+			State:      a2a.StateCompleted,
+			StatusText: `{"kind":"report","state":"ready","summary":"landed before the crash"}`,
+		}); err != nil {
+			t.Fatalf("RecordUnclaimedTask failed: %v", err)
+		}
+		fake.ScriptTaskState("task-followup-1", a2a.Task{
+			ID:         "task-followup-1",
+			ContextID:  "ctx-1",
+			State:      a2a.StateCompleted,
+			StatusText: `{"kind":"report","state":"ready","summary":"landed before the crash"}`,
+		})
+
+		// The next attempt adopts through the session key: no resend, the
+		// landed task binds, and its ready report drives the ticket home.
+		stats, err := d.DispatchPending(ctx)
+		if err != nil {
+			t.Fatalf("DispatchPending (adoption) failed: %v", err)
+		}
+		if stats.Dispatched != 1 || stats.Ambiguous != 0 {
+			t.Fatalf("stats = %+v, want the adopted assignment counted as dispatched", stats)
+		}
+		if calls := fake.DispatchCalls(); len(calls) != 1 {
+			t.Fatalf("send calls = %d, want only the original first dispatch (adoption must not re-send)", len(calls))
+		}
+		bound, err := s.Assignments(ctx, tk.ID)
+		if err != nil || len(bound) != 2 {
+			t.Fatalf("Assignments = %+v, %v", bound, err)
+		}
+		if bound[1].TaskID == nil || *bound[1].TaskID != "task-followup-1" {
+			t.Fatalf("follow-up binding = %v, want task-followup-1 adopted via the session key", bound[1].TaskID)
+		}
+		if status, _ := s.TicketStatus(ctx, tk.ID); status != store.TicketStatusEnded {
+			t.Fatalf("ticket = %q, want the adopted task's ready report applied", status)
 		}
 	})
 

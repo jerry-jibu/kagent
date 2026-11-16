@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/a2a"
 	"github.com/jerry-jibu/kagent/orchestrator/internal/dispatch"
@@ -208,7 +209,7 @@ func TestPassTickDispatchAndFollowup(t *testing.T) {
 		}
 	})
 
-	t.Run("Given a ticket that spent its follow-up cap, when one Pass tick runs, assert that no further assignment is minted (unbounded progress loops cannot burn worker turns)", func(t *testing.T) {
+	t.Run("Given a ticket that spent its follow-up cap, when one Pass tick runs, assert that no further assignment is minted and the ticket is held with its followup.exhausted audit (unbounded progress loops cannot burn worker turns, and the cap never stalls silently)", func(t *testing.T) {
 		s, ticketID, fake, pass := passFixture(t)
 		first := assignmentIDOf(t, s, ticketID)
 		if _, err := s.ApplyAssignmentTerminal(ctx, store.TerminalPlan{
@@ -248,6 +249,74 @@ func TestPassTickDispatchAndFollowup(t *testing.T) {
 		after, _ := s.Assignments(ctx, ticketID)
 		if len(after) != 4 {
 			t.Fatalf("assignments = %d, want no mint past the cap", len(after))
+		}
+
+		// The cap is not a silent stall: the ticket waits for a person with
+		// the exhaustion audited (PR #11 review, Required).
+		if status, _ := s.TicketStatus(ctx, ticketID); status != store.TicketStatusNeedsAttention {
+			t.Fatalf("ticket = %q, want needs-attention at the cap", status)
+		}
+		events, err := s.AuditEvents(ctx, ticketID)
+		if err != nil {
+			t.Fatalf("AuditEvents failed: %v", err)
+		}
+		exhausted := 0
+		for _, ev := range events {
+			if ev.Event == "followup.exhausted" {
+				exhausted++
+			}
+		}
+		if exhausted != 1 {
+			t.Fatalf("followup.exhausted rows = %d, want the cap exhaustion audited once", exhausted)
+		}
+
+		// The hold retires the ticket from the follow-up scan: further ticks
+		// neither mint nor re-audit.
+		for i := 0; i < 2; i++ {
+			if _, err := pass.Tick(ctx); err != nil {
+				t.Fatalf("post-cap tick %d failed: %v", i+1, err)
+			}
+		}
+		after2, _ := s.Assignments(ctx, ticketID)
+		if len(after2) != 4 {
+			t.Fatalf("assignments = %d, want the hold to persist without minting", len(after2))
+		}
+		events, _ = s.AuditEvents(ctx, ticketID)
+		exhausted = 0
+		for _, ev := range events {
+			if ev.Event == "followup.exhausted" {
+				exhausted++
+			}
+		}
+		if exhausted != 1 {
+			t.Fatalf("followup.exhausted rows = %d after further ticks, want no re-audit", exhausted)
+		}
+	})
+
+	t.Run("Given a dispatch held in the resend quarantine, when one Pass tick runs, assert that the hold is surfaced in the tick stats instead of dropped (a quiet dispatch loop during a quarantine window must be explainable)", func(t *testing.T) {
+		s, _, assignment := acceptFixture(t)
+		storeTriggerPayload(t, s)
+		// The write-ahead intent counted an attempt that never bound — the
+		// resend waits out the quarantine window.
+		if _, err := s.BeginDispatchAttempt(ctx, assignment.ID); err != nil {
+			t.Fatalf("BeginDispatchAttempt failed: %v", err)
+		}
+		fake := a2a.NewFake()
+		pass := dispatch.NewPass(s, dispatch.New(s, fake, dispatch.Options{
+			WorkerAgent:          "kagent/worker",
+			PushBaseURL:          "http://orchestrator:8080",
+			RedispatchQuarantine: time.Minute, // the attempt is moments old
+		}), nil, dispatch.PassOptions{})
+
+		stats, err := pass.Tick(ctx)
+		if err != nil {
+			t.Fatalf("Tick failed: %v", err)
+		}
+		if stats.DispatchQuarantined != 1 || stats.Dispatched != 0 || stats.DispatchFailed != 0 {
+			t.Fatalf("stats = %+v, want the quarantined hold surfaced", stats)
+		}
+		if len(fake.DispatchCalls()) != 0 {
+			t.Fatalf("a quarantined dispatch must not send; calls = %d", len(fake.DispatchCalls()))
 		}
 	})
 

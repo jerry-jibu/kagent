@@ -15,10 +15,12 @@ import (
 // Pass reconcile backfill cannot double count. Push is an optimization — a
 // lost push is repaired by the Pass beat within two ticks.
 //
-// P0 mounts the endpoint inside the cluster boundary without request
-// authentication; the gateway's signed-JWT verification is future work
-// (go/core/internal/service/session PushJWTSigner), tracked for the P0
-// hardening pass.
+// Requests are authenticated (PR #11 review, Required #12 / design-R3-2):
+// with a verifier configured, every event must carry the gateway's
+// short-lived Ed25519 Bearer JWT — signed per delivery attempt by the
+// gateway's PushJWTSigner — whose taskId claim matches the event's task id
+// (pushauth.go). Only a nil verifier runs unauthenticated, and that dev mode
+// is logged loudly at construction.
 type Receiver struct {
 	dispatcher *Dispatcher
 	// verifier may be nil: P0 dev mode (unauthenticated inside the cluster

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jerry-jibu/kagent/orchestrator/internal/a2a"
@@ -31,6 +32,9 @@ type PassOptions struct {
 	// FollowUpAfter delays a continuation after the last assignment settled;
 	// 0 continues on the next tick.
 	FollowUpAfter time.Duration
+	// Log receives the beat's stage explanations (quarantine holds, ambiguous
+	// sends); nil falls back to slog.Default().
+	Log *slog.Logger
 }
 
 // Pass is the reconciling heartbeat of the advancement chain (docs/designs
@@ -45,16 +49,22 @@ type Pass struct {
 	transport  a2a.Transport
 	deliverer  Deliverer
 	opts       PassOptions
+	log        *slog.Logger
 }
 
 // NewPass wires the beat. deliverer may be nil (no outbox drain).
 func NewPass(st *store.Store, d *Dispatcher, deliverer Deliverer, opts PassOptions) *Pass {
+	log := opts.Log
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Pass{
 		store:      st,
 		dispatcher: d,
 		transport:  d.transport,
 		deliverer:  deliverer,
 		opts:       opts,
+		log:        log,
 	}
 }
 
@@ -62,8 +72,18 @@ func NewPass(st *store.Store, d *Dispatcher, deliverer Deliverer, opts PassOptio
 type PassStats struct {
 	// Dispatched counts assignments that landed a task this tick.
 	Dispatched int
-	// DispatchFailed counts dispatch attempts that failed this tick.
+	// DispatchFailed counts dispatch attempts that failed observably this
+	// tick.
 	DispatchFailed int
+	// DispatchAmbiguous counts sends that failed without an observable
+	// answer this tick (timeout, connection reset): the gateway may still
+	// land them, so adoption/quarantine governs instead of a recorded
+	// failure (PR #11 review, Required).
+	DispatchAmbiguous int
+	// DispatchQuarantined counts attempted-but-unbound dispatches held back
+	// by the resend quarantine this tick (PR #11 review, Nit: surfaced so a
+	// quiet dispatch loop during a quarantine window is explainable).
+	DispatchQuarantined int
 	// Reconciled counts running assignments whose task observation moved the
 	// state machine this tick (terminal backfill or input-required pause).
 	Reconciled int
@@ -92,6 +112,26 @@ type PassStats struct {
 	ItemFailures int
 }
 
+// mergeDispatchStats folds one DispatchPending run into the beat's stats and
+// explains a dispatch loop that quietly held work back (quarantine windows,
+// ambiguous sends) instead of failing (PR #11 review, Nit).
+func (p *Pass) mergeDispatchStats(stats *PassStats, ds DispatchStats) {
+	stats.Dispatched += ds.Dispatched
+	stats.DispatchFailed += ds.Failed
+	stats.DispatchAmbiguous += ds.Ambiguous
+	stats.DispatchQuarantined += ds.Quarantined
+	if ds.Quarantined > 0 {
+		p.log.Info("dispatch: resends held in the redispatch quarantine",
+			"held", ds.Quarantined,
+			"reason", "a prior attempt may hold a live task at the gateway")
+	}
+	if ds.Ambiguous > 0 {
+		p.log.Warn("dispatch: sends failed without an observable answer",
+			"count", ds.Ambiguous,
+			"reason", "the gateway may still land them; adoption/quarantine governs (no failure recorded)")
+	}
+}
+
 // Tick runs one beat. Per-item failures never fail the beat: each is counted
 // and retried on the next tick — the store's transactional guards make every
 // retry safe. A stage that cannot even scan (the store itself unreachable)
@@ -107,8 +147,7 @@ func (p *Pass) Tick(ctx context.Context) (PassStats, error) {
 	if err != nil {
 		errs = append(errs, fmt.Errorf("failed to dispatch pending assignments: %w", err))
 	} else {
-		stats.Dispatched = dispatched.Dispatched
-		stats.DispatchFailed = dispatched.Failed
+		p.mergeDispatchStats(&stats, dispatched)
 	}
 
 	if err := p.reconcile(ctx, &stats); err != nil {
@@ -271,10 +310,13 @@ func (p *Pass) enforceWaitsForPerson(ctx context.Context, stats *PassStats) erro
 
 // scheduleFollowups mints continuation assignments for running tickets
 // whose work ended under a progress report (docs/designs/0001 §4.3: 到期/
-// 重派入口), within the per-ticket cap. The minted assignment is pending;
-// the NEXT tick's dispatch (or this tick's, ordering aside — dispatch runs
-// before the follow-up scan within one Tick, so the dispatch actually lands
-// on the following beat) sends it under the ticket's unchanged contextId.
+// 重派入口), within the per-ticket cap. A ticket at its cap is held for a
+// person — needs-attention plus a followup.exhausted audit row — instead of
+// stalling silently tick after tick (PR #11 review, Required). The minted
+// assignment is pending; the NEXT tick's dispatch (or this tick's, ordering
+// aside — dispatch runs before the follow-up scan within one Tick, so the
+// dispatch actually lands on the following beat) sends it under the
+// ticket's unchanged contextId.
 func (p *Pass) scheduleFollowups(ctx context.Context, stats *PassStats) error {
 	candidates, err := p.store.FollowupCandidates(ctx)
 	if err != nil {
@@ -287,6 +329,28 @@ func (p *Pass) scheduleFollowups(ctx context.Context, stats *PassStats) error {
 	}
 	for _, c := range candidates {
 		if c.Followups >= maxFollowups {
+			// The cap is spent (PR #11 review, Required): silently skipping
+			// the candidate every tick would stall the ticket forever with
+			// no trace. Hold it for a person — needs-attention with its
+			// audit row, like the stuck branch — and mint nothing further.
+			// The hold also retires the ticket from this scan (needs-
+			// attention tickets are not followup candidates), so the row is
+			// written once.
+			changed, err := p.store.MarkTicketNeedsAttention(ctx, c.TicketID,
+				fmt.Sprintf("followup cap %d exhausted — the work keeps reporting progress but continues no further without a person", maxFollowups))
+			if err != nil {
+				stats.ItemFailures++
+				continue
+			}
+			if changed {
+				if aerr := p.store.RecordAudit(ctx, c.TicketID, "followup.exhausted", map[string]any{
+					"followups": c.Followups,
+					"cap":       maxFollowups,
+				}); aerr != nil {
+					stats.ItemFailures++
+					continue
+				}
+			}
 			continue
 		}
 		if p.opts.FollowUpAfter > 0 && time.Since(c.LastEndedAt) < p.opts.FollowUpAfter {
@@ -306,8 +370,7 @@ func (p *Pass) scheduleFollowups(ctx context.Context, stats *PassStats) error {
 		if err != nil {
 			return fmt.Errorf("failed to dispatch minted follow-ups: %w", err)
 		}
-		stats.Dispatched += dispatched.Dispatched
-		stats.DispatchFailed += dispatched.Failed
+		p.mergeDispatchStats(stats, dispatched)
 	}
 	return nil
 }
