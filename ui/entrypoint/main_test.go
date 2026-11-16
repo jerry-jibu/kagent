@@ -47,6 +47,7 @@ func TestMatchesInitScript(t *testing.T) {
 			"KAGENT_UI_EXTENSION_A1=digit sorts first",
 			"KAGENT_UI_EXTENSION_A=</script>\"\\",
 			"KAGENT_UI_EXTENSION_EMPTY=",
+			"KAGENT_UI_EXTENSION_LINES=first\nsecond",
 			"KAGENT_UI_EXTENSIONLESS=ignored",
 		},
 	}
