@@ -118,6 +118,22 @@ func TestLoad(t *testing.T) {
 		}
 	})
 
+	t.Run("Given two admission entries with the same sender id, when loaded, assert that the load fails (duplicates would make StrengthFor order-dependent while the hash hides the winner)", func(t *testing.T) {
+		dir := writePolicyDir(t, validRepos(),
+			`{"senders": [
+				{"id": "alice", "strength": "explicit"},
+				{"id": "alice", "strength": "denied"}
+			]}`, validBots())
+
+		_, err := policy.Load(dir)
+		if err == nil {
+			t.Fatal("duplicate admission ids must fail the load")
+		}
+		if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), "alice") {
+			t.Fatalf("error must name the duplicate id, got: %v", err)
+		}
+	})
+
 	t.Run("Given a repository entry that is not owner/name, when loaded, assert that the load fails", func(t *testing.T) {
 		dir := writePolicyDir(t, `{"repositories": ["just-a-name"]}`, validAdmission(), validBots())
 

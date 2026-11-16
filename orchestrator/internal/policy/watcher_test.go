@@ -1,6 +1,7 @@
 package policy_test
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -67,12 +68,11 @@ func TestWatcher(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reload failed: %v", err)
 		}
-		// The watcher is a two-stage tick: version N updates Current() on
-		// one tick and delivers the callback on the NEXT tick. Waiting on
-		// Current() alone raced the delivery stage — poll the assertion
-		// condition itself (the delivered slice) like the malformed-file
-		// subtest below does (PR #11 review, Required: flaky under -race
-		// and -count>1).
+		// The watcher publishes a version only after the update callback has
+		// accepted it, so waiting on the delivered slice proves both stages
+		// at once — poll the assertion condition itself like the
+		// malformed-file subtest below does (PR #11 review, Required: flaky
+		// under -race and -count>1).
 		waitFor(t, "watcher to observe and deliver the new policy version", func() bool {
 			mu.Lock()
 			defer mu.Unlock()
@@ -143,6 +143,63 @@ func TestWatcher(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			return len(delivered) > 0 && delivered[len(delivered)-1] == want.Version
+		})
+	})
+
+	t.Run("Given an update callback that keeps failing, when a file changes, assert that Current keeps the old policy and never serves a version without a persisted hash; when the callback recovers, assert that the new version publishes", func(t *testing.T) {
+		dir := writePolicyDir(t, validRepos(), validAdmission(), validBots())
+		good, err := policy.Load(dir)
+		if err != nil {
+			t.Fatalf("initial load failed: %v", err)
+		}
+
+		var mu sync.Mutex
+		failUpdates := true
+		var delivered []string
+		w := startTestWatcher(t, dir, func(p policy.Policy) error {
+			mu.Lock()
+			fail := failUpdates
+			mu.Unlock()
+			if fail {
+				return errors.New("store unavailable")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			delivered = append(delivered, p.Version)
+			return nil
+		})
+
+		if err := os.WriteFile(filepath.Join(dir, "repos.json"), []byte(`{"repositories": ["acme/next"]}`), 0o644); err != nil {
+			t.Fatalf("failed to rewrite repos.json: %v", err)
+		}
+		want, err := policy.Load(dir)
+		if err != nil {
+			t.Fatalf("reload failed: %v", err)
+		}
+
+		// While the callback fails, the previous version keeps being served:
+		// record-before-publish means Current never outruns the store.
+		time.Sleep(200 * time.Millisecond)
+		if w.Current().Version != good.Version {
+			t.Fatalf("served version %s moved past a failed onUpdate; want %s", w.Current().Version, good.Version)
+		}
+		mu.Lock()
+		if len(delivered) != 0 {
+			mu.Unlock()
+			t.Fatalf("a failing onUpdate must deliver nothing, got %v", delivered)
+		}
+		mu.Unlock()
+
+		// Recovery: the next tick re-reads the same changed directory and
+		// publishes the new version.
+		mu.Lock()
+		failUpdates = false
+		mu.Unlock()
+		waitFor(t, "the new policy version to publish after the callback recovers", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return w.Current().Version == want.Version &&
+				len(delivered) > 0 && delivered[len(delivered)-1] == want.Version
 		})
 	})
 }

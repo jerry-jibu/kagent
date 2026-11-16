@@ -11,12 +11,14 @@ import (
 // Watcher hot-reloads the policy directory. Semantics (T1 AC):
 //   - startup: StartWatcher loads the directory once; a load error is
 //     returned so main refuses to start.
-//   - hot reload: a successfully parsed changed directory swaps Current and
-//     invokes onUpdate (wired to Store recording); a parse failure keeps the
-//     last good policy (degrade, never crash).
-//   - onUpdate failures are retried on subsequent ticks until the current
-//     version has been delivered, so a transient Store error cannot make a
-//     policy version invisible.
+//   - hot reload: a successfully parsed changed directory first invokes
+//     onUpdate (wired to Store recording) and only swaps Current after that
+//     succeeds — a served version always carries a persisted hash (PR #11
+//     review: record-then-publish could serve a version nobody recorded). A
+//     parse failure keeps the last good policy (degrade, never crash).
+//   - onUpdate failures keep the previous version served and are retried on
+//     subsequent ticks, so a transient Store error cannot strand the new
+//     version: it is re-read and re-attempted until it publishes.
 type Watcher struct {
 	dir      string
 	interval time.Duration
@@ -26,7 +28,6 @@ type Watcher struct {
 	mu          sync.RWMutex
 	current     Policy
 	loadedAt    time.Time
-	delivered   string // version last accepted by onUpdate
 	stop        chan struct{}
 	stopDone    chan struct{}
 	stopStarted sync.Once
@@ -48,15 +49,14 @@ func StartWatcher(dir string, interval time.Duration, onUpdate func(Policy) erro
 	}
 
 	w := &Watcher{
-		dir:       dir,
-		interval:  interval,
-		onUpdate:  onUpdate,
-		log:       log,
-		current:   p,
-		loadedAt:  time.Now(),
-		delivered: p.Version, // initial version needs no delivery
-		stop:      make(chan struct{}),
-		stopDone:  make(chan struct{}),
+		dir:      dir,
+		interval: interval,
+		onUpdate: onUpdate,
+		log:      log,
+		current:  p,
+		loadedAt: time.Now(),
+		stop:     make(chan struct{}),
+		stopDone: make(chan struct{}),
 	}
 	log.Info("policy loaded", "dir", dir, "version", p.Version,
 		"repositories", len(p.Repositories), "admission_rules", len(p.Admission), "bots", len(p.Bots))
@@ -100,27 +100,13 @@ func (w *Watcher) loop() {
 }
 
 // tick performs one reload scan. Parse failures keep the last good policy;
-// onUpdate failures are retried on later ticks until delivered.
+// onUpdate failures keep serving the previous version and retry on later
+// ticks — Current only ever moves to a version whose onUpdate succeeded
+// (record-before-publish, PR #11 review).
 func (w *Watcher) tick(ctx context.Context) {
 	w.mu.RLock()
 	served := w.current
-	delivered := w.delivered
 	w.mu.RUnlock()
-
-	// Retry a pending delivery first so a transient onUpdate error cannot
-	// strand a version that is already being served.
-	if delivered != served.Version && w.onUpdate != nil {
-		if err := w.onUpdate(served); err != nil {
-			w.log.Error("failed to record policy version; will retry",
-				"version", served.Version, "error", err)
-			return
-		}
-		w.mu.Lock()
-		w.delivered = served.Version
-		w.mu.Unlock()
-		w.log.Info("policy version recorded", "version", served.Version)
-		return
-	}
 
 	loaded, err := Load(w.dir)
 	if err != nil {
@@ -131,6 +117,14 @@ func (w *Watcher) tick(ctx context.Context) {
 	}
 	if loaded.Version == served.Version {
 		return
+	}
+
+	if w.onUpdate != nil {
+		if err := w.onUpdate(loaded); err != nil {
+			w.log.Error("failed to record policy version; keeping the previous version and retrying on the next tick",
+				"version", loaded.Version, "previous_version", served.Version, "error", err)
+			return
+		}
 	}
 
 	w.mu.Lock()
