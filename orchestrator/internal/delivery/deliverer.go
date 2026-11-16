@@ -44,11 +44,27 @@ type Options struct {
 	Log *slog.Logger
 }
 
+// Store is the store surface the deliverer needs — narrow on purpose: the
+// concrete *store.Store satisfies it, and the seam keeps the delivery loop
+// unit-testable on fakes without a PostgreSQL fixture. DeferTicketDelivery
+// is the store's rate-limit deferral contract (PR #11 review, Required #3):
+// writing it arms the PendingDeliveries filter so a deferred ticket leaves
+// the scan until the block lifts — the hammering-every-2s-beat pattern
+// GitHub's abuse detection escalates must not re-pick the candidate.
+type Store interface {
+	PendingDeliveries(ctx context.Context) ([]store.DeliveryCandidate, error)
+	DeferTicketDelivery(ctx context.Context, ticketID string, until time.Time) error
+	FailTicketDelivery(ctx context.Context, ticketID, reason string) (bool, error)
+	MarkTicketDelivered(ctx context.Context, plan store.DeliveredPlan) (bool, error)
+	RecordAudit(ctx context.Context, ticketID string, event string, detail any) error
+	AuditEvents(ctx context.Context, ticketID string) ([]store.AuditEvent, error)
+}
+
 // Deliverer ships pending results: workspace read-back → orchestrator-side
 // patch → ticket branch → PR → result-comment effect. It is the loop body
 // the orchestrator beats; every candidate is independent and idempotent.
 type Deliverer struct {
-	store   *store.Store
+	store   Store
 	backend workspace.Backend
 	patcher *workspace.Patcher
 	gh      github.Transport
@@ -57,7 +73,7 @@ type Deliverer struct {
 }
 
 // New wires the deliverer. Store, Backend and Transport are required.
-func New(st *store.Store, backend workspace.Backend, gh github.Transport, opts Options) *Deliverer {
+func New(st Store, backend workspace.Backend, gh github.Transport, opts Options) *Deliverer {
 	log := opts.Log
 	if log == nil {
 		log = slog.Default()
@@ -83,7 +99,8 @@ type Stats struct {
 	// empty — the ticket transitions to failed with its audit, no PR.
 	Failed int
 	// RateLimited counts candidates deferred behind a GitHub rate limit
-	// (they stay pending; the block lifts per the recorded Retry-After).
+	// (DeferTicketDelivery hides them from the scan until the recorded
+	// Retry-After; PR #11 review, Required #3).
 	RateLimited int
 	// Retried counts transient failures that stay pending for the next beat
 	// (backend outage, git failure, GitHub failure).
@@ -257,10 +274,12 @@ func (d *Deliverer) failPermanently(ctx context.Context, ticketID, reason string
 }
 
 // retryTransient records a transient failure (audit observation) and keeps
-// the candidate pending for the next beat. A GitHub rate limit skips the
-// candidate until the block lifts (PR #11 review, Required): re-hitting the
-// API every 2s beat is the hammering pattern GitHub's abuse detection
-// escalates.
+// the candidate pending for the next beat. A GitHub rate limit with a usable
+// reset deadline additionally DEFERS the ticket: the store's
+// DeferTicketDelivery contract arms the pending-deliveries filter so the
+// candidate leaves the scan until the block lifts (PR #11 review, Required
+// #3) — re-hitting the API every 2s beat is the hammering pattern GitHub's
+// abuse detection escalates.
 func (d *Deliverer) retryTransient(ctx context.Context, ticketID string, cause error, stage string) (int, error) {
 	detail := map[string]any{
 		"stage":     stage,
@@ -280,9 +299,24 @@ func (d *Deliverer) retryTransient(ctx context.Context, ticketID string, cause e
 		return 0, fmt.Errorf("%w: failed to record the transient failure of %s: %w", errStore, ticketID, err)
 	}
 	if errors.As(cause, &rl) {
-		d.log.Warn("github rate limit — delivery deferred",
-			"ticket", ticketID, "stage", stage,
-			"retry_after", rl.RetryAfter.Format(time.RFC3339))
+		if !rl.RetryAfter.IsZero() {
+			if err := d.store.DeferTicketDelivery(ctx, ticketID, rl.RetryAfter); err != nil {
+				// The deferral write did not land: the scan would keep
+				// re-picking the ticket against a rate limit it cannot
+				// win, so the beat aborts and the next beat retries both
+				// writes.
+				return 0, fmt.Errorf("%w: failed to defer the delivery of %s until %s: %w",
+					errStore, ticketID, rl.RetryAfter.Format(time.RFC3339), err)
+			}
+			d.log.Warn("github rate limit — delivery deferred until the block lifts",
+				"ticket", ticketID, "stage", stage,
+				"retry_after", rl.RetryAfter.Format(time.RFC3339))
+			return outcomeRateLimited, nil
+		}
+		// No usable deadline (unclassified 403): nothing to defer against —
+		// stay pending, the next beat retries with care.
+		d.log.Warn("github rate limit without a reset deadline — retried on the next beat",
+			"ticket", ticketID, "stage", stage)
 		return outcomeRateLimited, nil
 	}
 	d.log.Warn("ticket delivery retried on the next beat",
@@ -423,10 +457,14 @@ func firstLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// truncateTitle shortens a report line to max runes including the ellipsis.
+// Rune-bound, never byte-bound: a byte slice at 71 lands mid-rune in CJK
+// text and corrupts the character (PR #11 review, Nit).
 func truncateTitle(s string) string {
 	const max = 72
-	if len(s) > max {
-		return s[:max-1] + "…"
+	runes := []rune(s)
+	if len(runes) > max {
+		return string(runes[:max-1]) + "…"
 	}
 	return s
 }
