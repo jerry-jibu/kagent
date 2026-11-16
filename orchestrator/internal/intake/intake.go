@@ -38,7 +38,9 @@ type CommentPayload struct {
 // contract. Evaluation stages (Gate, evaluator) decode trigger payloads
 // through this function: trigger rows are immutable audit data, so a
 // payload that no longer decodes into the contract is malformed durable
-// data and is rejected — never silently decoded into a zero value.
+// data and is rejected — never silently decoded into a zero value. A zero
+// issue or comment id is the same violation: no GitHub event carries them,
+// so a payload that does is corrupt or forged.
 func DecodeCommentPayload(payload []byte) (CommentPayload, error) {
 	var pl CommentPayload
 	if err := json.Unmarshal(payload, &pl); err != nil {
@@ -51,6 +53,10 @@ func DecodeCommentPayload(payload []byte) (CommentPayload, error) {
 		return CommentPayload{}, fmt.Errorf("payload repo is empty: not a CommentPayload")
 	case pl.Author == "":
 		return CommentPayload{}, fmt.Errorf("payload author is empty: not a CommentPayload")
+	case pl.Issue == 0:
+		return CommentPayload{}, fmt.Errorf("payload issue is zero: not a CommentPayload")
+	case pl.CommentID == 0:
+		return CommentPayload{}, fmt.Errorf("payload comment id is zero: not a CommentPayload")
 	}
 	return pl, nil
 }

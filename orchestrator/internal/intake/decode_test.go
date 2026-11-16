@@ -37,6 +37,8 @@ func TestDecodeCommentPayload(t *testing.T) {
 		{"a kind-less payload", `{"repo":"acme/api","author":"alice"}`, "kind"},
 		{"a repo-less payload", `{"kind":"issue-comment","author":"alice"}`, "repo"},
 		{"an author-less payload", `{"kind":"issue-comment","repo":"acme/api"}`, "author"},
+		{"a zero-issue payload", `{"kind":"issue-comment","repo":"acme/api","author":"alice","issue":0,"comment_id":1001}`, "issue"},
+		{"a zero-comment-id payload", `{"kind":"issue-comment","repo":"acme/api","author":"alice","issue":42,"comment_id":0}`, "comment id"},
 	}
 	for _, sc := range scenarios {
 		t.Run("Given "+sc.name+", when decoded, assert that the contract violation is named", func(t *testing.T) {
