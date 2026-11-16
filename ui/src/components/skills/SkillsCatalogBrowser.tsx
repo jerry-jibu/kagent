@@ -19,6 +19,10 @@ const { Text } = Typography;
  * Three relationship states a row can be in, all visible at once:
  * - `preChecked` — the target already holds this catalog skill; checked on open
  *   and version-editable, because unchecking is how a manage dialog removes.
+ *   Untouched rows are left exactly as held — the apply never re-sends one — so
+ *   removing an unrelated skill cannot quietly move a row pinned at an older
+ *   digest onto the catalog's current one; `heldImages` marks such rows
+ *   "Older version" instead, the same indication the template form uses.
  * - `disabledNames` — the target holds a skill of this name the catalog does not
  *   own (a custom source). Shown "Added" and not checkable: the catalog cannot
  *   manage what it did not provide, so the row must not pretend otherwise.
@@ -28,6 +32,7 @@ export function SkillsCatalogBrowser({
   catalog,
   preChecked = [],
   disabledNames = [],
+  heldImages = {},
   applyLabel = "Add",
   onApply,
 }: {
@@ -36,9 +41,17 @@ export function SkillsCatalogBrowser({
   preChecked?: string[];
   /** Skill names the target holds that the catalog does not own; not checkable. */
   disabledNames?: string[];
+  /** For a pre-checked name, the digest-pinned image the target actually holds. */
+  heldImages?: Record<string, string>;
   /** The apply button's prefix; the selected count follows it. */
   applyLabel?: string;
-  onApply: (add: CatalogSelection[], removeNames: string[]) => void;
+  /**
+   * Called with the additions and removals the apply carries. May return `false`
+   * — directly or through the promise — when the apply did not land; the browser
+   * then keeps every selection and version choice for a retry instead of
+   * resetting to the opening state.
+   */
+  onApply: (add: CatalogSelection[], removeNames: string[]) => boolean | void | Promise<boolean | void>;
 }) {
   const theme = useTheme();
   const [search, setSearch] = useState("");
@@ -46,6 +59,11 @@ export function SkillsCatalogBrowser({
   // One version choice per checked-or-checkable skill; absent means "current".
   const [versionBySkill, setVersionBySkill] = useState<Record<string, number>>({});
   const [checked, setChecked] = useState<Set<string>>(() => new Set(preChecked));
+  // Rows the reader has acted on — checked, unchecked, or re-pinned — since the
+  // browser opened. Only these join the apply: a pre-checked row left as it was
+  // is already on the target at whatever pin it was saved with, and re-sending
+  // it would silently upgrade that pin to the catalog's current digest.
+  const [touched, setTouched] = useState<Set<string>>(() => new Set());
 
   const allTags = useMemo(
     () => [...new Set(catalog.skills.flatMap((skill) => skill.tags))].sort(),
@@ -65,10 +83,15 @@ export function SkillsCatalogBrowser({
     });
   }, [catalog, search, activeTags]);
 
-  /** The applied state: checked catalog skills become selections at their chosen version. */
+  /**
+   * The applied additions: checked rows the reader actually touched. Unchecking
+   * and re-pinning are touches, so everything an apply would change is here —
+   * and nothing else is, which is what keeps a removal from carrying silent
+   * re-pins of the rows left alone.
+   */
   const selections = (): CatalogSelection[] =>
     catalog.skills
-      .filter((skill) => checked.has(skill.name))
+      .filter((skill) => checked.has(skill.name) && touched.has(skill.name))
       .map((skill) => {
         const at = versionBySkill[skill.name];
         return selectionForSkill(skill, at === undefined ? undefined : skill.versions[at], catalog.image);
@@ -76,7 +99,26 @@ export function SkillsCatalogBrowser({
   // A pre-checked skill that the reader unchecked is a removal, not an omission.
   const removals = preChecked.filter((name) => !checked.has(name));
 
+  /*
+   * The change set the apply would actually write: rows checked that the target
+   * does not hold, held rows re-pinned to a digest they are not held at, and
+   * removals. A held row sitting exactly as it was — or put back to it — stages
+   * nothing, which is what keeps Save dark on a manage view nobody has changed
+   * while still letting unchecking the *last* held skill (nothing left checked)
+   * enable it. A held row with no pin on record counts as changed: a write the
+   * target may not need beats a Save the reader cannot press.
+   */
+  const stagedCount =
+    selections().filter(
+      (selection) =>
+        !preChecked.includes(selection.name) || heldImages[selection.name] !== selection.image,
+    ).length + removals.length;
+
+  const touch = (name: string) =>
+    setTouched((current) => new Set(current).add(name));
+
   const toggle = (name: string) => {
+    touch(name);
     setChecked((current) => {
       const next = new Set(current);
       if (next.has(name)) next.delete(name);
@@ -91,6 +133,10 @@ export function SkillsCatalogBrowser({
     const versions = [{ label: "Latest", image: catalog.image, path: skill.path }, ...skill.versions];
     const chosenAt = versionBySkill[skill.name];
     const isDisabled = disabled.has(skill.name);
+    // The pin this row would apply as things stand; a held row sitting on some
+    // other digest is marked rather than quietly re-pinned by the next save.
+    const appliedImage = chosenAt === undefined ? catalog.image : skill.versions[chosenAt]?.image ?? catalog.image;
+    const olderPin = heldImages[skill.name] !== undefined && heldImages[skill.name] !== appliedImage;
     return (
       <Card
         key={skill.name}
@@ -111,6 +157,16 @@ export function SkillsCatalogBrowser({
             <div css={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               <Text strong>{skill.name}</Text>
               {isDisabled ? <Tag css={{ marginInlineEnd: 0 }}>Added</Tag> : null}
+              {olderPin ? (
+                <Tag
+                  color="warning"
+                  css={{ marginInlineEnd: 0 }}
+                  data-testid={`skills-catalog-outdated-${skill.name}`}
+                  title="Saved from an earlier kagent-tools image than this install ships. It stays as held unless a version is chosen for it here."
+                >
+                  Older version
+                </Tag>
+              ) : null}
               {skill.tags.map((tag) => (
                 <Tag key={tag} css={{ marginInlineEnd: 0 }} data-testid={`skills-catalog-tag-${tag}`}>
                   {tag}
@@ -127,6 +183,7 @@ export function SkillsCatalogBrowser({
             css={{ width: "100%" }}
             value={chosenAt === undefined ? "current" : String(chosenAt)}
             onChange={(value: string) => {
+              touch(skill.name);
               setVersionBySkill((current) => {
                 const next = { ...current };
                 if (value === "current") delete next[skill.name];
@@ -188,15 +245,27 @@ export function SkillsCatalogBrowser({
         </Text>
         <Button
           type="primary"
-          disabled={checked.size === 0}
+          disabled={stagedCount === 0}
           data-testid="skills-catalog-apply"
           onClick={() => {
-            onApply(selections(), removals);
-            setChecked(new Set(preChecked));
-            setVersionBySkill({});
+            const applied = onApply(selections(), removals);
+            // Reset only once the caller has confirmed the apply landed. The
+            // manage dialog keeps this modal open when a save fails, and wiping
+            // the checkboxes and version choices then would make the reader
+            // rebuild the whole selection to retry.
+            void Promise.resolve(applied).then((outcome) => {
+              if (outcome !== false) {
+                setChecked(new Set(preChecked));
+                setTouched(new Set());
+                setVersionBySkill({});
+              }
+            });
           }}
         >
-          {applyLabel} {checked.size === 1 ? "1 skill" : `${checked.size} skills`}
+          {/* The count is what Save writes — the staged change set — not the
+              checkbox count above, which includes held rows left as they are. */}
+          {applyLabel}
+          {stagedCount > 0 ? ` ${stagedCount === 1 ? "1 skill" : `${stagedCount} skills`}` : ""}
         </Button>
       </div>
     </div>

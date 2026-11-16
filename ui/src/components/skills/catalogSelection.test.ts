@@ -7,6 +7,7 @@ import {
   matchesCatalogSkill,
   newSelectionNames,
   selectionForSkill,
+  skippedAdditions,
   type CatalogSelection,
 } from "./catalogSelection";
 
@@ -138,5 +139,29 @@ describe("matchesCatalogSkill and newSelectionNames", () => {
       "k8s-troubleshooting",
       "helm-release-management",
     ]);
+  });
+});
+
+describe("skippedAdditions", () => {
+  const selection = (name: string, image: string): CatalogSelection => ({
+    name,
+    description: "",
+    image,
+    path: `opt/kagent-tools-skills/skills/${name}`,
+    tags: [],
+  });
+
+  it("names a pick the target holds under the same name from a source the catalog does not own", () => {
+    const custom = { name: "k8s-troubleshooting", source: { git: { url: "https://git.test/r.git", commit: "c".repeat(40) } } };
+    expect(skippedAdditions([custom], [selection("k8s-troubleshooting", CURRENT)])).toEqual(["k8s-troubleshooting"]);
+  });
+
+  it("does not name a held skill the catalog owns — re-picking it is a re-pin, not a skip", () => {
+    const held = [specSkill("k8s-troubleshooting", CURRENT, "opt/kagent-tools-skills/skills/k8s-troubleshooting")];
+    expect(skippedAdditions(held, [selection("k8s-troubleshooting", OLDER)])).toEqual([]);
+  });
+
+  it("does not name a genuinely new skill", () => {
+    expect(skippedAdditions([], [selection("helm-release-management", CURRENT)])).toEqual([]);
   });
 });

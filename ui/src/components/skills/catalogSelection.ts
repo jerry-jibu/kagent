@@ -9,6 +9,7 @@
 
 import type { AgentTemplateSkill } from "@/api/domain/agentTemplates";
 import type { BuiltinSkill, BuiltinSkillVersion, BuiltinSkillsCatalog } from "@/api/runtimeConfig";
+import { sameImageRepository } from "./catalogIdentity";
 
 /** One skill, at one chosen version, as a picker hands it on. */
 export interface CatalogSelection {
@@ -40,11 +41,6 @@ export function selectionForSkill(
   };
 }
 
-/** The repository part of a digest-pinned reference, before the `@`. */
-function imageRepository(image: string): string {
-  return image.split("@")[0];
-}
-
 /**
  * Whether a spec's skill already holds this catalog skill — name, repository and
  * path all matching, any digest. The same-shape test `matchBuiltinSkill` applies
@@ -56,7 +52,7 @@ export function matchesCatalogSkill(
 ): boolean {
   const source = skill.source;
   if (!source.oci) return false;
-  if (imageRepository(source.oci) !== imageRepository(selection.image)) return false;
+  if (!sameImageRepository(source.oci, selection.image)) return false;
   if ((source.path ?? "") !== selection.path) return false;
   return skill.name === selection.name;
 }
@@ -71,7 +67,7 @@ export function catalogSkillFor(
   catalog: BuiltinSkillsCatalog | undefined,
 ): BuiltinSkill | undefined {
   if (!catalog || !skill.source.oci) return undefined;
-  if (imageRepository(skill.source.oci) !== imageRepository(catalog.image)) return undefined;
+  if (!sameImageRepository(skill.source.oci, catalog.image)) return undefined;
   return catalog.skills.find(
     (entry) => entry.path === (skill.source.path ?? "") && entry.name === skill.name,
   );
@@ -118,4 +114,29 @@ export function newSelectionNames(
 ): string[] {
   const held = new Set(existing.map((skill) => skill.name));
   return add.filter((selection) => !held.has(selection.name)).map((selection) => selection.name);
+}
+
+/**
+ * The selections an apply would skip: `add` entries whose name the target already
+ * holds from a source the catalog does not own.
+ *
+ * `applySkillSelections` refuses to overwrite such an entry — the picker never
+ * offered it, so replacing it would destroy a skill it cannot manage — but that
+ * refusal is silent, and a save reporting success over a dropped pick is the
+ * reader being lied to. Callers surface these by name, before saving, instead.
+ * A held entry that *is* the same catalog skill is not a skip: re-picking it at
+ * another version is the deliberate re-pin the merge applies.
+ */
+export function skippedAdditions(
+  existing: AgentTemplateSkill[],
+  add: CatalogSelection[],
+): string[] {
+  const fresh = new Set(newSelectionNames(existing, add));
+  return add
+    .filter((selection) => !fresh.has(selection.name))
+    .filter((selection) => {
+      const held = existing.find((skill) => skill.name === selection.name);
+      return held === undefined || !matchesCatalogSkill(held, selection);
+    })
+    .map((selection) => selection.name);
 }
