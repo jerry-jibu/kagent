@@ -1,0 +1,14 @@
+# worker 沙箱 → agentfs 桥的出站授权（PR #11 e2e：本版本 kagent 编译器的
+# BYO egress 白名单不含 MCP 绑定目的地——0003 记载的"MCP server 绑定进
+# 白名单"尚未在该版本实现，又一处文档漂移）。EgressPolicyRefs 是设计的
+# 原生扩展点（agent_types.go:65，0003 route-B 同一机制）。
+apiVersion: api.kagent.dev/v1alpha3
+kind: EgressPolicy
+metadata:
+  name: agentfs-bridge
+  namespace: kagent
+  labels:
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  destinations:
+    - origin: http://agentfs.kagent.svc.cluster.local:9765

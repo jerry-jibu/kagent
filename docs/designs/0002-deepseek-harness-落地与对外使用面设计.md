@@ -4,7 +4,7 @@
 *   **Status:** Proposed
 *   **Date:** 2026-11-14
 
-> 注记：本文迁自 agent-data-workspace（设计探讨工作区）。文中 `0009` 等编号指该工作区 `docs/learnings/` 下的学习笔记；关键事实已内联为 kagent 仓库的 file:line 引用，本文自洽可读。`docs/env.md` 指本仓库部署速查（`docs/env-playbook` 分支）。决策编号 D7–D9 延续 0001 的 D1–D6。本文已过 EGM 全量评审（2026-11-14），修订已并入。
+> 注记：本文迁自 agent-data-workspace（设计探讨工作区）。文中 `0009` 等编号指该工作区 `docs/learnings/` 下的学习笔记；关键事实已内联为 kagent 仓库的 file:line 引用，本文自洽可读。`docs/env.md` 指本仓库部署速查（`docs/env-playbook` 分支）。决策编号 D7–D10 延续 0001 的 D1–D6（D7=BYO 起步〔A2〕、D9=Pass 对账检测〔§3〕、D10=编排器预置物化〔A5〕；**D8 原文 = "P0 取仓库已验证的 Anthropic 变体"，已被 A1 更正块推翻**——变体由桥约束决定）。本文已过 EGM 全量评审（2026-11-14），修订已并入；2026-11-15 二轮 EGM 评审再修订（A1 ModelConfig 配对更正、A3 替代机制落地记录、A4 契约现状与构建出处更正、验证计划形态同步、CUJ1/CUJ3/CUJ4 P0 范围注、evaluator prompt 偏离记录）。
 
 --------------------------------------------------------------------------------
 
@@ -24,7 +24,7 @@
 
 *   **DSH**：DeepSeek Harness——byo-ext PR #2 提供的桥接运行时（Go bridge 包裹 DeepSeek CLI，每 turn 一进程，状态在 durable /data）。
 *   **bridge 双关**：文中 "DSH bridge" 一律指镜像内的 Go bridge；"Attention bridge" 一律指 0001 编排器的飞书出站组件。延迟预算里的"bridge 出站"指后者。
-*   **A2A**：agent 间通信协议（kagent 的 task/消息层）；task 有终态/非终态，push 通知只承诺终态。
+*   **A2A**：agent 间通信协议（kagent 的 task/消息层）；push 回调在 task 进入终态**或 `input-required`/`auth-required`** 时触发（`docs/architecture/a2a-push-notifications.md:42-44`、`go/core/internal/database/push_delivery.go:47`——2026-11-15 更正：原文"push 只承诺终态"引自外部笔记，与本仓库平台实现不符）。
 *   **substrate / actor / DATA**：kagent 的算力层——worker 以 actor 进程跑在 gVisor 沙箱 WorkerPool；`/data` 为跨挂起/替换存活的持久卷（DATA），快照=卷+状态。
 *   **agentfs**：一个组件三种用法——workspace（每工单一目录的持久工作区）、MCP 工具（`agenticfs_*`）、桥（集群内 agentfs 服务的 MCP 端点）。
 *   **HITL / ACP**：HITL=human-in-the-loop（kagent 的 input-required/审批扩展头）；ACP=Agent Client Protocol（DSH CLI 的原生会话协议，其权限请求即审批通道 1）。
@@ -61,10 +61,10 @@ sequenceDiagram
     ORC->>ORC: ④ Engine 建 Ticket+Mandate（唯一写者，单事务）
     ORC->>GW: ⑤ Dispatcher: SendMessage + PushConfig（Assignment ≡ 一个 A2A task）
     GW->>WK: actor 拉起 DSH（superagent 的 Worker Session 被 actor 整体替代，零开发）
-    WK->>WK: agentfs workspace 干活、本地 commit、出 patch（不持 git 推送凭证）
-    WK-->>GW: Report（六态）或 input-required
+    WK->>WK: agentfs workspace 纯文件编辑（无 git——0003 改道后实施路线；不持任何凭证）
+    WK-->>GW: Report（prompt 教五态:progress/ready/blocked/failed/waiting;dropped 仅为编排器解析端终态）或 input-required
     GW--)ORC: ⑥ push 终态 POST（Pass 2s 对账兜底）
-    ORC->>GH: ⑦ Outbox：push 代码 + 建 PR + 回评论（GitHub 写凭证只在编排器）
+    ORC->>GH: ⑦ 交付器:push 分支 + 建 PR(幂等) + Outbox 回评论（GitHub 写凭证只在编排器）
 ```
 
 ## The Problem
@@ -72,12 +72,12 @@ sequenceDiagram
 两个缺口：
 
 1. **harness 落地未定义**。0001 的 worker 是 DSH BYO，但 kagent 的 Harness CRD 有四种类型（`kagent/codex/claude/byo`，`go/api/v1alpha3/harness_types.go:131-161`），DeepSeek 走哪条、模型侧怎么配、镜像怎么发、审批通道对 superagent 的 attention 流有什么硬约束——都没定。其中一条是硬约束：**结构化输出对非 kagent harness 一律被编译器拒绝**（`go/core/internal/translator/compiler.go:332-334`），这直接影响 evaluator（需要结构化 Decision）与 worker（不需要）的 harness 选型。
-2. **使用面未成文**。人从哪里进来？0001 §4.2 里 "GW → O: Attention bridge 捕获" 连检测机制都没写（input-required 是非终态，0004 的 push 语义只承诺终态）。0001 的 "Panel (P1)" 若建成独立前端，就要复制一套 SPA + 认证 + 部署，而 kagent UI 已有构建期 app-extension 框架（13 个扩展槽，`ui/src/appExtensions/extensionPoints.ts:11-25`）正好留了这个缝。
+2. **使用面未成文**。人从哪里进来？0001 早期草案 §4.2 曾把 attention 捕获写成网关推送且未定检测机制（现行 0001 §4.2 已同步为 Pass 对账检测——机制定义见本文 §3/D9）。0001 的 "Panel (P1)" 若建成独立前端，就要复制一套 SPA + 认证 + 部署，而 kagent UI 已有构建期 app-extension 框架（13 个扩展槽，`ui/src/appExtensions/extensionPoints.ts:11-25`）正好留了这个缝。
 
 ## Goals
 
-1. **安装零改动**：DeepSeek harness 的安装只靠 kagent 已有机制（kubectl apply 现有 CRD + egress 注入），P0 对 kagent 上游产品代码零改动（本 fork 分支仅新增 `deploy/` 清单与文档）。
-2. **交互模式零学习成本**：DSH agent 在 UI/CLI 里与 kagent/codex/claude agent 在已验证范围（流式对话、工具审批 HITL）内表现一致；checkpoint/fork 以 0009 持久化契约为前提，P0 验收单列（state.json 耦合是 0009 §6 已知中危项）。
+1. **安装零改动**：DeepSeek harness 的安装只靠 kagent 已有机制（kubectl apply 现有 CRD + egress 注入），P0 对 kagent 上游产品代码零改动（本集成分支新增：`deploy/` 清单、`orchestrator/` 模块（见 0001 §9.1）与 docs/designs 文档——"零改动"指 go/ui/helm/proto 产品代码）。
+2. **交互模式零学习成本**：DSH agent 在 UI/CLI 里与 kagent/codex/claude agent 在已验证范围（流式对话、工具审批 HITL）内表现一致；**P0 已验证现状（2026-11-15）**：三项中仅非流式对话往返有走查记录——流式与 HITL 审批均未走查（见 CUJ2 覆盖现状注与批次 #14），"已验证范围"以补齐走查为准；checkpoint/fork 以 0009 持久化契约为前提（state.json 耦合是 0009 §6 已知中危项）——原文称"P0 验收单列"，**实际 P0 无单列验收项**（验证计划与 CUJ 均无 checkpoint/fork 用例，0003 V2 亦未执行）：如实记为未验证缺口，P1 补验收。
 3. **入口收敛**：编排模式（superagent）的全部人际交互收敛到四个入口，无新门户、无第二前端。
 4. **UI 内核零改动**：会话页=工单执行视图、HITL 应答、harness 管理全部复用现有页面；needs-attention 聚合以构建期 app-extension 实现（dashboard 头卡 + nav + 工单页），交付为一个 npm 扩展包。
 5. **门控语义一致**：四个入口执行同一套门控（0001 §7）：门在编排器、消息内容是输入不是权限、凭证三域不混居。
@@ -92,7 +92,7 @@ sequenceDiagram
 
 ## Open Questions
 
-*   **Q1 — input-required 感知的节拍验证**：本文把编排器感知 input-required 定为 Pass 对账检测（§3，D9）。2s 节拍下飞书卡片的端到端延迟（对账≤2s + Attention bridge 出站）是否达标，**待 P1 实测**（飞书通道与卡片是 0001 的 P1 交付；本设计的 P0 attention 出站仅含编排器侧记录与 UI 面）；不达标再议 push 语义扩展（那是 kagent 侧改动）。
+*   **Q1 — input-required 感知的延迟验证**：检测为 push 优先 + Pass 2s 对账兜底（§3，D9 已按平台事实更正）。P1 端到端延迟 = push 即时（常态）或 ≤2s（兜底）+ Attention bridge 出站 + IM 投递，**待 P1 实测**（飞书通道与卡片是 0001 的 P1 交付；本设计的 P0 attention 出站仅含编排器侧记录与 UI 面）；原"push 语义扩展需 kagent 侧改动"的备选已撤销——平台 push 已覆盖 input-required（`push_delivery.go:47`）。
 *   **Q2 — 扩展包到编排器的网络路径**：P1 的 ListAttention 是编排器的只读 gRPC-Web 端点，浏览器直连需要 ingress/oauth2-proxy 路由配置（UI 现在同源 `/api` 只指向 controller，`ui/src/api/transport.ts:1-18`）。P1 落地时定：编排器挂同一 oauth2-proxy 后面 + UI 侧 operation override 指向其 base URL（扩展框架有 base-URL resolver seam，`transport.ts:122-132`）。
 *   **Q3 — 会话列表状态标签**：conversations 列表的 StateTag（`ui/src/components/agent-instances/InstanceTags.tsx`）是否已把 awaiting_input 显示为独立标签，实现时核实；若已显示，P0 的"聚合"就有零成本替代。
 *   **Q4 — share-link 只读旁观**：UI 有 share-link 机制（`X-Share-Token`，`ui/src/api/shareToken.ts`），能否把工单 session 以只读 share 链接发给干系人旁观进度——P2 再议（share-link 是读视图，不开放应答）。
@@ -102,22 +102,24 @@ sequenceDiagram
 ### CUJ 1: 管理员安装 DeepSeek harness（交互模式就绪）
 
 *   **Given**: kagent 集群 substrate 可用；DSH BYO 镜像已在 registry，digest 钉死（0009 §1 契约）。
-*   **When**: 依次 apply ModelConfig（deepseek = Anthropic provider + baseUrl，见 A1）、Harness（`byo:{}` + workload image/command）、Agent（Template ref + HarnessRef）。
+*   **When**: 依次 apply ModelConfig（`deepseek` = Anthropic 变体，`deepseek-openai` = OpenAI 变体——worker 必须绑定后者，见 A1）、Harness（`byo:{}` + workload image/command）、Agent（inline template + HarnessRef——P0 两 Agent 均内联，免多一层 AgentTemplate CR）。
 *   **Then**: UI `/agents` 的 Harnesses tab 列出该 harness；引用它的 agent 出现在**删除确认文案**里（`referenced()` 仅用于确认，不展示常驻引用列表，`HarnessesTab.tsx:78-136`）；开对话即用 DeepSeek 模型；bridge 沙箱内无模型凭证（模型凭证经 egress 网关注入，1006 红线）。
 
 ### CUJ 2: 用户直接与 DSH agent 对话（交互模式，superagent 不在场）
 
 *   **Given**: CUJ 1 完成。
 *   **When**: UI `/agents/:ns/:name` 开对话，或 kagent CLI 发消息。
-*   **Then**: 流式应答、原生 ACP 权限请求→HITL 审批全部照现有 agent 工作（checkpoint/fork 见 Goal 2 注）；UI 对 harness 类型无感知（它只讲 A2A + HITL 扩展头，见 §2 论证）。
+*   **Then**: 流式应答、原生 ACP 权限请求→HITL 审批全部照现有 agent 工作（checkpoint/fork 见 Goal 2 注）；UI 对 harness 类型无感知（它只讲 A2A + HITL 扩展头，见 §2 论证）。**覆盖现状注**：对话往返已走查（README CUJ2 步骤——**非流式** `SendMessage` curl）；**流式（UI 对话/SendStreamingMessage）未走查**；**HITL 审批链未走查**（README CUJ2 步骤无审批步骤，"UI 对 BYO agent 的 HITL 卡片渲染"为 A4 记录的 T9 验证项、无结果记录）——两项均列为待验证，随代码批次 #14 补走查（含一个真流式步骤）。
 
 ### CUJ 3: superagent 工单从外部触发到 UI 旁观（编排模式）
 
 *   **Given**: 0001 P0 运行中（编排器 + evaluator + worker 就位）。
 *   **When**: GitHub issue 里 @agent。
-*   **Then**: Engine 以**服务账号身份**建 Ticket ↔ kagent session ↔ agentfs workspace；UI 会话列表按创建者隔离（`useAgentInstances.ts:11-25`，`all_creators` 视图 403 回退）——编排器建的 session 经 SessionService share（只读链接）发给工单干系人；**工单状态的权威视图在编排器侧**（P1 工单页/ListAttention），chat 页是执行细节视图：进度、流式输出、checkpoint 分隔符（UI 内核代码零改动；Ticket↔session 映射红利，0001 §3）。
+*   **Then**: Engine 以**服务账号身份**建 Ticket ↔ kagent session ↔ agentfs workspace；UI 会话列表按创建者隔离（`useAgentInstances.ts:11-25`，`all_creators` 视图 403 回退）——share 只读链接 **P0 为人工创建**（记录于 README "P0 已接受边界" 节，L144；编排器自动签发列 P1，与 Q4 的 P2 再议互补：P1 自动签发基础能力，P2 再议开放范围）；**工单状态的权威视图在编排器侧**（P1 工单页/ListAttention），chat 页是执行细节视图：进度、流式输出、checkpoint 分隔符（UI 内核代码零改动；Ticket↔session 映射红利，0001 §3）。
 
-### CUJ 4: attention 双面应答（UI 原生 + 飞书推送收敛）
+### CUJ 4: attention 双面应答（UI 原生 + 飞书推送收敛）——**P0 不可达，P1 激活**
+
+> **P0 现状注**：P0 worker 不配置任何受保护 MCP 通道 2 绑定（桥亦不接受带 `Tools` 圈定的绑定，见 A3），"等人"改走 Report `state=waiting` 终态 → 编排器转 needs-attention → 人的新输入随重派送达。本 CUJ 描述的 input-required 双面收敛流在 P1 通道 2 绑定落地后激活；A3 记录了该替代与前置条件。
 
 *   **Given**: worker 发出 input-required（受保护 MCP 通道 2——保原 task 连续的唯一通道，0009 §4）。
 *   **When**: 用户在 UI chat 的 AskUserPrompt 作答（`ui/src/components/chat/AskUserPrompt.tsx:96-135`，A2A 引用原 task）；**或**在飞书卡片回复（P1——飞书通道与卡片是 0001 的 P1 交付；Attention bridge 扇出→引用原 task 送决策）。
@@ -133,9 +135,11 @@ sequenceDiagram
 
 ### 1. DeepSeek harness 三层落地
 
-#### A1 模型层——已有，零改动
+#### A1 模型层——已有，零改动（D8；已被下述更正推翻——见 A1 更正块）
 
-仓库先例（`docs/env.md:61-62`）：ModelConfig `deepseek` = provider **Anthropic** + `baseUrl: https://api.deepseek.com/anthropic` + Secret（`kagent-deepseek`，存 ANTHROPIC_API_KEY）。0009 原型走的是 OpenAI 兼容（`api.deepseek.com/v1`），两条协议 DeepSeek 官方都提供；**P0 取仓库已验证的 Anthropic 变体**（D8）。注：byo-ext PR #2 官方模板（`examples/agent.yaml.tmpl`）给 DSH 配的是 **OpenAI 兼容**变体（provider OpenAI + `apiKeySecretKey: OPENAI_API_KEY`）——两种配对桥都能吃（ModelConfig 对 bridge 是不透明配置），P0 维持 Anthropic 变体因集群已有验证过的 Secret/ModelConfig 零新增；若 DSH 侧 OTLP usage 校验要求特定 provider 配对再按模板切换。不新增 ModelProvider 枚举：枚举改动会波及 API 类型、telemetry 映射、UI 表单，而 baseUrl 覆盖已达成同一效果。
+仓库先例（`docs/env.md:61-62`）：ModelConfig `deepseek` = provider **Anthropic** + `baseUrl: https://api.deepseek.com/anthropic` + Secret（`kagent-deepseek`，存 ANTHROPIC_API_KEY）。0009 原型走的是 OpenAI 兼容（`api.deepseek.com/v1`），两条协议 DeepSeek 官方都提供。
+
+> **2026-11-14 实施期更正（原断言被证伪）**：本文原称"两种配对桥都能吃（ModelConfig 对 bridge 是不透明配置）"并据此让 P0 维持单一 Anthropic 变体——**该断言为假**：DSH 桥的 config guard 硬性只接受 OpenAI 型 ModelConfig（byo-ext `harnesses/deepseek/internal/config/config.go:52-53`：`GetOpenai() == nil` → "DSH BYO requires an OpenAI-compatible ModelConfig"）。照原文计划 #1 执行会产出无法启动的 worker。实际交付为**双 ModelConfig**：保留集群既有 `deepseek`（Anthropic 变体，交互模式/evaluator 等场景可用）+ 新增 `deploy/kagent/modelconfig-deepseek-openai.yaml`（provider OpenAI + `deepseek-chat` + `baseUrl: https://api.deepseek.com/v1`），worker 绑定 `deepseek-openai`（`agent-worker.yaml:18`；根因记录 `README.md:11`）。Anthropic 变体对 **DSH worker** 不可用（对其他消费者仍可用）；若未来桥放开配对再收敛为单变体。D8 决策随之更正：变体由桥的约束决定，非"集群已验证"偏好。不新增 ModelProvider 枚举的论证不变：枚举改动会波及 API 类型、telemetry 映射、UI 表单，而 baseUrl 覆盖已达成同一效果。
 
 #### A2 harness 层——BYO 起步（D7，核心决策）
 
@@ -143,9 +147,9 @@ sequenceDiagram
 
 | | **BYO（P0 选定）** | 一等 `deepseek` 类型（P2 候选） |
 |---|---|---|
-| kagent 仓库改动 | **零** | 8 处（清单见实现计划） |
+| kagent 仓库改动 | **零** | 9 项（清单见实现计划；第 5 项合并 images.go+proto，第 9 项为重生成） |
 | CRD 写法 | `spec.byo:{}` + `workload.image`(digest) + `workload.command`（`harness_types.go:134-135` 强制） | `spec.deepseek:{}`，镜像进 `HarnessImagesConfig` 默认打包 |
-| 能力差异 | 无——BYO 编译器把 command/args 直通、注入 KAGENT_CONFIG_JSON/AgentCard（`translator/byo/compiler.go:84`） | 只是**打包/命名/UX 升级**，不是新运行时 |
+| 能力差异 | 无——BYO 编译器把 command/args 直通、经 bootstrap 契约注入配置（`translator/byo/compiler.go:84`；现网为 `KAGENT_BOOTSTRAP_JSON` bundle，见 A4 契约核对） | 只是**打包/命名/UX 升级**，不是新运行时 |
 | UI 呈现 | Harnesses tab 正常列出、正常删除 | 同左 + 表单可特化 |
 | 结构化输出 | 不可用（非 kagent harness 一律拒绝，`compiler.go:332-334`） | 同样不可用（除非另改编译器） |
 
@@ -155,17 +159,21 @@ sequenceDiagram
 
 #### A3 审批通道对 attention 的硬约束
 
-0009 §4 三通道中，superagent 的 attention 流（0001 §4.2：回复引用原 task 送决策）**只能依赖通道 2（受保护 MCP）**：通道 1（原生 ACP 权限）活不过 DATA 快照/进程替换，通道 3（外部审批服务）不保原 task 连续。落地含义：**worker 的 agentfs/MCP 工具清单里，需要"等人后继续原工单"语义的操作必须走 `requireApproval`**（这是 `MCPToolBinding` 的一等字段，`agenttemplate_types.go:42-48`，可按 `Tools` 圈定范围）；编排模式的 worker template **禁用**会触发通道 1 的 DSH 内置权限（策略=拒绝）——通道 1 请求不产生 input-required 态，D9 的检测对它不可达，唯一安全做法是令其不发生；若因配置漂移仍发生，桥按显式拒绝处理并计入 Report（failed），不做静默等待。交互模式（CUJ 2）不受此限。这一条写进 worker 的 template 约定，是 0001 "bridge 契约"的具体化。
+0009 §4 三通道中，superagent 的 attention 流（0001 §4.2：回复引用原 task 送决策）**只能依赖通道 2（受保护 MCP）**：通道 1（原生 ACP 权限）活不过 DATA 快照/进程替换，通道 3（外部审批服务）不保原 task 连续。
+
+> **2026-11-14 实施期更正（原机制在现桥上不可用）**：本文原要求 P0 worker 用一等字段 `requireApproval: true`（`agenttemplate_types.go:63-67`）圈定"等人后继续"语义、并把通道 1 禁用写进 prompt/权限策略。两点事实推翻原案：① 现桥的 Parse 对**非空 `Tools` 的绑定直接拒绝**（byo-ext `config.go:92-93`："tool selection and forwarded headers are unsupported by DSH ACP"）——"可按 `Tools` 圈定范围"不可用；② P0 worker 实际未设任何 requireApproval 绑定，systemPrompt 亦无通道 1 禁用条款（`agent-worker.yaml:3-5,19-32`）。**P0 实际机制（替代记录）**："等人"走 Report `state=waiting` 终态 → 编排器转 needs-attention → 人的新输入随重派送达（`agent-worker.yaml:27-28`）。CUJ4 的 input-required 双面收敛流因此 P0 不可达，P1 激活；P1 前置条件 = 桥支持带 `Tools` 圈定的 MCP 绑定（或等价机制）。交互模式（CUJ 2）不受此限。
 
 #### A4 打包与分发（出处已锚定）
 
-DSH BYO 镜像源码：上游 `kagent-dev/byo-ext` 仓库的 **PR #2「Add DeepSeek Harness」**（<https://github.com/kagent-dev/byo-ext/pull/2>，分支 `pull/2/head`；本地已取为 `pr-2` 分支检出）。**该 PR 未合入上游 main**——main 只含社区 harness 脚手架（`templates/harness/Dockerfile`），`harnesses/deepseek/`（Go bridge + Node DSH 双运行时，自带 `Dockerfile` 与 `VERIFICATION.md`）仅存在于 PR 分支。镜像从 PR 分支的 `harnesses/deepseek/Dockerfile` 构建，push 到 registry、digest 钉死写进 Harness CR；**构建归属 agent-data-workspace 的流水线**（kagent 仓库零 diff 不受影响）。我们的三份 manifest 以其 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本——该模板同时示范了实际字段名：`apiKeySecret`/`apiKeySecretKey`、`workerPoolRef.name`/`snapshotPolicy.location`。**helm 无需任何改动**——BYO 镜像引用随 CR 走，不进 `HarnessImagesConfig`（那是内置类型默认镜像的机制，`helm/kagent/values.yaml:153-156`）。`Harness.Spec.Env` 只收字面量（secret ref 被显式推迟，`runtime_types.go:8-20`）——与"bridge 零凭证"契约一致，无需放宽。
+DSH BYO 镜像源码：上游 `kagent-dev/byo-ext` 仓库的 **PR #2「Add DeepSeek Harness」**（<https://github.com/kagent-dev/byo-ext/pull/2>，分支 `pull/2/head`；本地已取为 `pr-2` 分支检出）。**该 PR 未合入上游 main**——main 只含社区 harness 脚手架（`templates/harness/Dockerfile`），`harnesses/deepseek/`（Go bridge + Node DSH 双运行时，自带 `Dockerfile` 与 `VERIFICATION.md`）仅存在于 PR 分支。
 
-**与官方 BYO 文档的契约核对（2026-11-14）**：本集群 v1.0.1 实现双 env 契约——`KAGENT_CONFIG_JSON`/`KAGENT_AGENT_CARD_JSON` 为控制器保留 env（`go/core/internal/substrate/actor_template.go:82` 拒绝用户冲突），BYO 编译器产出 ConfigJSON+AgentCard（`translator/byo/compiler.go:85`），与 PR#2 桥**匹配**。官方文档（kagent.dev，main 线）已演进为 `KAGENT_BOOTSTRAP_JSON` + `/config/config.json`、`agent-card.json` + `GetBootstrapConfig`（bundle 256KiB、缓存 `/data/kagent/bootstrap/bundle.pb`）——**升级 kagent 时 PR#2 桥需跟进新契约**（升级契约风险，同 0009 upgrade 契约族）。另两条官方口径与我们已记录一致：BYO 结构化输出被拒（错误串逐字同 `compiler.go:332-334`）；BYO agent card 不声明 HITL 扩展——P0 attention 走 task 态 input-required 不受影响，UI 对 BYO agent 的 HITL 卡片渲染列 T9 验证项。gRPC `:80` + readyz `:8081` 双端口契约与 0009 记载一致。
+> **2026-11-15 构建出处更正（原表述不可复现）**：本文原称"镜像从 PR 分支的 `harnesses/deepseek/Dockerfile` 构建"——**实际 T9 交付镜像（digest `sha256:6dd2a07…`）由仓库外 Dockerfile 构建**：`kagent-dev/.superagent-notes/build/Dockerfile.dsh`（`--target production`，CN 镜像源 + `go mod tidy && go mod vendor` + 本地 kagent replace），完整配方见 `deploy/kagent/README.md:32-41`。即钉死 digest **不对应** PR 分支源码的直接构建，风险表的"源 SHA → digest 对应关系"按 README 台账（源 SHA + 构建配方双记录）维持可审计，而非"分支即配方"。`harness-dsh-byo.yaml:2-3` 注释仍写 `pr-2 @ 19771c8` + 分支 Dockerfile——manifest 注释随代码修复批次更正为 8632d5e + 真实配方。**helm 无需任何改动**——BYO 镜像引用随 CR 走，不进 `HarnessImagesConfig`（`helm/kagent/values.yaml:153-156`）。`Harness.Spec.Env` 只收字面量（secret ref 被显式推迟，`runtime_types.go:8-20`）——与"bridge 零凭证"契约一致，无需放宽。manifest 以 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本（字段名示范：`apiKeySecret`/`apiKeySecretKey`、`workerPoolRef.name`/`snapshotPolicy.location`）。
+
+**与官方 BYO 文档的契约核对（2026-11-14 核对，2026-11-15 更正现状描述）**：原文曾称"本集群 v1.0.1 实现双 env 契约（KAGENT_CONFIG_JSON/KAGENT_AGENT_CARD_JSON）与 PR#2 桥匹配，bootstrap 为未来升级风险"——**现状恰相反**：PR 树的 go/ 与 v1.0.1（`558e3d76`）逐文件一致，但已是 **bootstrap 契约**——控制器注入 `KAGENT_BOOTSTRAP_JSON`（`go/api/bootstrap/bundle.go:20`；`go/core/internal/substrate/actor_template.go:94`），双 env 名仅作为用户冲突保留字存在（`actor_template.go:82`）；byo-ext pr-2 HEAD（`8632d5e`，原文记录的 `19771c8` 为旧 env 契约时代的基线，README 台账已标注）的桥同走 bootstrap、不再注入旧双 env（`harnesses/deepseek/cmd/main.go:50-52`）。即**契约已对齐，无遗留升级步骤**；真正的升级风险变为：kagent bootstrap bundle 演进（字段/缓存路径）与桥的解析需要同步——升级前按官方 BYO 文档重验。另两条官方口径与我们已记录一致：BYO 结构化输出被拒（错误串逐字同 `compiler.go:332-334`）；BYO agent card 不声明 HITL 扩展——P0 attention 走 task 态 input-required 不受影响（P0 实际由 waiting 终态替代，见 A3），UI 对 BYO agent 的 HITL 卡片渲染列 T9 验证项。gRPC `:80` + readyz `:8081` 双端口契约与 0009 记载一致。
 
 #### A5 工作区物化与上下文可达（D10 定案，详设见 [0003](./0003-工作区物化与上下文可达性.md)）
 
-工单工作目录的代码物化采用**编排器预置**：Engine accept 后编排器（持 GitHub 凭证）浅克隆 `--depth 1` 物化进工单工作区，worker 离线做本地 git（DSH BYO 镜像已含 git/ripgrep/bash，byo-ext `Dockerfile:15`）产出 `format-patch`，**编排器取回并 push/建 PR**（凭证只在编排器，worker 无凭证且 remote URL 不嵌 token）。worker 自取 clone 为 P2 演进——前提是 EgressPolicy 放行 `github.com:443`（`agent_types.go:65` 原生扩展点）+ egress 层 git 凭证注入（新机制）；github.com 在 BYO 编译期 egress 白名单之外（`byo/compiler.go:77-79`），当前网络层即禁止。上下文可达性红线：跨 agent 运行时上下文**不共享**（仅按值注入/编译期 subagent），跨 actor 经 DATA 恢复**可达**。验证场景 V1–V7 见 0003。
+工单工作目录的代码物化采用**编排器预置**：Engine accept 后编排器（持 GitHub 凭证）浅克隆 `--depth 1` 物化进工单工作区（文本通道，排除 .git/二进制/symlink），worker **纯文件编辑**（无 git、无凭证——0003 实施期改道：agentfs 通道仅文本，原"worker 离线本地 git + format-patch"路线 A 已否决，见 0003 决策记录），**编排器读回全工作区、确定性 commit 并 push/建 PR**（凭证只在编排器，worker 无凭证且 remote URL 不嵌 token）。worker 自取 clone 为 P2 演进——前提是 EgressPolicy 放行 `github.com:443`（`agent_types.go:65` 原生扩展点）+ egress 层 git 凭证注入（新机制）；github.com 在 BYO 编译期 egress 白名单之外（`byo/compiler.go:77-79`），当前网络层即禁止。上下文可达性红线：跨 agent 运行时上下文**不共享**（仅按值注入/编译期 subagent），跨 actor 经 DATA 恢复**可达**。验证场景 V1–V7 见 0003。
 
 ### 2. 对外使用面：两模式 × 四入口
 
@@ -206,11 +214,11 @@ flowchart LR
 | kagent UI | 两模式 | 交互对话；旁观工单执行；回答 HITL；管 harness/模板/模型/actor；P1 聚合卡与工单页 | 现有页面 + §4 扩展包 | 扩展包（构建期） |
 | CLI / A2A API | 两模式 | 交互对话；程序化派发与集成（编排器与 CLI 同地位，0001 §5） | A2A SendMessage/push | 零改动 |
 
-**UI harness 无感的论证**（"尽量继续使用它的 UI"的承重墙）：UI 聊天走 `A2AService/SendStreamingMessage` + `A2A-Extensions: hitl/v1` 头（`ui/src/api/chat/a2aGrpcChatClient.ts:583`、`ui/src/api/chat/hitl.ts:37-40`），不问 harness 是谁；harness 差异被 Gateway/编译器吸收在 `KAGENT_CONFIG_JSON` 里。因此：**任何新 harness（包括未来的 P2 一等 deepseek）在交互模式下对 UI 的成本恒为零**；只有编排模式的聚合视图（工单、needs-attention）是 UI 不认识的新领域对象，走扩展槽补。
+**UI harness 无感的论证**（"尽量继续使用它的 UI"的承重墙）：UI 聊天走 `A2AService/SendStreamingMessage` + `A2A-Extensions: hitl/v1` 头（`ui/src/api/chat/a2aGrpcChatClient.ts:583`、`ui/src/api/chat/hitl.ts:37-40`），不问 harness 是谁；harness 差异被 Gateway/编译器吸收在服务端配置注入里（现网 = `KAGENT_BOOTSTRAP_JSON` bootstrap bundle——A4 契约核对，原文的 `KAGENT_CONFIG_JSON` 为旧契约名）。因此：**任何新 harness（包括未来的 P2 一等 deepseek）在交互模式下对 UI 的成本恒为零**；只有编排模式的聚合视图（工单、needs-attention）是 UI 不认识的新领域对象，走扩展槽补。
 
 ### 3. attention 的检测与双面应答（补 0001 的机制缺口）
 
-**检测（D9）**：0001 §4.2 的 "GW → O: Attention bridge 捕获" 未定机制，且 A2A push 只承诺终态（0004）。本文定：**Pass 对账检测**——编排器 2s 节拍的 reconcile（0001 D2 已有）在扫描 running Assignment 时顺带过滤 `input-required` 态 task，发现即入 attention 队列。零新 push 语义、复用既有节拍与幂等记账；代价是感知延迟 ≤ 2s + bridge 出站（Q1）。
+**检测（D9，2026-11-15 按平台事实更正）**：原文依据外部笔记前提"A2A push 只承诺终态"把检测定为**仅** Pass 对账——该前提与本仓库平台实现不符：push 回调在 `input-required`/`auth-required` 即触发（`docs/architecture/a2a-push-notifications.md:42-44`、`push_delivery.go:47`），且编排器交付代码已按此处理（`dispatcher.go:357` 将 input-required push 观察记 needs-attention；`push_test.go:47` 明确断言该路径并引用本节）。**更正后的 D9**：**push 优先检测**（input-required push 事件即时到达 push 接收器）+ **Pass 2s 对账兜底**（push 丢失时的 backstop，语义不变）。Q1 的延迟预算随之改写：感知延迟 = push 即时（常态）或 ≤2s（兜底路径）+ bridge 出站；"push 语义扩展需 kagent 侧改动"的备选撤销——平台已支持，无需任何 kagent 改动。
 
 ```mermaid
 sequenceDiagram
@@ -223,7 +231,8 @@ sequenceDiagram
 
     WA->>GW: input-required (通道 2: 扣住调用已存档, DSH 已 stop)
     GW->>GW: task 态 = input-required (待决审批单例)
-    O->>GW: Pass 对账 ListTasks (≤2s)
+    GW--)O: push 事件 (input-required 即推, 常态路径)
+    O->>GW: Pass 对账 ListTasks (≤2s, push 丢失兜底)
     O->>O: 入 attention 队列 (waitsForPerson)
     par UI 面 (免费, 现有 HITL)
         U->>GW: chat 页 AskUserPrompt 作答 (引用原 task)
@@ -235,7 +244,7 @@ sequenceDiagram
     WA->>GW: 执行存档调用, 新原生 turn 续跑
 ```
 
-**收敛与幂等**：待决审批是 task 上的单例；"先到先得 + 后到显式失败"不是天然性质，而是 Gateway 审批注册的机制保证（`go/adk/pkg/a2a/hitl.go:578` 只认 task 态与待决审批；PrepareSend/RevokeSend 原子化引用审批的注册/撤销）——双面竞争纳入验证计划的 e2e。**答侧授权**：飞书决策人须为该 Ticket 订阅 Thread 的成员（0001 订阅扇出语义）；Gateway 不验提交者身份（`hitl.go:578` 只验 task 态），身份校验是编排器 Attention bridge 的职责（飞书 user id 映射进审计记录）。**卡片失效刷新（P1，非顺带）**：Attention bridge 须持久化卡片 ID（Store.attention），审批被消费后经飞书卡片更新 API 置灰；更新失败最多重试一次，以编排器状态为准——P0 不做卡片刷新，卡片文案自带"以编排器状态为准"提示。
+**收敛与幂等**：待决审批是 task 上的单例；"先到先得 + 后到显式失败"不是天然性质，而是 Gateway 审批注册的机制保证（`go/adk/pkg/a2a/hitl.go:578` 只认 task 态与待决审批；PrepareSend/RevokeSend 原子化引用审批的注册/撤销）——双面竞争纳入验证计划的 e2e。**答侧授权（P1 待显式设计）**：原表述"飞书决策人须为该 Ticket 订阅 Thread 的成员"依赖跨 Source 身份解析——而这正是 0001 非目标第 3 条排除的能力（"不做跨 Source 身份映射"），且 0001 的 Subscription 是 Ticket↔Thread 关联、无"成员名册"概念，原表述在现语义下不可实现。Gateway 不验提交者身份（`hitl.go:578` 只验 task 态）是事实。P1 attention 落地时需显式择一：per-thread 答侧允许名单（编排器 policy 内）、或放宽该非目标做受控身份映射、或接受"持有链接即可答"并记录为已知放宽——三选一的设计归 P1（本文不预设）。**卡片失效刷新（P1，非顺带）**：Attention bridge 须持久化卡片 ID（Store.attention），审批被消费后经飞书卡片更新 API 置灰；更新失败最多重试一次，以编排器状态为准——P0 不做卡片刷新，卡片文案自带"以编排器状态为准"提示。
 
 ### 4. UI 复用与扩展
 
@@ -253,7 +262,7 @@ sequenceDiagram
 
 1. **dashboard 头卡**：槽 `app_dashboard_dashboardOverview_summaryGrid_leadingCard`——needs-attention 计数 + 列表入口。
 2. **nav 注入 + 工单页**：扩展路由贡献一个只读工单列表（Ticket 状态/等待原因/归属），点击跳 `conversation` 页。
-3. **数据路径**：编排器新增只读 `ListAttention` gRPC-Web 端点（**编排器是 waitsForPerson 谓词的唯一所有者**——纯扫 A2A ListTasks 拿不到"此后无人发言"语义，故不走 UI 侧扫描）。**读侧授权**：已认证（oauth2-proxy）用户可见 needs-attention 计数；工单明细限编排器 policy 的 operator 名单——与写侧门控（0001 §7）对偶。扩展包数据接入用 operation override 携带**自有 transport** 指向编排器：全局 base-URL resolver 是单值（`transport.ts:110-132`）不能改指，正确组装是扩展的 `operations` override 自带 transport（`extensionApi.ts:75`）（Q2）。
+3. **数据路径**：编排器新增只读 `ListAttention` gRPC-Web 端点（**编排器是 waitsForPerson 谓词的唯一所有者**——纯扫 A2A ListTasks 拿不到"此后无人发言"语义，故不走 UI 侧扫描）。**读侧授权**：已认证（oauth2-proxy）用户可见 needs-attention 计数；工单明细限编排器 policy 的 operator 名单——与写侧门控（0001 §7）对偶。扩展包数据接入用 operation override 携带**自有 transport** 指向编排器：全局 base-URL resolver 是单值（`transport.ts:110-132`）不能改指，正确组装是扩展的 `operations` override 自带 transport（`ui/src/appExtensions/api/extensionApi.ts:75`）（Q2）。
 4. **注册**：扩展包在 `ui/src/appExtensions/activeExtensions.ts` 注册——这是对 UI 内核的**唯一一处**触碰，且是扩展框架设计的注册点。该提交由本 fork 的 exp 分支维护（随上游演进定期 rebase），扩展稳定后考虑上游 PR。
 
 **明确不做**：运行时插件加载；替换 shell/主题；把 UI 做成触发面（触发留在 GitHub/飞书——UI 里"直接对话"已经覆盖交互模式）；UI 侧策略编辑。
@@ -263,7 +272,7 @@ sequenceDiagram
 ### Alternative A: 立即做一等 `deepseek` harness 类型
 
 *   **Pros**: CRD 命名进 ExactlyOneOf、默认镜像进发布包、UI 表单可特化、0009 的运行时拒绝可前移为编译期校验。
-*   **Cons**: kagent 仓库 8 处改动（API 类型+CEL、编译器注册表与 switch、新 translator 包、reconciler 接线、images.go、proto `HarnessImagesConfig`、helm helpers、release 校验、gRPC 面），且每处都要重生成与回归；而 BYO 已被 e2e 与 0009 集群验收覆盖。
+*   **Cons**: kagent 仓库 9 项改动（实现计划逐项清单：API 类型+CEL、编译器注册表与 switch、新 translator 包、reconciler 接线、images.go+proto `HarnessImagesConfig`（合并计 1 项）、helm helpers、release 校验、gRPC 面、deepcopy/CRD 重生成），且每处都要回归；而 BYO 已被 e2e 与 0009 集群验收覆盖。
 *   **Reason for Rejection**: Rejected by author——P0 的目标是验证使用面，不是打包面；一等类型只是便利性升级，已设触发条件（A2 表）进 P2。
 
 ### Alternative B: 独立 Panel 前端（0001 "Panel (P1)" 的字面实现）
@@ -298,7 +307,7 @@ sequenceDiagram
 
 | 兼容层 | 保 | 手段 |
 |---|---|---|
-| 语义/行为（Trigger 确定性、cursor -5s、admission strength、waitsForPerson/followupOwners、Engine 唯一写者、Outbox receipt） | ✅ | 规格钉版 + 符合性测试：每条不变量落成 Go 测试（given-when-assert-that），测试名即规格条款 |
+| 语义/行为（Trigger 确定性、cursor -5s、admission strength、waitsForPerson/followupOwners、Engine 唯一写者、Outbox receipt） | ✅ | 规格钉版 + 符合性测试：每条不变量落成 Go 测试（given-when-assert-that），测试名即规格条款。**符合性现状注（2026-11-15）**：waitsForPerson/followupOwners/receipt/Trigger 幂等已有对应单测；"Engine 唯一写者"在交付布局下由 Store 单事务方法 + 实例 advisory lock 保障而非组件级断言（0001 §9.2），符合性测试以事务语义测试覆盖 |
 | 外部表面（GitHub 评论 marker、飞书消息语义、deterministic trigger ID 方案） | ✅ | 沿用原型约定——同一 Thread 历史可被任一实现消费 |
 | 代码/内部状态（TS 实现、Store schema、DSH inbox 进程接口） | ❌ | 正是被 kagent 替代的机制，刻意不保 |
 
@@ -324,20 +333,21 @@ sequenceDiagram
 | Pass 2s 对账随 agent×task 规模增长的成本 | P0 单 agent 规模小；P2 引入增量游标/只扫活跃 task |
 | attention 队列老化（无人理的工单） | waitsForPerson 已定义挂起语义；P2 加老化升级通知 |
 | 飞书 API 限流（卡片更新/扇出） | 批量与去抖；卡片失效刷新失败不重试超过一次（§3） |
-| Anthropic 兼容层漂移（DSH 侧校验要求特定配对） | A1 已留 OpenAI 兼容切换路径（官方模板同款配对） |
-| PR #2 未合入上游（rebase/强推/集成形态变更） | 构建记录源 SHA（当前 `19771c8`）→ 镜像 digest 对应关系；显式重同步不自动漂移；升级前按 0009 upgrade 契约重验持久化格式 |
-| kagent 升级：BYO 契约演进（双 env → KAGENT_BOOTSTRAP_JSON bootstrap bundle，main 线已切换） | 升级前核对官方 BYO 文档与 PR#2 桥实现（0002 A4 契约核对节）；台账重验 |
+| DSH 桥只吃 OpenAI 型 ModelConfig（原"Anthropic 兼容层漂移"风险已成事实，非风险） | 已交付双 ModelConfig：worker 绑 `deepseek-openai`（A1 更正）；桥放开配对后再收敛单变体 |
+| PR #2 未合入上游（rebase/强推/集成形态变更） | 构建记录源 SHA（当前 `8632d5e`；`19771c8` 为旧 env 契约基线，README 台账已标注）→ 镜像 digest 对应关系；显式重同步不自动漂移；升级前按 0009 upgrade 契约重验持久化格式 |
+| kagent 升级：bootstrap bundle 契约演进（字段/缓存路径变化） | 升级前核对官方 BYO 文档与 PR#2 桥实现（A4 契约核对节——现网已是 bootstrap 契约，无"双 env→bootstrap"迁移步骤）；台账重验 |
+| **orchestrator 入站面无认证（P0 已接受边界，2026-11-15 补记）**：A2A push 接收器（`/a2a/push`，驱动 ticket 终态/Report 解析/PR 文案）与 admin retry/stop HTTP 面均无请求认证——依赖集群边界（ClusterIP、无入站暴露）+ 单副本；伪造的集群内 POST 可终结工单/注入 Report 文本进 PR 正文 | P0 接受（与 push.go:18-21 代码注释一致）；硬化项（push 签名 JWT 验证、admin 鉴权、NetworkPolicy）列代码修复批次；非 dev 集群部署前必须落地 |
 
 --------------------------------------------------------------------------------
 
-### Additional Resources
+## Additional Resources
 
 *   [0001-superagent-on-kagent-编排层设计](./0001-superagent-on-kagent-编排层设计.md)（编排层，本文的上游）
 *   `0009 — DSH BYO 集成与执行链`（BYO 契约/三审批通道/红线）
 *   byo-ext PR #2（DSH BYO 桥源码与官方 manifest 模板，未合入上游 main）：https://github.com/kagent-dev/byo-ext/pull/2（本地已取 `pr-2` 分支）
 *   kagent 仓库实读（2026-11-14）：`go/api/v1alpha3/harness_types.go`、`go/core/internal/translator/compiler.go`、`go/core/internal/controller/reconciler.go`、`ui/src/`（router/api/appExtensions）、`docs/env.md`
 
-### Future Improvements
+## Future Improvements
 
 *   **The idea**：P2 一等 harness 类型若触发，把 0009 的 state.json↔原生日志耦合校验（0009 §6 中危项）一并前移进编译器 startup check。
 
@@ -347,22 +357,24 @@ sequenceDiagram
 
 ### Target Files to Create/Modify
 
-**本仓库（fork 分支 `exp/deepseek-superagent`，P0）**——2026-11-14 决定：部署清单与设计稿同分支演进；agent-data-workspace 仅存文档档。对上游的"零改动"指产品代码；`deploy/` 新增清单随本分支走。
+**本仓库（集成分支 `int/superagent-p0`，P0；docs 源线 `exp/deepseek-superagent`）**——2026-11-14 决定：部署清单与设计稿同分支演进；agent-data-workspace 仅存文档档。对上游的"零改动"指产品代码；`deploy/` 清单、`orchestrator/` 模块（0001 §9.1）与 docs 随本分支走。
 
-#### 1. `deploy/kagent/modelconfig-deepseek.yaml` (Create)
+#### 1. `deploy/kagent/modelconfig-deepseek.yaml` + `modelconfig-deepseek-openai.yaml` (Create)
 
-*   **Type / Scope**: k8s manifest（ModelConfig + Secret 引用模板）。
-*   **Proposed Changes**: Anthropic provider + `baseUrl: https://api.deepseek.com/anthropic` + `apiKeySecret`/`apiKeySecretKey`（实际字段名；byo-ext 模板同款键位，provider/baseUrl 换 Anthropic 变体）；model 取集群现值（`deepseek-flash`，env.md）；Secret 值不入库，README 指向创建命令。
+*   **Type / Scope**: k8s manifest（ModelConfig ×2 + Secret 引用模板）。
+*   **Proposed Changes**: `deepseek` = Anthropic provider + `baseUrl: https://api.deepseek.com/anthropic`；`deepseek-openai` = OpenAI provider + `deepseek-chat` + `baseUrl: https://api.deepseek.com/v1`——**worker 必须绑定后者**（桥 config guard 只吃 OpenAI 型，A1 更正；此为实施期新增，不在原计划）。均含 `apiKeySecret`/`apiKeySecretKey`（实际字段名；byo-ext 模板同款键位）；Secret 值不入库——创建指引现状：manifest 注释引用 `env.md`（外部分支），**README 无 `kubectl create secret` 命令**（补命令列代码修复批次）。
 
 #### 2. `deploy/kagent/harness-dsh-byo.yaml` (Create)
 
 *   **Type / Scope**: k8s manifest（Harness CR）。
-*   **Proposed Changes**: `spec.byo:{}` + `workload.image`（digest 钉死占位）+ `workload.command: [/usr/local/bin/kagent-dsh-byo]` + `env` 字面量白名单 + `substrate.workerPoolRef.name`/`snapshotPolicy.location`（实际键名；值按 env.md 部署惯例：`kagent-default` / 既有快照位置）。**以 byo-ext PR #2 的 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本**（provider/baseUrl 按本文 A1 换 Anthropic 变体）。零 CRD 扩展。
+*   **Proposed Changes**: `spec.byo:{}` + `workload.image`（digest 钉死占位）+ `workload.command: [/usr/local/bin/kagent-dsh-byo]` + `env` 字面量白名单（P0 交付为空） + `substrate.workerPoolRef.name`/`snapshotPolicy.location`（实际键名；值按 env.md 部署惯例：`kagent-default` / 既有快照位置）。**以 byo-ext PR #2 的 `harnesses/deepseek/examples/agent.yaml.tmpl` 为蓝本**（provider/baseUrl 配对随 A1 更正：模型配对在 ModelConfig 侧解决（worker 绑 `deepseek-openai`），Harness CR 本身不携带 provider/baseUrl）。零 CRD 扩展。
 
 #### 3. `deploy/kagent/agent-worker.yaml`、`agent-evaluator.yaml` (Create)
 
 *   **Type / Scope**: k8s manifest（Agent CR ×2）。
-*   **Proposed Changes**: worker = **inline template** + HarnessRef(dsh-byo)（P0 内联，免多一个 AgentTemplate CR），tools 绑定 agentfs 的 RemoteMCPServer（`MCPToolBinding.server`，kind=RemoteMCPServer），"等人后继续"语义的操作用一等字段 `requireApproval: true`（`agenttemplate_types.go:42-48`），A3 的通道 1 禁用写进 prompt/权限策略；evaluator = HarnessRef(`kagent-default`——1.0.1 onboarding 内置 kagent harness，env.md 已录）+ inline template + `outputSchema` 结构化 Decision（`agenttemplate_types.go:194`；`compiler.go:332-334` 使其必须用 kagent harness）。`Harness.Spec.Env` P0 置空（bridge 无需额外字面量），待需求出现再加。
+*   **Proposed Changes**: worker = **inline template** + HarnessRef(dsh-byo)（P0 内联，免多一个 AgentTemplate CR），tools 绑定 agentfs 的 RemoteMCPServer（`MCPToolBinding.server`，kind=RemoteMCPServer）；~~"等人后继续"操作用一等字段 `requireApproval: true`（`agenttemplate_types.go:63-67`）+ 通道 1 禁用写进 prompt~~——**实施期变更（A3 更正）**：现桥拒绝非空 `Tools` 圈定，P0 worker 不设 requireApproval，"等人"走 Report `state=waiting` 终态 + 编排器 needs-attention；通道 2/requireApproval 列 P1（前置=桥支持 Tools 圈定）。evaluator = HarnessRef(`kagent-default`——1.0.1 onboarding 内置 kagent harness，env.md 已录）+ inline template + `outputSchema` 结构化 Decision（`agenttemplate_types.go:194`；`compiler.go:332-334` 使其必须用 kagent harness）。`Harness.Spec.Env` P0 置空（bridge 无需额外字面量），待需求出现再加。
+*   **evaluator prompt（2026-11-15 已对齐）**: 原交付 prompt 宣称输入含 "Trigger 批次/Thread 快照/Ticket 历史" 而 wire 只发单 Trigger（偏离记录见 git 历史）——prompt 已改写为单 Trigger 形态并注明 P2 放宽路径（批次 #3 落地）。
+*   **交付补充（不在原目标清单，实施期新增）**: `deploy/kagent/orchestrator.yaml`（Deployment+Service+ConfigMap）、`deploy/kagent/e2e-v1.sh`、`orchestrator/cmd/fakegithub`、`orchestrator/` 全模块——收编记录见 0001 §9.1 与本文 A1 更正。
 
 **本仓库同分支（P1）**——编排器代码亦落本 fork 探索分支
 
@@ -388,16 +400,16 @@ sequenceDiagram
 8. `go/core/internal/grpcserver/harness.go` — gRPC 面名字（:21-25）。
 9. deepcopy/CRD YAML 重生成（`make -C go generate`，`helm/kagent-crds/templates/api.kagent.dev_harnesses.yaml` 的 CEL :256-262）。
 
-### Verification Plan
+## Verification Plan
 
-*   **Compilation/Build**: `make -C go build`（若走 P2）；DSH BYO 镜像构建（记录源 SHA `19771c8` → 镜像 digest 对应关系，见风险表）；UI `yarn build`（仓库为 yarn 4.9.0，`ui/package.json:6`）。
-*   **Unit Tests**: 编排器 `ListAttention`/waitsForPerson 语义（given-when-assert-that，`.agents/skills/given-when-assert-that/SKILL.md`）；attention 检测的 Pass 对账用例（input-required 进队、审批消费后出队、双面竞争后到拒绝、通道 1 请求被显式拒绝路径）。
-*   **E2E/Integration**: 在本 fork 分支以 `make -C go e2e` 复用 BYO e2e 模式（`go/core/test/e2e/harness_test.go:20-30`）跑三份 manifest——测试基建改动只在本分支，不进上游；CUJ1–CUJ5 手动走查清单；扩展包 Playwright（`yarn test:pw`）。
+*   **Compilation/Build**: `make -C go build`（若走 P2）；DSH BYO 镜像构建（记录源 SHA `8632d5e` → 镜像 digest 对应关系，见风险表）；UI `yarn build`（仓库为 yarn 4.9.0，`ui/package.json:6`）。
+*   **Unit Tests**: P0 已交付 `orchestrator/` 13 包单测（given-when-assert-that，`.agents/skills/given-when-assert-that/SKILL.md`），PG 语义测试由 `DATABASE_URL` 驱动；`ListAttention`/attention 对账用例随 P1 交付（input-required 进队、审批消费后出队、双面竞争后到拒绝、通道 1 显式拒绝路径）。
+*   **E2E/Integration（2026-11-15 更正：形态已偏离原计划并接受，`README.md:145` 有记录）**: 原计划"以 `make -C go e2e` 复用 BYO e2e 模式跑三份 manifest"未执行；实际交付为 `deploy/kagent/e2e-v1.sh` + `orchestrator/cmd/fakegithub`（fake GitHub 面 + 本地编排器进程），go e2e 套件零改动。手动走查现状：README 清单只覆盖 CUJ1/CUJ2；**CUJ3 无任何已记录走查**（会话列表旁观/all_creators 视图步骤缺，随代码修复批次补走查记录）；扩展包 Playwright（`yarn test:pw`）随 P1。
 *   **Latency 验证**: Q1 实测（P1）input-required→飞书卡片 P95 ≤ 5s；超标触发 push 语义扩展讨论（kagent 侧改动，需另立项）。
 
 --------------------------------------------------------------------------------
 
-### 附录：Claims & Evidence（承重主张 → 锚点 → 验证状态）
+## 附录：Claims & Evidence（承重主张 → 锚点 → 验证状态）
 
 行号基线：kagent v1.0.1（`558e3d76`），验证日期 2026-11-14（EGM 全量评审逐条核验）。
 
@@ -410,7 +422,7 @@ sequenceDiagram
 | UI harness 无感（A2A 流式 + HITL 扩展头） | `ui/src/api/chat/a2aGrpcChatClient.ts:583`、`ui/src/api/chat/hitl.ts:37-40` | ✅ |
 | HITL 应答组件引用原 task 提交 | `ui/src/components/chat/AskUserPrompt.tsx:96-135` | ✅ |
 | 审批单例/串行化点 | `go/adk/pkg/a2a/hitl.go:578` + Gateway PrepareSend/RevokeSend | ✅（评审补锚） |
-| MCP 绑定一等 requireApproval 字段 | `go/api/v1alpha3/agenttemplate_types.go:42-48` | ✅ |
+| MCP 绑定一等 requireApproval 字段 | `go/api/v1alpha3/agenttemplate_types.go:63-67`（2026-11-15 更正锚点：原 :42-48 有偏移） | ✅（字段存在；注：DSH 桥现拒绝非空 `Tools` 圈定——`config.go:92-93`，见 A3） |
 | 13 个构建期扩展槽 | `ui/src/appExtensions/extensionPoints.ts:11-25` | ✅ |
 | 会话列表按创建者隔离 | `ui/src/api/hooks/useAgentInstances.ts:11-25` | ✅（评审发现→F7） |
 | HarnessesTab referenced() 仅用于删除确认 | `ui/src/pages/agents/HarnessesTab.tsx:78-136` | ✅（F6） |
@@ -418,9 +430,9 @@ sequenceDiagram
 | substrate 字段名 | `go/api/v1alpha3/runtime_types.go:33-41` | ✅（IR-2） |
 | builtin-harness-images.json 为发布期生成物 | `.gitignore:211`、`Makefile:455-457` | ✅（IR-3） |
 | UI 包管理器 yarn 4.9.0 | `ui/package.json:6` | ✅（IR-4） |
-| transport 全局单值 / 扩展 operations override | `ui/src/api/transport.ts:110-132`、`ui/src/api/extensionApi.ts:75` | ✅（IR-5） |
-| DSH 契约/三审批通道/零凭证 | byo-ext PR #2 `harnesses/deepseek/`（pr-2 分支，`19771c8`） | ✅（0009 + 本地检出） |
-| Anthropic 兼容变体可用 | `docs/env.md:61-62` | ✅（集群已验证） |
+| transport 全局单值 / 扩展 operations override | `ui/src/api/transport.ts:110-132`、`ui/src/appExtensions/api/extensionApi.ts:75` | ✅（IR-5；2026-11-15 更正路径：原引 `ui/src/api/extensionApi.ts` 不存在） |
+| DSH 契约/三审批通道/零凭证 | byo-ext PR #2 `harnesses/deepseek/`（pr-2 分支，HEAD `8632d5e`；`19771c8` 为旧 env 契约基线） | ✅（0009 + 本地检出） |
+| ~~Anthropic 兼容变体可用~~（对 DSH worker **不成立**） | byo-ext `harnesses/deepseek/internal/config/config.go:52-53`（OpenAI-only guard）；交付 `modelconfig-deepseek-openai.yaml` | ❌ 原断言已证伪并更正（A1，2026-11-15）；Anthropic 变体仅对非 DSH 消费者可用 |
 
 --------------------------------------------------------------------------------
 

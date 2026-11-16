@@ -1,0 +1,261 @@
+# superagent-on-kagent P0 — orchestrator Service + Deployment + policy ConfigMap（T1 骨架 / T9 全链路收口）
+#
+# 设计依据：docs/designs/0001 D5/D6（独立 schema、单副本 Deployment）、§6（Store 事务纪律）、
+# docs/designs/0003（V1 全链路：accept→物化→派工→交付）。
+# 镜像由构建流水线产出后以 digest 钉死替换（与 harness 清单同一台账纪律）。
+# 占位符在 apply 前由 envsubst 代入（见 README.md）：
+#   ${ORCH_IMAGE}                编排器镜像 digest 钉死形态（构建台账）
+#   ${POLICY_REPO}               Gate 允许的 GitHub 仓库（owner/name）
+#   ${GITHUB_SOURCE_REPO}        Source 轮询的仓库；置空整个 --github-source 对 = 关闭 Source（空转模式）
+# DATABASE_URL / GITHUB_TOKEN 以 env 注入（Secret 引用），不进容器 argv——
+# 编排器侧缺省回退读同名环境变量，pod spec 不出现凭证。
+---
+# The pod identity for the postgres pod-certificate signer whitelist
+# (README: --postgres-client=kagent/superagent-orchestrator=...). No RBAC
+# rules: the SA exists only so kubelet admission can resolve the identity
+# and the signer can mint the kagent_owner_user certificate (PR #11 review,
+# Required — the Deployment referenced an SA no manifest created).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superagent-policy
+  namespace: kagent
+  labels:
+    app.kubernetes.io/part-of: superagent-on-kagent
+data:
+  # 仓库名单：允许触发工单的 GitHub 仓库（owner/name）
+  repos.json: |
+    {"repositories": ["${POLICY_REPO}"]}
+  # 发送者 admission 表：explicit = @ 即显式授权；inferred = 可研判；denied = 显式拒绝
+  admission.json: |
+    {"senders": [{"id": "${POLICY_SENDER}", "strength": "explicit"}]}
+  # bot 名单：bot 评论不视作人类触发（防自触发环）
+  bots.json: |
+    {"bots": ["kagent-bot[bot]"]}
+---
+# push receiver 的集群内入口：--push-base-url（http://superagent-orchestrator.kagent.svc:8080）
+# 与容器 --listen-addr :8080 经本 Service 对齐，网关的任务终态回调才能到达
+# /a2a/push（docs/designs/0001 D2；缺 Service 时推送地址集群内不可解析）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  selector:
+    app.kubernetes.io/name: superagent-orchestrator
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  # P0 单副本：实例锁（PG advisory lock）拒绝第二个实例，防止双跑/迁移竞态
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: superagent-orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: superagent-orchestrator
+        app.kubernetes.io/part-of: superagent-on-kagent
+    spec:
+      # Pod 证书认证：postgres signer 白名单绑定该 SA（见 README 部署节）
+      serviceAccountName: superagent-orchestrator
+      # 本仓库对自有工作负载强制执行的安全基线（helm/kagent/tests/
+      # security-context_test.yaml 同款；PR #11 review, Required）。镜像
+      # USER 65532:65532 已非 root，此处为声明式收紧；readOnlyRootFilesystem
+      # 需要下面的 /tmp emptyDir（克隆落点 os.MkdirTemp）。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: orchestrator
+          # 占位：以构建台账 digest 替换（源 SHA → digest）
+          image: ${ORCH_IMAGE}
+          args:
+            - --schema
+            - orchestrator
+            - --policy-dir
+            - /etc/orchestrator/policy
+            - --listen-addr
+            - :8080
+            # T2 摄入链：轮询该仓库的 issue 评论（占位为空时删除这对 flag = 关闭 Source）
+            - --github-source
+            - ${GITHUB_SOURCE_REPO}
+            - --github-poll-interval
+            - 60s
+            # T4 研判链：evaluator Agent 经 A2A Gateway invoke（kagent harness + outputSchema）
+            - --a2a-gateway-url
+            - http://kagent-controller.kagent.svc:8083
+            - --evaluator-agent
+            - superagent-evaluator
+            - --eval-interval
+            - 5s
+            # T6 推进链：派工 + push 回调 + 2s 对账（push-base-url 必须是 Gateway 可达的编排器地址）
+            - --worker-agent
+            - superagent-worker
+            - --push-base-url
+            - http://superagent-orchestrator.kagent.svc:8080
+            - --pass-interval
+            - 2s
+            - --dispatch-start-deadline
+            - 10m
+            # T5/T7/T9 工作区链：agentfs 桥物化工单工作区（accept 后、派工前）+ 交付读回
+            - --workspace-mcp-endpoint
+            - http://agentfs.kagent.svc:9765/mcp
+            - --workspace-base-branch
+            - ${WORKSPACE_BASE_BRANCH}
+            - --github-git-url
+            - ${GITHUB_GIT_URL}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # 集群 PostgreSQL 为 TLS-only + pod 证书认证（hostssl ... cert）：
+            # 复用 helm 安装期产出的 owner 连接串（含 sslmode=verify-full 与
+            # /run/postgres.podcert.ate.dev 客户端证书路径），配合下方
+            # postgres-client-certificate projected volume（同一 signer +
+            # username annotation，为编排器 Pod 铸造 kagent_owner_user 证书）。
+            # 凭证以 env 注入（不进 argv/pod spec 字面量）；编排器对
+            # --database-url/--github-token 缺省时回退读同名环境变量。
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: kagent-postgres-owner
+                  key: ownerConnectionString
+            # GitHub token 只存在于编排器（0001 §7 凭证隔离）；无 token 也可匿名轮询公开仓库
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-github
+                  key: token
+                  optional: true
+            # push JWT 验证（Required #12）：钉死 Gateway push signer 的
+            # Ed25519 公钥（PEM，PUBLIC KEY 块）与 issuer——非 dev 集群必须
+            # 设置（KAGENT_GATEWAY_PUSH_JWT_* 与 session 包 signer 同源）。
+            - name: PUSH_JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-push-jwt
+                  key: public-key.pem
+                  optional: true
+            - name: PUSH_JWT_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-push-jwt
+                  key: issuer
+                  optional: true
+            # admin 变更端点（retry/stop）的 bearer token；空 = dev 模式
+            - name: ORCHESTRATOR_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: superagent-orchestrator-admin
+                  key: token
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/orchestrator/policy
+              readOnly: true
+            - name: postgres-client-certificate
+              mountPath: /run/postgres.podcert.ate.dev
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: policy
+          configMap:
+            name: superagent-policy
+        # 克隆落点（os.MkdirTemp("", ...) 落 /tmp）：readOnlyRootFilesystem
+        # 下的可写卷。
+        - name: tmp
+          emptyDir: {}
+        # 与 kagent-controller 同款 Pod 证书投影：postgres.podcert.ate.dev
+        # signer 为本 Pod 铸造 kagent_owner_user 客户端证书（pg_hba 的 cert 认证）。
+        - name: postgres-client-certificate
+          projected:
+            defaultMode: 420
+            sources:
+              - podCertificate:
+                  credentialBundlePath: kagent_owner_user.pem
+                  keyType: ECDSAP256
+                  signerName: postgres.podcert.ate.dev/identity
+                  userAnnotations:
+                    postgres.podcert.ate.dev/username: kagent_owner_user
+              - clusterTrustBundle:
+                  labelSelector:
+                    matchLabels:
+                      podcert.ate.dev/canarying: live
+                  path: trust-bundle.pem
+                  signerName: servicedns.podcert.ate.dev/identity
+---
+# 默认拒绝入站：只放行同 namespace（gateway/controller/agentfs 调用方与
+# 探针来源；podSelector: {} 已覆盖同 ns，kubernetes.io/metadata.name 的
+# 自指 peer 是冗余——PR #11 review 去除。admin 走查走 kubectl port-forward，
+# 不经集群 ingress，故无 oauth2-proxy/ingress 面 peer——原注释提的 peer
+# 并不存在）。egress 不设限（egress 白名单由 byo 编译期网关与集群网络
+# 策略另行约束——worker 侧红线，编排器自身需要 PG/Gateway/GitHub 的正常出站）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: superagent-orchestrator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}          # 同 namespace（kagent 控制面组件）

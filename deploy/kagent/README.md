@@ -1,52 +1,249 @@
 # deploy/kagent — superagent-on-kagent P0 部署清单
 
-设计依据：[docs/designs/0002-deepseek-harness-落地与对外使用面设计.md](../docs/designs/0002-deepseek-harness-落地与对外使用面设计.md)。
-基线：kagent v1.0.1 集群（env.md），`exp/deepseek-superagent` 分支。
+设计依据：[docs/designs/0002-deepseek-harness-落地与对外使用面设计.md](../../docs/designs/0002-deepseek-harness-落地与对外使用面设计.md)、[docs/designs/0003-工作区物化与上下文可达性.md](../../docs/designs/0003-工作区物化与上下文可达性.md)。
+基线：kagent v1.0.1 fork（int/superagent-p0）+ substrate v1.0.0（ate-system），kind 集群 `kagent`。
 
 ## 清单
 
 | 文件 | 资源 | 说明 |
 |---|---|---|
-| `modelconfig-deepseek.yaml` | ModelConfig `deepseek` | Anthropic 兼容网关；复用既有 Secret `kagent-deepseek` |
+| `modelconfig-deepseek.yaml` | ModelConfig `deepseek` | Anthropic 兼容网关（evaluator 用）；复用既有 Secret `kagent-deepseek` |
+| `modelconfig-deepseek-openai.yaml` | ModelConfig `deepseek-openai` | OpenAI 兼容网关（worker 专用配对：DSH BYO 桥的 config guard 只接受 `model.openai`）；同一把 DeepSeek key 双协议通用 |
 | `harness-dsh-byo.yaml` | Harness `dsh-byo` | BYO 契约；`${DSH_BYO_IMAGE}`、`${SNAPSHOT_LOCATION}` 需代入 |
-| `agent-worker.yaml` | Agent `superagent-worker` | inline template + agentfs MCP 绑定 |
-| `agent-evaluator.yaml` | Agent `superagent-evaluator` | 内置 `kagent-default` harness + `outputSchema` 结构化 Decision |
+| `agent-worker.yaml` | Agent `superagent-worker` | inline template + agentfs MCP 绑定 + `deepseek-openai` |
+| `agent-evaluator.yaml` | Agent `superagent-evaluator` | 内置 `kagent-default` harness + `outputSchema` 结构化 Decision + `deepseek` |
+| `agentfs.yaml` | Deployment + Service `agentfs` + RemoteMCPServer `agenticfs-mcp` | 真 agentfs 引擎 + kagent-bridge 双二进制（bridge digest 由 scripts/image-build.sh 推送后钉死） |
+| `egresspolicy-agentfs.yaml` | EgressPolicy `agentfs-bridge` | worker 沙箱 → agentfs 出站授权 |
+| `networkpolicy-agentfs.yaml` | NetworkPolicy `agentfs` | agentfs 入站默认拒绝：只放行 kagent 同 ns + ate-system worker actor（PR #11 review） |
+| `orchestrator.yaml` | ServiceAccount + Service + Deployment `superagent-orchestrator` + ConfigMap `superagent-policy` + NetworkPolicy | push receiver 的集群内 Service（网关回调可达）+ 编排器单副本（实例锁）+ policy 热加载 + PG Pod 证书投影 + 入站默认拒绝 + T9 全链路 flags |
+| `e2e-v1.sh` | 验收脚本 | V1 全链路（fake GitHub 面可重复；见下） |
 
-## 前置
+## 镜像构建台账（源 SHA → digest，显式重同步，不自动漂移）
 
-1. **Secret**（已存在，env.md）：`kubectl -n kagent get secret kagent-deepseek`。
-2. **DSH BYO 镜像**：源码 = `kagent-dev/byo-ext` PR #2（未合入 main）：
+**两条 registry 并存，权威路径 = `localhost:5001/kagent-dev/*`**（PR #11 review 对账）：
+deploy-local.sh 的默认 `DSH_BYO_IMAGE`、agentfs.yaml 的钉死值、image-build.sh 的推送目标都在 5001。
+`localhost:5000/*` 为 T9 期旧路径，下表仅保留作历史记录；编排器集群镜像仍在 5000（无 5001 副本，
+e2e 不用镜像——编排器以本地进程跑，见 scripts/build.sh）。
+
+现状核对（2026-11-16）：宿主当前只有 `local-registry`@5000 在跑（catalog 只有 5000 路径的 T9 工件），
+5001 的 registry 容器当前不在运行。上表两行 5001 digest 是清单钉死且集群 Pod 正在跑的值
+（image-build.sh 推送时经 curl 校验落账；kind 节点的 containerd 没有 5001 的 certs.d 镜像配置，
+拉取当时由 5001 registry 直连完成）。重构建/重拉前需先把 5001 registry 起回来——image-build.sh
+的推送后校验会对 registry 缺位快速失败。
+
+| 镜像 | 源 | 记录 |
+|---|---|---|
+| `kagent-dev/dsh-byo`（**当前部署**） | kagent-dev/byo-ext **PR #2**（未合入 main）分支 `pr-2`；产出 defb23dc 的具体源 SHA 未随构建记录在案——重同步时按下方构建配方重出并记新对 | `localhost:5001/kagent-dev/dsh-byo@sha256:defb23dcb798627bb37fe0ad2a4c3c20d6dbfb9ba9dc7a7804eb71b422a0882d`（deploy-local.sh 默认部署值） |
+| `kagent-dev/kagent-bridge` | jibudata/agent-data-workspace 引擎（`agentfs mcp`）+ 本仓库 `deploy/kagent-bridge` 双二进制；引擎源 SHA 未钉死（image-build.sh 取 `$AGENTFS_SRC` 当前 checkout），重同步 = 重跑该脚本 | `localhost:5001/kagent-dev/kagent-bridge@sha256:026bbc2348b64c79759711d583fd2ed93d98c23a72ced5a0e24d6361db5e1176`（agentfs.yaml 钉死；image-build.sh 推送校验后自动重钉） |
+| `kagent-dsh-byo`（T9 前基线，历史） | kagent-dev/byo-ext PR #2 分支 `pr-2` @ `19771c8` | `localhost:5000/kagent-dsh-byo@sha256:5a71928b0aaad081b06ee9600190d967857d22a209bae85a49a631dabe79b9eb`（旧 env 契约） |
+| `kagent-dsh-byo`（T9，历史） | 同 PR 分支 `pr-2` @ `8632d5e`（`7383f7b` bootstrap 契约 + `14af3d4` durable 子目录 + `8632d5e` chmod EPERM 容忍） | `localhost:5000/kagent-dsh-byo@sha256:6dd2a0076d306d14751a714d69fccec5b6dc85c46936888cbf60cea02ed841ac` |
+| `superagent-orchestrator` | 本仓库 `orchestrator/` 模块 | `localhost:5000/superagent-orchestrator@sha256:ef37c412ce04f2a347bd5afdf77fa99453d09a9126bd34bc7885006c302dea30`（集群部署形态用；e2e 本地进程免镜像） |
+
+台账纪律（0002 风险表）：镜像重构建/上游重同步时，先记录 源SHA → digest 对应关系，再改 Harness/Deployment 的 digest；升级 kagent 时按 0009 upgrade 契约重验（本 T9 已验证：bridge 升级跟进 bootstrap-bundle 契约 = 预测的升级契约风险的实做）。
+
+### DSH BYO 镜像构建（T9 形态）
+
+```bash
+git -C /path/to/byo-ext fetch origin pull/2/head:pr-2 && git -C /path/to/byo-ext checkout pr-2
+# 桥已适配 bootstrap-bundle 契约（kagent go module 经本地 replace + vendor 具体化）
+cd /path/to/byo-ext/harnesses/deepseek
+export PATH=$HOME/sdk/go1.27.3/bin:$PATH
+go mod tidy && go mod vendor   # 本地 replace 的 kagent 树打入 vendor/，容器内零网络构建
+# 构建文件（CN 网络镜像 + vendor 构建）：kagent-dev/.superagent-notes/build/Dockerfile.dsh
+docker build -f /path/to/Dockerfile.dsh --target production -t localhost:5001/kagent-dev/dsh-byo:bootstrap .
+docker push localhost:5001/kagent-dev/dsh-byo:bootstrap
+curl -sI http://localhost:5001/v2/kagent-dev/dsh-byo/manifests/bootstrap \
+  -H 'Accept: application/vnd.oci.image.index.v1+json' | grep -i docker-content-digest   # 记入台账
+```
+
+### 编排器镜像构建
+
+```bash
+cd orchestrator   # 仓库根下的独立 Go module（github.com/jerry-jibu/kagent/orchestrator）
+docker build -f Dockerfile -t localhost:5000/superagent-orchestrator:t9 .
+docker push localhost:5000/superagent-orchestrator:t9   # 运行时含系统 git（clone/push 用）
+```
+
+## kind ↔ 本地 registry（本机 e2e 前置）
+
+> 注（PR #11 review 对账）：本节打通步骤是 5000 路径的——kind 节点的 containerd certs.d
+> 只配了 `localhost:5000`（已核对在位）。当前清单引用的 `localhost:5001/kagent-dev/*`
+> 没有节点侧镜像配置，拉取靠 5001 registry 对节点直连可达（部署当时成立；现该容器不在
+> 运行，重拉前先起回来——见台账节的现状核对）。
+
+本地 registry 容器 `local-registry`（registry:2 @ localhost:5000）需两条打通：
+
+1. **节点侧 containerd（CRI 拉取路径）**：kind 节点写
+   `/etc/containerd/certs.d/localhost:5000/hosts.toml`
+   （`[host."http://<registry-addr>:5000]"`，`capabilities=["pull","resolve"]`，`skip_verify=true`）
+   并在 `/etc/containerd/config.toml` 的 `[plugins."io.containerd.grpc.v1.cri".containerd]`
+   加 `config_path = "/etc/containerd/certs.d"`，重启 containerd。
+   ⚠️ china-network 已知坑：`kind load docker-image`（docker 29）会因 attestation blob 缺失而坏——走 registry 路线。
+2. **substrate 侧（actor 镜像拉取路径）**：atelet 的 imageCache 自己走 go-containerregistry
+   （`imageCache.EnsureImage`），对 localhost/loopback 引用先 https 后 http 回退。注册表必须从
+   atelet Pod 可达，且 digest 形态的 Harness 镜像在 atelet 的视角可达：
 
    ```bash
-   git -C /path/to/byo-ext fetch origin pull/2/head:pr-2 && git -C /path/to/byo-ext checkout pr-2
-   # 记录源 SHA（当前 19771c8）
-   docker build -f harnesses/deepseek/Dockerfile -t <registry>/kagent-dsh-byo .
-   docker push <registry>/kagent-dsh-byo   # 取 digest
+   docker network connect kind local-registry          # registry 进 kind 网络
+   kubectl -n ate-system patch ds atelet --type=json \
+     -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--localhost-registry-replacement=172.18.0.3:5000"}]'
+   # 172.18.0.3 = registry 容器在 kind 网络上的 IP（docker inspect 可查）；Pod 均可达
    ```
 
-   把 `<registry>/kagent-dsh-byo@sha256:<64hex>` 记入构建台账（源 SHA → digest）。
+   两者都就绪后 `crictl pull` 与 golden build 均可取 `localhost:5001/kagent-dev/dsh-byo@sha256:<digest>`。
 
-3. **SNAPSHOT_LOCATION**：与集群既有 Harness 的快照位置约定对齐
-   （参照：`kubectl -n kagent get harness -o yaml | grep -A2 snapshotPolicy`）。
+3. **kind 网关 push 回调（本机 e2e）**：编排器 push-base-url 指向宿主时，网关默认拒绝
+   http/私网 push URL——kind 环境需在 `kagent-controller` ConfigMap 置
+   `push.allowHttp: true`、`push.allowPrivateNetworks: true` 后重启 controller（生产保持 false）。
+
+## 数据库与 Pod 证书（编排器接集群 PG）
+
+集群 PostgreSQL 为 TLS-only + 证书认证（`hostssl ... cert`，`hostssl all postgres all reject`）：
+
+1. 编排器 Pod 复用 controller 同款 Pod 证书投影（signer `postgres.podcert.ate.dev/identity`，
+   annotation `postgres.podcert.ate.dev/username: kagent_owner_user`）——已写进 `orchestrator.yaml`。
+2. **signer 白名单**：podcertificate-controller 的
+   `--postgres-client=kagent/superagent-orchestrator=kagent_owner_user` 参数必须存在
+   （本机已 patch；helm 重装后需重加）。
+3. schema 预建（owner 用户无数据库级 CREATE 权限；编排器的 store.Open 探测到 schema 存在即跳过创建）：
+
+   ```bash
+   kubectl -n kagent exec deploy/kagent-postgresql -- \
+     psql -U postgres -d kagent -c "CREATE SCHEMA IF NOT EXISTS orchestrator AUTHORIZATION kagent_owner_user;"
+   ```
 
 ## 应用
 
+DeepSeek Secret（值不入库；两份 ModelConfig 共用，键名见清单注释）：
+
 ```bash
-export DSH_BYO_IMAGE='<registry>/kagent-dsh-byo@sha256:<64hex>'
-export SNAPSHOT_LOCATION='<cluster-convention>'
-for f in modelconfig-deepseek harness-dsh-byo agent-worker agent-evaluator; do
-  envsubst < $f.yaml | kubectl apply -f -
-done
+kubectl -n kagent create secret generic kagent-deepseek \
+  --from-literal=ANTHROPIC_API_KEY='<deepseek key>' \
+  --from-literal=OPENAI_API_KEY='<deepseek key>' \
+  --dry-run=client -o yaml | kubectl apply -f -   # 幂等重建
 ```
 
-（macOS：`brew install gettext` 提供 envsubst。）
+```bash
+export DSH_BYO_IMAGE='localhost:5001/kagent-dev/dsh-byo@sha256:<64hex>'   # 台账 digest（权威 registry 路径，见台账节）
+export SNAPSHOT_LOCATION='s3://ate-snapshots/kagent/'                 # 与集群既有 Harness 一致
+export POLICY_REPO='example/repo'          # Gate 仓库名单
+export POLICY_SENDER='maintainer-login'    # Gate admission 名单
+export GITHUB_SOURCE_REPO='example/repo'   # Source 轮询仓库；空串 = Source 关闭（空转模式）
+export WORKSPACE_BASE_BRANCH='main'
+export GITHUB_GIT_URL='https://github.com'
+export ORCH_IMAGE='localhost:5000/superagent-orchestrator@sha256:<64hex>'   # 台账 digest
+for f in modelconfig-deepseek modelconfig-deepseek-openai harness-dsh-byo agent-worker agent-evaluator; do
+  sed -e "s|\${DSH_BYO_IMAGE}|$DSH_BYO_IMAGE|" -e "s|\${SNAPSHOT_LOCATION}|$SNAPSHOT_LOCATION|" $f.yaml | kubectl apply -f -
+done
+# 占位符模式侧必须转义（\${...}）：双引号里未转义的 ${VAR} 会被 shell 先展开——
+# ORCH_IMAGE 未导出时展开成空正则（sed 给每行行首加前缀，YAML 全毁）；导出了也
+# 会变成拿值当模式、永远匹配不到清单里的字面占位符（PR #11 review, Required）。
+sed -e "s|\${ORCH_IMAGE}|$ORCH_IMAGE|" \
+    -e "s|\${POLICY_REPO}|$POLICY_REPO|" -e "s|\${POLICY_SENDER}|$POLICY_SENDER|" \
+    -e "s|\${GITHUB_SOURCE_REPO}|$GITHUB_SOURCE_REPO|" \
+    -e "s|\${WORKSPACE_BASE_BRANCH}|$WORKSPACE_BASE_BRANCH|" \
+    -e "s|\${GITHUB_GIT_URL}|$GITHUB_GIT_URL|" orchestrator.yaml | kubectl apply -f -
+```
+
+## 编排器 flags 全集（cmd/orchestrator）
+
+| flag | 语义 | 空缺时 |
+|---|---|---|
+| `--log-level` | JSON 日志最低级别（stderr；`debug`/`info`/`warn`/`error`） | `info` |
+| `--database-url` | PostgreSQL 连接串（必需；缺省回退读 `DATABASE_URL` 环境变量——集群 Secret 注入路径） | 拒绝启动 |
+| `--schema` | 编排器自有 PG schema（存在则跳过创建） | `orchestrator` |
+| `--policy-dir` | policy ConfigMap 挂载目录 | `/etc/orchestrator/policy` |
+| `--listen-addr` | healthz/admin + push receiver 监听 | `:8080` |
+| `--policy-poll-interval` | policy 热加载轮询 | `5s` |
+| `--github-source` | Source 轮询仓库（owner/name） | 空 = Source 关闭（下游全关） |
+| `--github-api-url` | GitHub REST base（fake GitHub 指这里） | `https://api.github.com` |
+| `--github-token` | 编排器持有的 GitHub 凭证（clone/push/PR/评论；凭证单调；缺省回退读 `GITHUB_TOKEN` 环境变量——凭证不进 pod spec argv） | 空 = 匿名（公开仓库） |
+| `--github-poll-interval` | Source 轮询节拍 | `60s` |
+| `--github-start-cursor` | 全新 Source 起始 RFC3339 位点 | 仓库原点 |
+| `--a2a-gateway-url` | kagent A2A Gateway origin（例 `http://kagent-controller.kagent.svc:8083`） | eval/Pass 链关闭 |
+| `--evaluator-agent` | 研判 Agent 路由（`name` 或 `ns/name`） | eval 链关闭 |
+| `--eval-interval` | eval 循环节拍 | `5s` |
+| `--worker-agent` | worker Agent 路由（派工目标） | Pass 节拍关闭 |
+| `--push-base-url` | 网关可达的编排器 origin（push 回调） | 由 listen-addr 推导（仅单机） |
+| `--pass-interval` | Pass 对账节拍（派工/对账/waitsForPerson/follow-up/outbox/物化扫描） | `2s` |
+| `--dispatch-start-deadline` | G7 卡死窗口（派工后无产出即 needs-attention） | `10m`（负值关闭） |
+| `--workspace-mcp-endpoint` | agentfs MCP 桥端点（例 `http://agentfs.kagent.svc:9765/mcp`）；**为空时交付链关闭，且派工不再等待物化基线** | 物化/交付链关闭 |
+| `--workspace-base-branch` | 物化器逐工单克隆的默认基分支（Story 27：工单 Mandate scope 可带 `base-branch:` 行覆盖本默认） | `main` |
+| `--github-git-url` | git remote 基址（mandate 仓库名拼 `.git`） | `https://github.com` |
+| `--push-jwt-public-key` | Gateway push signer 的 Ed25519 **公钥** PEM（钉死后 push 强制 JWT 验证：EdDSA + kid + iss/aud + taskId 绑定）；空 = dev 模式（**非 dev 集群必须设置**） | 无验证（dev） |
+| `--push-jwt-issuer` | push token 的期望 issuer（与 `--push-jwt-public-key` 同设；公钥也可经 `PUSH_JWT_PUBLIC_KEY` env 注入） | — |
+| `--admin-token` | 变更 admin 端点（retry/stop）的 Bearer token（也可经 `ORCHESTRATOR_ADMIN_TOKEN` env）；空 = dev 模式，读端点不受限 | 无守卫（dev） |
+
+链路序（accept 事务提交后）：物化扫描（accept→物化→基线落库）→ 派工扫描（`RequireWorkspace`：基线未落库不派工）→ worker Report ready → 交付循环（工作区读回 → 编排器侧 diff → push 分支 → PR → 结果评论 effect）。
+
+## P0 已接受边界（审查收口记录）
+
+- **入站面已硬化（2026-11-15，批次 #12）**：push 接收器支持 Gateway push JWT 验证（钉死公钥 = `--push-jwt-public-key`+`--push-jwt-issuer`，manifest 经 Secret 注入；token 绑定 taskId，claim/事件不匹配 403）；admin 变更端点（retry/stop）守 `--admin-token`；NetworkPolicy 默认拒绝入站、只放行同 namespace。三个开关空缺时保持 dev 模式（本地 e2e/fake 网关可用），**非 dev 集群部署前必须全部设置**——清单里以 optional SecretKeyRef 注入，缺 Secret 即 dev 模式（编排器启动日志有 WARNING）。
+- **agentfs 入站面已硬化（2026-11-16，PR #11 review）**：`networkpolicy-agentfs.yaml` 默认拒绝入站，只放行 kagent 同 namespace（编排器/controller/gateway）与 ate-system（atelet 拉起的 worker actor 沙箱 Pod）——此前 agentfs 只有出站 EgressPolicy，任何 namespace 的 Pod 都能碰工单工作区数据。
+- **Session 身份与 share（Stories 23/24）——本轮不写码**：编排器经 Gateway mTLS 以自身 ServiceAccount 身份调用，session 创建者=编排器 SA 是构造事实（`tickets.session_id` 只记录 contextId，归属无需额外字段）。**share 链接目前由用户在 UI 手动创建**（SessionService share），编排器自动签发并回贴 issue 归 **P1**。
+- **e2e 形态偏离已接受**：V1 全链路验收是独立 bash 脚本（`deploy/kagent/e2e-v1.sh`，fake GitHub 面 + 真集群组件），而非 `go/core/test/e2e` 套件内的 Go 测试。链路覆盖达意（store/g fake GitHub/bare git/egress 四处留证据）；集成形态的偏离已审查接受，go 套件内沉淀归后续票。
 
 ## 验证（CUJ1/CUJ2，0002）
 
 ```bash
-kubectl -n kagent get modelconfig deepseek harness dsh-byo agent superagent-worker superagent-evaluator
+kubectl -n kagent get modelconfig deepseek deepseek-openai harness dsh-byo \
+  agent superagent-worker superagent-evaluator
+kubectl -n kagent get agent superagent-worker -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
 ```
 
 - UI `/agents` Harnesses tab 列出 `dsh-byo`（引用 agent 只出现在删除确认文案）。
-- 开 `superagent-worker` 对话：流式应答走 DeepSeek 模型；`kubectl -n kagent logs deploy/kagent-controller` 无编译错误。
-- bridge 沙箱零凭证：actor 日志无 API key passthrough（PR #2 启动即拒）。
+- 对话验证（CUJ2，网关直呼；注意 `A2A-Version` 头必需）：
+
+  ```bash
+  curl -s http://localhost:8083/agents/kagent/superagent-worker -X POST \
+    -H 'Content-Type: application/json' -H 'A2A-Version: 1.0' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"请自我介绍"}],"messageId":"c1"}}}'
+  ```
+
+- 流式应答走 DeepSeek 模型（经 egress）；`kubectl -n kagent logs deploy/kagent-controller` 无编译错误。
+- bridge 沙箱零凭证：atelet Run 日志的 env 只含模型凭证占位 + 平台注入（无 GitHub token）。
+
+**流式走查（CUJ2 第二段，2026-11-15 补——此前仅非流式 curl）**：UI `/agents/:ns/:name` 开
+`superagent-worker` 对话，确认回复逐块渲染（SendStreamingMessage/SSE）而非整段一次到达；
+`kubectl -n kagent logs deploy/kagent-controller | grep -i stream` 见流式转发记录。
+
+**HITL 审批走查（CUJ2 第三段，T9 验证项）**：让 worker 触发一次 ACP 权限请求
+（如让它执行需要审批的操作），确认 UI 渲染审批卡片（AskUserPrompt）且批准后任务续跑；
+BYO agent card 不声明 HITL 扩展时的卡片渲染行为一并记录（0002 A4 T9 项）。
+
+## 验证（CUJ3 走查记录，2026-11-15 补）
+
+- **编排器建的 session 归属**：`kubectl -n kagent logs deploy/kagent-controller | grep -i session`，
+  会话创建者显示为编排器 SA；UI 会话列表默认视角下不串入个人会话。
+- **all_creators 视图 403 回退**：非特权用户访问编排器建的会话 → 403（`useAgentInstances.ts:11-25`
+  的回退路径），UI 显示空列表而非报错。
+- **share 只读旁观**：编排器建的工单 session 在 UI 手动创建 share 链接
+  （P0 边界，见上节），干系人以只读视角看到执行历史。
+- **chat 页即执行细节视图**：进度/流式输出/checkpoint 分隔符照常渲染（UI 内核零改动）。
+
+## V1 全链路 e2e（fake GitHub 面，可重复）
+
+```bash
+deploy/kagent/e2e-v1.sh /tmp/kagent-v1-e2e
+```
+
+脚本走通 0003 V1 全链（①issue @bot →②摄入/Gate →③evaluator accept →④建单+确认评论 →⑤物化基线 →⑥真 Gateway 派工 → 真 DSH BYO worker actor（gVisor）改文件 → Report ready →⑦编排器读回/diff/push/PR/结果评论），并在 store（权威视图）、fake GitHub（评论 marker + PR）、bare git 仓（交付分支内容）、egress 网关日志（DeepSeek 命中存在 + github.com 零命中）四处留证据。GitHub 面全程 fake（`--github-api-url` 指向 `cmd/fakegithub`）。
+
+**真 GitHub 走查（协调者步骤）**：需要用户 GitHub token（Secret `superagent-orchestrator-github`）+
+`--github-source`/`--github-api-url`/`--github-git-url` 指向真实仓库（`https://github.com`）；
+编排器 flags 全集见上表。
+
+## 脚本套件（e2e 全流程，按序执行）
+
+| 脚本 | 做什么 | 何时跑 |
+|---|---|---|
+| `scripts/env-setup.sh` | 环境体检+准备：kind 集群、t1-pg 测试 PG、DeepSeek Secret、controller `push.allowHttp` 补丁、DeepSeek API 余额连通性 | 每次 e2e 前（幂等） |
+| `scripts/build.sh` | 构建编排器与 fake GitHub 二进制 | e2e 前 |
+| `scripts/image-build.sh` | 构建 kagent-bridge 镜像（真 agentfs 引擎+桥双二进制）、推送、校验 registry、digest 钉死 agentfs.yaml | 桥/引擎代码变更后 |
+| `scripts/validate-manifests.sh` | manifest 校验冒烟：YAML 全文档解析 + kubectl dry-run（集群可达走 server，不可达降级 client/解析层）；防 `---` 分隔符切坏文档这类错复发（PR #11 review） | manifest 变更后；deploy-local.sh 部署前自动先跑（含未部署的 orchestrator.yaml） |
+| `scripts/deploy-local.sh` | 部署全套 manifest：校验冒烟 → agentfs → 入站/出站策略 → modelconfigs → harness×2 → agents（等 Ready） | 首次/manifest 变更后 |
+| `scripts/e2e.sh` | e2e 运行器：清理陈旧编排器（实例锁）+ 定向清理本套件端口的陈旧转发（只杀监听 8083/9765 的 kubectl port-forward，不全机 pkill）→ 起 8083/9765 转发（PID 跟踪，只杀自己的）→ 跑 `e2e-v1.sh` | 每次 e2e |
+
+踩坑记录（脚本注释里有细节）：buildx COPY 内容缓存旧二进制、digest 拉取校验需 OCI Accept 头、
+`:tag` 引用被节点 containerd IfNotPresent 缓存、`egressPolicyRefs` 在 Agent spec 级、
+DeepSeek 402 表现为评估器回散文（JSON 解析错）、陈旧编排器进程占 PG 实例锁。

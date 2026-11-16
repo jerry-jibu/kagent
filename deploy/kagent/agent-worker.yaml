@@ -1,21 +1,24 @@
 # Agent: superagent 编排模式 worker（0002 实现计划 #3）
 # inline template（P0 决定）；harness=dsh-byo；工具=agentfs 的 RemoteMCPServer
-# requireApproval 是 MCPToolBinding 一等字段 (agenttemplate_types.go:42-48)：
+# requireApproval 是 MCPToolBinding 一等字段 (agenttemplate_types.go:63-67)：
 #   P0 只绑 agentfs（沙箱内、无外部副作用），故不设 requireApproval 绑定；
-#   后续接入外部副作用工具时按 Tools 圈定并置 true（0002 §1-A3）
+#   现桥拒绝非空 Tools 圈定（byo-ext config.go:92-93）——P1 前置=桥支持
+#   Tools 圈定（0002 §1-A3 更正）
 apiVersion: api.kagent.dev/v1alpha3
 kind: Agent
 metadata:
   name: superagent-worker
   namespace: kagent
 spec:
+  egressPolicyRefs:
+    - name: agentfs-bridge
   harnessRef:
     name: dsh-byo
   template:
     inline:
       description: superagent 编排模式的工单执行 worker（DSH BYO 桥 + agentfs workspace）
       modelConfig:
-        name: deepseek
+        name: deepseek-openai
       systemPrompt: |
         你是 superagent 编排模式的工单执行 worker，按 Mandate 摘要完成分配的工单。
 
@@ -28,6 +31,8 @@ spec:
            编排器会转 needs-attention 并把人的回答以新输入送回。
         5. 每个 turn 结束时输出结构化 Report（最后一段为 JSON）：
            {"state": "progress|ready|blocked|failed|waiting", "summary": "<一句话>", "artifacts": ["<产物路径或PR链接>"]}
+         6. 声明 ready 前确保没有仍在途的后台任务（后台任务先收尾或改报 progress；
+            G8 约定，0001 §3——ready 即交付，编排器随即读回工作区）。
            state 语义：progress=进行中；ready=完成；blocked=被外部因素卡住；
            failed=失败（附原因）；waiting=等人的决策。
       tools:
