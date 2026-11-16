@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -79,11 +78,8 @@ func (s *Store) NeedsAttentionTickets(ctx context.Context) ([]AttentionTicket, e
 			&row.WaitsForPerson, &row.LastEvent, &row.LastEventAt); err != nil {
 			return nil, fmt.Errorf("failed to scan attention ticket: %w", err)
 		}
-		if sid != nil {
-			row.Ticket.SessionID = *sid
-		}
-		if err := json.Unmarshal(man, &row.Ticket.Mandate); err != nil {
-			return nil, fmt.Errorf("ticket %s carries a mandate that does not decode: %w", row.Ticket.ID, err)
+		if err := decodeTicket(&row.Ticket, man, sid); err != nil {
+			return nil, err
 		}
 		row.LatestAssignment.Status = asStatus
 		row.LatestAssignment.Report = asReport
@@ -98,6 +94,18 @@ func (s *Store) NeedsAttentionTickets(ctx context.Context) ([]AttentionTicket, e
 // Pass to dispatch, and the action is audited — all in one transaction. The
 // needs-attention guard makes a double-click replay a refusal, never a
 // second assignment.
+//
+// Retry settles (not refuses) the ticket's other live assignments: a P0 hold
+// leaves work alive — MarkTicketNeedsAttention keeps a RUNNING assignment
+// running ("the task itself stays alive awaiting the person's answer") and
+// the Pass's stuck branch holds the ticket without settling its assignment.
+// Minting a fresh assignment on top would leave the ticket with two live
+// assignments, forking the reconcile/follow-up scans' one-live-assignment
+// invariant. The person's retry is an answer to the hold, which retires the
+// previous attempt — exactly StopTicket's settle discipline ("dropped"),
+// just with the ticket returning to running instead of failing. Follow-up
+// inputs recorded on the ticket still ride the fresh assignment's dispatch
+// document (FollowupInputs reads the audit trail, not the assignments).
 func (s *Store) RetryTicket(ctx context.Context, ticketID, actor string) (Assignment, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -124,6 +132,18 @@ func (s *Store) RetryTicket(ctx context.Context, ticketID, actor string) (Assign
 			return Assignment{}, fmt.Errorf("failed to read ticket %s: %w", ticketID, err)
 		}
 		return Assignment{}, fmt.Errorf("%w (ticket is %s)", ErrTicketNotHeld, status)
+	}
+
+	// Settle the earlier attempt BEFORE minting the fresh assignment, so the
+	// ticket never carries two live assignments across the retry (PR #11
+	// review, Required #1).
+	if _, err := tx.Exec(ctx, `
+		UPDATE assignments
+		SET status = $2, report = $3, updated_at = now()
+		WHERE ticket_id = $1 AND status IN ($4, $5)`,
+		ticketID, AssignmentStatusEnded, "dropped",
+		AssignmentStatusPending, AssignmentStatusRunning); err != nil {
+		return Assignment{}, fmt.Errorf("failed to settle the live assignments of %s: %w", ticketID, err)
 	}
 
 	assignmentID, err := newAssignmentID()

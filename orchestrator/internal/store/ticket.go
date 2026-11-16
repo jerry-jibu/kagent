@@ -312,9 +312,23 @@ func (s *Store) Tickets(ctx context.Context) ([]Ticket, error) {
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-// scanTicket decodes one tickets row. A mandate that no longer decodes is
-// malformed durable data and is rejected, never silently decoded into a
-// zero-value authorization.
+// decodeTicket finishes decoding one tickets row whose raw columns the caller
+// already scanned into tk: the nullable session id and the mandate JSON. It
+// is the shared tail of every ticket scan (single-row, JOIN candidates,
+// delivery and admin listings). A mandate that no longer decodes is malformed
+// durable data and is rejected, never silently decoded into a zero-value
+// authorization.
+func decodeTicket(tk *Ticket, mandate []byte, sessionID *string) error {
+	if sessionID != nil {
+		tk.SessionID = *sessionID
+	}
+	if err := json.Unmarshal(mandate, &tk.Mandate); err != nil {
+		return fmt.Errorf("ticket %s carries a mandate that does not decode: %w", tk.ID, err)
+	}
+	return nil
+}
+
+// scanTicket decodes one tickets row.
 func scanTicket(row rowScanner) (Ticket, error) {
 	var tk Ticket
 	var mandate []byte
@@ -326,11 +340,8 @@ func scanTicket(row rowScanner) (Ticket, error) {
 		}
 		return Ticket{}, fmt.Errorf("failed to scan ticket: %w", err)
 	}
-	if sessionID != nil {
-		tk.SessionID = *sessionID
-	}
-	if err := json.Unmarshal(mandate, &tk.Mandate); err != nil {
-		return Ticket{}, fmt.Errorf("ticket %s carries a mandate that does not decode: %w", tk.ID, err)
+	if err := decodeTicket(&tk, mandate, sessionID); err != nil {
+		return Ticket{}, err
 	}
 	return tk, nil
 }

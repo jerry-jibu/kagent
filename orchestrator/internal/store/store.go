@@ -353,6 +353,73 @@ func (s *Store) TryAcquireInstanceLock(ctx context.Context) error {
 	return nil
 }
 
+// InstanceLockProbeInterval is the instance-lock watchdog cadence: modest on
+// purpose. The probe is one reentrant SELECT on the lock connection, and the
+// detection latency it buys (a lost lock lets a second instance start) is
+// worth a few seconds of near-zero load.
+const InstanceLockProbeInterval = 3 * time.Second
+
+// WatchInstanceLock guards against silent loss of the instance lock (PR #11
+// review, Required #2): the lock lives on a connection nothing else touches,
+// so if that connection dies the session lock is released invisibly — this
+// process stays ready while a second instance can acquire the lock and
+// double-run. The watchdog probes the SAME lock connection every interval;
+// pg_try_advisory_lock is reentrant per session, so while we hold the lock
+// the probe returns true. An error (connection gone) or a false (lock not
+// ours) invokes onLoss exactly once with the reason and ends the watch —
+// the caller owns readiness and shutdown from there.
+func (s *Store) WatchInstanceLock(ctx context.Context, interval time.Duration, onLoss func(why string)) {
+	watchInstanceLock(ctx, interval, s.probeInstanceLock, onLoss)
+}
+
+// probeInstanceLock runs one reentrant lock probe on the dedicated lock
+// connection. An error or held=false both mean the lock is not (verifiably)
+// ours.
+func (s *Store) probeInstanceLock(ctx context.Context) (bool, error) {
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	if s.lockConn == nil {
+		return false, errors.New("instance lock connection is not held")
+	}
+	var held bool
+	if err := s.lockConn.QueryRow(ctx,
+		"SELECT pg_try_advisory_lock($1)", s.lockKey()).Scan(&held); err != nil {
+		return false, fmt.Errorf("instance lock probe failed: %w", err)
+	}
+	return held, nil
+}
+
+// watchInstanceLock is the probe-decision loop, separated from the SQL probe
+// so the loss/error handling is unit-testable without PostgreSQL (the SQL
+// probe itself is covered by the DB-backed store tests). Every interval it
+// probes — each probe bounded by the interval, so a hung connection cannot
+// stall the watch past one cycle — and the first not-verifiably-held outcome
+// triggers onLoss once and returns.
+func watchInstanceLock(ctx context.Context, interval time.Duration,
+	probe func(ctx context.Context) (bool, error), onLoss func(why string)) {
+	if interval <= 0 {
+		interval = InstanceLockProbeInterval
+	}
+	for {
+		probeCtx, cancel := context.WithTimeout(ctx, interval)
+		held, err := probe(probeCtx)
+		cancel()
+		if err != nil || !held {
+			why := "instance lock probe reports the lock is no longer held"
+			if err != nil {
+				why = err.Error()
+			}
+			onLoss(why)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
 // RecordPolicyVersion persists a policy version hash (idempotent on the
 // version). Every later Gate decision and Mandate references this hash
 // (docs/designs/0001 §5: 策略分发).

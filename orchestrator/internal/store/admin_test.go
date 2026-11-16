@@ -154,6 +154,50 @@ func TestRetryTicket(t *testing.T) {
 		}
 	})
 
+	t.Run("Given a held ticket whose assignment is still running (the P0 hold keeps the task alive), when the admin retries it, assert that the running assignment settles ended under dropped and only the fresh assignment stays live (PR #11 review, Required #1: retry 不再分叉第二个活 worker)", func(t *testing.T) {
+		s := openTestStore(t)
+		mustMigrate(t, s)
+		tk, a := adminTicketFixture(t, s, "github:acme/api", "issue-comment:32", "issue:42")
+		dispatchTask(t, s, a, "task-32")
+		if _, err := s.MarkTicketNeedsAttention(ctx, tk.ID, "task paused in input-required"); err != nil {
+			t.Fatalf("MarkTicketNeedsAttention failed: %v", err)
+		}
+
+		minted, err := s.RetryTicket(ctx, tk.ID, "jerry")
+		if err != nil {
+			t.Fatalf("RetryTicket failed: %v", err)
+		}
+
+		assignments, err := s.Assignments(ctx, tk.ID)
+		if err != nil {
+			t.Fatalf("Assignments failed: %v", err)
+		}
+		if len(assignments) != 2 {
+			t.Fatalf("assignments = %d, want exactly 2 (the settled one and the fresh one)", len(assignments))
+		}
+		var settled, live *store.Assignment
+		for i := range assignments {
+			switch assignments[i].ID {
+			case a.ID:
+				settled = &assignments[i]
+			case minted.ID:
+				live = &assignments[i]
+			}
+		}
+		if settled == nil || live == nil {
+			t.Fatalf("assignments = %+v, want the original %s and the minted %s", assignments, a.ID, minted.ID)
+		}
+		if settled.Status != store.AssignmentStatusEnded || settled.Report != "dropped" {
+			t.Fatalf("previous assignment = %+v, want ended under dropped (StopTicket discipline)", settled)
+		}
+		if live.Status != store.AssignmentStatusPending || live.Kind != store.AssignmentKindFollowup {
+			t.Fatalf("fresh assignment = %+v, want a pending follow-up", live)
+		}
+		if status, _ := s.TicketStatus(ctx, tk.ID); status != store.TicketStatusRunning {
+			t.Fatalf("ticket = %q, want running after the retry", status)
+		}
+	})
+
 	t.Run("Given a running ticket, when the admin retries it, assert that the action is refused (retry 只针对挂起工单)", func(t *testing.T) {
 		s := openTestStore(t)
 		mustMigrate(t, s)

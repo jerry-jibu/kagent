@@ -250,11 +250,8 @@ func scanCandidateRow(rows rowScanner) (Assignment, Ticket, error) {
 		&tk.TriggerSource, &tk.TriggerDeterministicID, &tk.CreatedAt); err != nil {
 		return Assignment{}, Ticket{}, fmt.Errorf("failed to scan candidate row: %w", err)
 	}
-	if sid != nil {
-		tk.SessionID = *sid
-	}
-	if err := json.Unmarshal(man, &tk.Mandate); err != nil {
-		return Assignment{}, Ticket{}, fmt.Errorf("ticket %s carries a mandate that does not decode: %w", tk.ID, err)
+	if err := decodeTicket(&tk, man, sid); err != nil {
+		return Assignment{}, Ticket{}, err
 	}
 	return a, tk, nil
 }
@@ -339,7 +336,9 @@ func (s *Store) MarkAssignmentDispatched(ctx context.Context, assignmentID, tick
 // (PR #11 C3): pending→ended ("dropped") + audit row in one transaction —
 // the assignment never dangles on a dead ticket, and the dispatcher does
 // not retry a refused dispatch. CAS against pending: a concurrent settle
-// wins silently.
+// wins silently, and the audit row lands only when this call performed the
+// transition — an audit trail must never describe a settle that did not
+// happen.
 func (s *Store) SettleRefusedDispatch(ctx context.Context, assignmentID, ticketID, reason string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -347,22 +346,25 @@ func (s *Store) SettleRefusedDispatch(ctx context.Context, assignmentID, ticketI
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE assignments
 		SET status = $2, report = $3, updated_at = now()
 		WHERE id = $1 AND status = $4`,
-		assignmentID, AssignmentStatusEnded, "dropped: "+reason, AssignmentStatusPending); err != nil {
+		assignmentID, AssignmentStatusEnded, "dropped: "+reason, AssignmentStatusPending)
+	if err != nil {
 		return fmt.Errorf("failed to settle the refused dispatch of %s: %w", assignmentID, err)
 	}
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO audit (ticket_id, event, detail)
-		VALUES ($1, 'dispatch.refused', $2)`,
-		ticketID, marshalDetail(map[string]any{
-			"assignment_id": assignmentID,
-			"reason":        reason,
-		})); err != nil {
-		return fmt.Errorf("failed to audit the refused dispatch of %s: %w", ticketID, err)
+	if tag.RowsAffected() == 1 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit (ticket_id, event, detail)
+			VALUES ($1, 'dispatch.refused', $2)`,
+			ticketID, marshalDetail(map[string]any{
+				"assignment_id": assignmentID,
+				"reason":        reason,
+			})); err != nil {
+			return fmt.Errorf("failed to audit the refused dispatch of %s: %w", ticketID, err)
+		}
 	}
 
 	return tx.Commit(ctx)
@@ -496,6 +498,42 @@ type TerminalOutcome struct {
 	TicketChanged bool
 }
 
+// ErrInvalidPlan rejects terminal plans that name states outside the
+// vocabularies the Engine writes (PR #11 review: reject unknown values
+// loudly at the boundary instead of persisting an off-vocabulary state).
+var ErrInvalidPlan = errors.New("invalid terminal plan")
+
+// The report vocabulary TerminalPlan.ReportState accepts: the six-state
+// worker report (dispatch/report.go is the source of truth; the store cannot
+// import the dispatch package, so the literals mirror it — the same discipline
+// as predicates.go), plus "" for the report-less unresolved settle.
+var reportStates = map[string]bool{
+	"progress": true, "waiting": true, "ready": true,
+	"blocked": true, "failed": true, "dropped": true,
+}
+
+// validate mirrors DecisionInput/TicketInput: a plan naming a state outside
+// the allowed vocabularies is refused at the boundary, never persisted.
+func (plan TerminalPlan) validate() error {
+	switch plan.AssignmentStatus {
+	case AssignmentStatusEnded, AssignmentStatusUnresolved:
+	default:
+		return fmt.Errorf("%w: assignment status %q is not a settle state (%s or %s)",
+			ErrInvalidPlan, plan.AssignmentStatus, AssignmentStatusEnded, AssignmentStatusUnresolved)
+	}
+	switch plan.TicketStatus {
+	case "", TicketStatusPending, TicketStatusRunning, TicketStatusNeedsAttention, TicketStatusFailed, TicketStatusEnded:
+	default:
+		return fmt.Errorf("%w: ticket status %q is outside the ticket vocabulary",
+			ErrInvalidPlan, plan.TicketStatus)
+	}
+	if plan.ReportState != "" && !reportStates[plan.ReportState] {
+		return fmt.Errorf("%w: report state %q is outside the report vocabulary",
+			ErrInvalidPlan, plan.ReportState)
+	}
+	return nil
+}
+
 // TerminalPlan is one terminal outcome to persist atomically: the
 // assignment's settle state, the optional ticket transition, and the audit
 // row — all in one transaction (docs/designs/0001 §6: persist transitions
@@ -505,7 +543,7 @@ type TerminalOutcome struct {
 type TerminalPlan struct {
 	AssignmentID     string
 	AssignmentStatus string // ended | unresolved
-	ReportState      string // the report the assignment settled under
+	ReportState      string // progress | waiting | ready | blocked | failed | dropped | "" (unresolved settles report-less)
 	TicketID         string
 	TicketStatus     string // ended | failed | needs-attention | "" (no change)
 	DeliveryPending  bool
@@ -521,6 +559,10 @@ type TerminalPlan struct {
 // the transition did, and a terminal ticket (ended/failed) is never
 // resurrected. Replaying a settled plan is a no-op that reports Applied=false.
 func (s *Store) ApplyAssignmentTerminal(ctx context.Context, plan TerminalPlan) (TerminalOutcome, error) {
+	if err := plan.validate(); err != nil {
+		return TerminalOutcome{}, err
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return TerminalOutcome{}, fmt.Errorf("failed to begin terminal transaction: %w", err)

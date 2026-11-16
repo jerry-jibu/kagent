@@ -3,7 +3,11 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Delivery states of a ticket's result (migration 0008_delivery). Only a
@@ -32,7 +36,10 @@ type DeliveryCandidate struct {
 
 // PendingDeliveries returns the tickets with a pending result, creation order
 // first. Delivered and failed deliveries are terminal: they never re-enter
-// the scan.
+// the scan. A ticket deferred behind a GitHub rate limit
+// (rate_limited_until, migration 0010) stays out of the scan until its
+// deferral expires — re-hitting the API every beat is the hammering pattern
+// the rate limit exists to prevent.
 func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, thread_source, thread_key, mandate, status, session_id,
@@ -40,6 +47,7 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 		       base_branch, base_commit, base_skipped
 		FROM tickets
 		WHERE delivery_state = $1
+		  AND (rate_limited_until IS NULL OR rate_limited_until <= now())
 		ORDER BY created_at, id`, DeliveryPending)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list pending deliveries: %w", err)
@@ -57,11 +65,8 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 			&c.BaseBranch, &c.BaseCommit, &skipped); err != nil {
 			return nil, fmt.Errorf("failed to scan delivery candidate: %w", err)
 		}
-		if sessionID != nil {
-			tk.SessionID = *sessionID
-		}
-		if err := json.Unmarshal(mandate, &tk.Mandate); err != nil {
-			return nil, fmt.Errorf("ticket %s carries a mandate that does not decode: %w", tk.ID, err)
+		if err := decodeTicket(&tk, mandate, sessionID); err != nil {
+			return nil, err
 		}
 		if err := json.Unmarshal(skipped, &c.BaseSkipped); err != nil {
 			return nil, fmt.Errorf("ticket %s carries a skipped list that does not decode: %w", tk.ID, err)
@@ -70,6 +75,43 @@ func (s *Store) PendingDeliveries(ctx context.Context) ([]DeliveryCandidate, err
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// DeferTicketDelivery pushes a ticket's next delivery attempt past a GitHub
+// rate limit (migration 0010): rate_limited_until hides it from
+// PendingDeliveries until the recorded Retry-After instant. Column-only by
+// contract — the deliverer already writes its own rate-limit audit row
+// (delivery.failed with rate_limited/retry_after detail via RecordAudit), so
+// writing a second row here would duplicate the observation.
+//
+// CAS-guarded on delivery_state = pending: a deferral is meaningful only for
+// a result still owed; a ticket whose delivery already reached a terminal
+// state (delivered/failed — e.g. a raced scan between the candidate scan and
+// this call) must not gain a stale deferral marker. Such a race is a no-op
+// returning nil; a ticket id with no row at all is malformed input and
+// returns ErrTicketNotFound.
+func (s *Store) DeferTicketDelivery(ctx context.Context, ticketID string, until time.Time) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE tickets
+		SET rate_limited_until = $2, updated_at = now()
+		WHERE id = $1 AND delivery_state = $3`,
+		ticketID, until, DeliveryPending)
+	if err != nil {
+		return fmt.Errorf("failed to defer the delivery of ticket %s: %w", ticketID, err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var deliveryState string
+	err = s.pool.QueryRow(ctx,
+		"SELECT delivery_state FROM tickets WHERE id = $1", ticketID).Scan(&deliveryState)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrTicketNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read the delivery state of ticket %s: %w", ticketID, err)
+	}
+	return nil // raced past terminal: the deferral is moot, nothing to defer
 }
 
 // TicketsAwaitingMaterialization returns the live tickets whose workspace has

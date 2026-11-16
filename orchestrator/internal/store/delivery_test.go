@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -393,6 +394,106 @@ func TestDeliveryAuditDetailShape(t *testing.T) {
 		}
 		if artifacts[0] != "internal/parser/parser.go" {
 			t.Fatalf("artifacts[0] = %v", artifacts[0])
+		}
+	})
+}
+
+// TestDeferTicketDelivery guards the rate-limit deferral contract (PR #11
+// review, Required #3): a deferred candidate leaves the delivery scan until
+// its Retry-After instant passes, and the store writes no audit row of its
+// own — the rate-limit observation is the deliverer's delivery.failed row.
+func TestDeferTicketDelivery(t *testing.T) {
+	// readyDelivery walks a fixture to a pending delivery.
+	readyDelivery := func(t *testing.T) (*store.Store, string) {
+		t.Helper()
+		s, ticketID, a := deliveryFixture(t)
+		if err := s.RecordTicketBaseline(context.Background(), ticketID, "main", "0123456789abcdef0123456789abcdef01234567", nil); err != nil {
+			t.Fatalf("RecordTicketBaseline failed: %v", err)
+		}
+		if _, err := s.ApplyAssignmentTerminal(t.Context(), readyPlan(a, ticketID)); err != nil {
+			t.Fatalf("ApplyAssignmentTerminal failed: %v", err)
+		}
+		return s, ticketID
+	}
+
+	t.Run("Given a pending delivery, when it is deferred behind a short rate limit, assert that PendingDeliveries hides it and it re-enters once the deferral expires", func(t *testing.T) {
+		s, ticketID := readyDelivery(t)
+		ctx := context.Background()
+
+		if err := s.DeferTicketDelivery(ctx, ticketID, time.Now().Add(200*time.Millisecond)); err != nil {
+			t.Fatalf("DeferTicketDelivery failed: %v", err)
+		}
+
+		candidates, err := s.PendingDeliveries(ctx)
+		if err != nil {
+			t.Fatalf("PendingDeliveries failed: %v", err)
+		}
+		if len(candidates) != 0 {
+			t.Fatalf("a deferred delivery must leave the scan, got %d candidates", len(candidates))
+		}
+
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			candidates, err = s.PendingDeliveries(ctx)
+			if err != nil {
+				t.Fatalf("PendingDeliveries failed: %v", err)
+			}
+			if len(candidates) == 1 && candidates[0].Ticket.ID == ticketID {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("delivery must re-enter the scan after the deferral expires, got %d candidates", len(candidates))
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
+
+	t.Run("Given a delivered ticket, when its delivery is deferred, assert that the call is a no-op that writes no audit row (the rate-limit observation is the deliverer's delivery.failed row)", func(t *testing.T) {
+		s, ticketID, a := deliveryFixture(t)
+		ctx := context.Background()
+		if _, err := s.ApplyAssignmentTerminal(ctx, readyPlan(a, ticketID)); err != nil {
+			t.Fatalf("ApplyAssignmentTerminal failed: %v", err)
+		}
+		effect := store.OutboxEffect{
+			Channel:        "github",
+			Address:        "acme/api#42",
+			IdempotencyKey: "result:" + ticketID,
+			Payload:        []byte(`{"kind":"github-issue-comment","repo":"acme/api","issue":42,"body":"result"}`),
+		}
+		if _, err := s.MarkTicketDelivered(ctx, store.DeliveredPlan{
+			TicketID: ticketID,
+			PRNumber: 7,
+			PRURL:    "https://github.com/acme/api/pull/7",
+			Branch:   ticketID,
+			Commit:   "0123456789abcdef0123456789abcdef01234567",
+			Effect:   effect,
+		}); err != nil {
+			t.Fatalf("MarkTicketDelivered failed: %v", err)
+		}
+		before, err := s.AuditEvents(ctx, ticketID)
+		if err != nil {
+			t.Fatalf("AuditEvents failed: %v", err)
+		}
+
+		if err := s.DeferTicketDelivery(ctx, ticketID, time.Now().Add(time.Minute)); err != nil {
+			t.Fatalf("DeferTicketDelivery on a delivered ticket must be a no-op, got: %v", err)
+		}
+
+		after, err := s.AuditEvents(ctx, ticketID)
+		if err != nil {
+			t.Fatalf("AuditEvents failed: %v", err)
+		}
+		if len(after) != len(before) {
+			t.Fatalf("DeferTicketDelivery must be column-only: audit went from %d to %d rows", len(before), len(after))
+		}
+	})
+
+	t.Run("Given an unknown ticket id, when its delivery is deferred, assert that the call fails with ErrTicketNotFound", func(t *testing.T) {
+		s := openTestStore(t)
+		mustMigrate(t, s)
+
+		if err := s.DeferTicketDelivery(context.Background(), "ticket-none", time.Now().Add(time.Minute)); !errors.Is(err, store.ErrTicketNotFound) {
+			t.Fatalf("error = %v, want ErrTicketNotFound", err)
 		}
 	})
 }
