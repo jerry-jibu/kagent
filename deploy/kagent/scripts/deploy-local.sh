@@ -4,9 +4,10 @@
 # 用法: deploy/kagent/scripts/deploy-local.sh
 #
 # 部署顺序（依赖序）:
-#   agentfs（桥+引擎）→ EgressPolicy → modelconfigs → harness×2 → agents
+#   校验冒烟 → agentfs（桥+引擎+入站策略）→ EgressPolicy → modelconfigs → harness×2 → agents
 # orchestrator.yaml 本身不在本脚本部署（e2e 以本地进程跑编排器；集群部署
-# 形态按 README 的 sed 流程）。
+# 形态按 README 的 sed 流程）——但 validate-manifests.sh 的校验覆盖它
+# （PR #11 review #1 的防复发闸：`---` 分隔符切坏文档这种错，apply 前先拦下）。
 #
 # 坑位记录:
 #   - egressPolicyRefs 在 Agent spec 级（不在 template.inline）——放错层
@@ -20,11 +21,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DSH_BYO_IMAGE=${DSH_BYO_IMAGE:-localhost:5001/kagent-dev/dsh-byo@sha256:defb23dcb798627bb37fe0ad2a4c3c20d6dbfb9ba9dc7a7804eb71b422a0882d}
 SNAPSHOT_LOCATION=${SNAPSHOT_LOCATION:-s3://ate-snapshots/kagent/}
 
+echo "=== manifest 校验冒烟（validate-manifests.sh，含未部署的 orchestrator.yaml）==="
+"$SCRIPT_DIR/scripts/validate-manifests.sh"
+
 echo "=== agentfs 桥+引擎 ==="
 kubectl apply -f "$SCRIPT_DIR/agentfs.yaml"
 
 echo "=== EgressPolicy: worker 沙箱 → agentfs 出站授权 ==="
 kubectl apply -f "$SCRIPT_DIR/egresspolicy-agentfs.yaml"
+
+echo "=== NetworkPolicy: agentfs 入站默认拒绝（编排器 + ate-system worker 之外全拒）==="
+kubectl apply -f "$SCRIPT_DIR/networkpolicy-agentfs.yaml"
 
 echo "=== modelconfigs ==="
 for f in modelconfig-deepseek modelconfig-deepseek-openai; do

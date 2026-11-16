@@ -184,30 +184,6 @@ spec:
                   name: superagent-orchestrator-admin
                   key: token
                   optional: true
----
-# 默认拒绝入站：只放行同 namespace（gateway/controller/agentfs 调用方与
-# 探针来源）与 ingress 面的 oauth2-proxy（admin 走查用）。egress 不设限
-# （egress 白名单由 byo 编译期网关与集群网络策略另行约束——worker 侧红线，
-# 编排器自身需要 PG/Gateway/GitHub 的正常出站）。
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: superagent-orchestrator
-  namespace: kagent
-  labels:
-    app.kubernetes.io/name: superagent-orchestrator
-    app.kubernetes.io/part-of: superagent-on-kagent
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: superagent-orchestrator
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - podSelector: {}          # 同 namespace（kagent 控制面组件）
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kagent
           readinessProbe:
             httpGet:
               path: /healthz
@@ -260,3 +236,26 @@ spec:
                       podcert.ate.dev/canarying: live
                   path: trust-bundle.pem
                   signerName: servicedns.podcert.ate.dev/identity
+---
+# 默认拒绝入站：只放行同 namespace（gateway/controller/agentfs 调用方与
+# 探针来源；podSelector: {} 已覆盖同 ns，kubernetes.io/metadata.name 的
+# 自指 peer 是冗余——PR #11 review 去除。admin 走查走 kubectl port-forward，
+# 不经集群 ingress，故无 oauth2-proxy/ingress 面 peer——原注释提的 peer
+# 并不存在）。egress 不设限（egress 白名单由 byo 编译期网关与集群网络
+# 策略另行约束——worker 侧红线，编排器自身需要 PG/Gateway/GitHub 的正常出站）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: superagent-orchestrator
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: superagent-orchestrator
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: superagent-orchestrator
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}          # 同 namespace（kagent 控制面组件）
