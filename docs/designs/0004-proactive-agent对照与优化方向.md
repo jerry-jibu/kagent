@@ -49,6 +49,24 @@
 *   **G9（P2）WorkerPool 容量方法论**：OpenClaw duty-cycle 实测（0.72%、1000 agent 投影 47:1、"Size a pool on the peak"）+ CMA benchmarks 工具；**适用性警告**：编码 agent duty cycle ≠ 个人助理，数字只借方法不借结论。
 *   **G10（P1 文档）presence/cognition 红线与渠道两族分类**：已并入 0001 §2.1.1。
 *   **G11（观察项）substrate 官方 GC/挂起能力**：就绪即弃自管逻辑（对齐 CMA Improvements 姿态）。
+*   **G12（P1）运行成本上限**：Anthropic daily-brief 为每次运行设花费预算（初值=正常运行的 3–5 倍），触及即**暂停**（非报错）并需监测暂停态避免误判"无事可报"。我们按 assignment 粒度对齐：worker Report/网关用量上报累加进 assignments（字段已可扩展），超限转 needs-attention 人工核，不自动终止。evidence：Mandate 已持 policy_version，预算归编排器判定不进模型。
+
+
+## 补充对照（2026-11-16）：Anthropic daily-brief 参考实现（第二篇 blog）
+
+Anthropic《Building effective agent automations》给出完整参考实现（每日简报：按 schedule 读 Slack/GitHub，跟踪上次运行后的变化，投递到 Slack，代码开源）。六组件与本文五组件对照后：四个强互证、一个确认 G2 方向、**一个真增量（G12 运行成本上限）**。
+
+| Anthropic 组件/实践 | 我们的对应 | 判定 |
+|---|---|---|
+| 信息源 + 每源书签（只记最新已读时间戳，窗口随实际运行伸缩；失败时书签不动、其他来源照常、显式标注不可读） | Sources/Intake：cursor 高水位与触发同事务持久化（`IngestEvents` 单事务），失败回滚即书签不动；cursor -5s 重叠去重 | ✅ 同款语义（源失败"显式标注不可读"我们只到日志级，简报场景才需要用户可见标注——飞书 Source 时注意） |
+| 投递确认严格序：先查重（确定性 marker）→ 投递 → **确认成功才推进书签/账本**；无法确认 → 标"可能已投递"，状态不动 | Outbox receipt 幂等 + 确定性 marker + 红线"不确定结局不自动重放"（0001 §8） | ✅ 强互证——Anthropic 用确认机制守"不丢失、不重复"，与我们同一条底线 |
+| 记忆分权：Preferences（读者维护、agent 只读）+ State（agent 读写：书签/账本/运行记录） | Mandate/Policy（编排器持有，worker 只读）+ workspace/DATA（agent 读写）；G2 记忆文件约定 | ✅ **确认 G2 方向**—— Anthropic 的分权原则与 G2 拟议的文件约定同构；账本"稳定 ID 只报变化"与 Trigger 确定性 ID 同源 |
+| 每次触发全新会话 + 显式挂载上下文（环境/凭据/记忆/预算） | per-Ticket session（TaskStore）+ Mandate 随派工注入 | ✅ 同构 |
+| 护栏：只读 token、网络白名单主机、**每次运行花费上限（初值 3–5 倍，暂停而非报错，需监测暂停态）** | 凭证单调（worker 零凭证）+ egress 编译期白名单；Gate 名单/admission | ⚠️ **G12 真增量**：运行成本上限我们完全没有（见缺口清单） |
+| 时区出现两次：调度字段管唤醒，输入指令管"今天/昨天"的语义 | 飞书 Source 未落地；ScheduledRun（cron）只有唤醒语义 | 📌 P1 飞书 Source 设计时记入（无成本） |
+
+*参考：Anthropic blog https://claude.dev/blog/building-effective-agent-automations/ ；参考实现 anthropics/claude-quickstarts managed-agents/daily-brief；中文解读 mp.weixin.qq.com/s/ZS5drbQWfhIe8qD2XWIFfQ。*
+
 
 ## 刻意差异（红线，不跟从）
 
@@ -73,6 +91,7 @@
 *   **agent-substrate/always-on-agent**（presence/cognition split 参考实现：hermes 舰队 + openclaw，含实测数字）：https://github.com/agent-substrate/always-on-agent
 *   **agent-substrate/claude-managed-agents**（Claude MA 自托管沙箱 × substrate actor：poll&ack/queue/reconcile/lease heartbeat 生产化实现 + benchmarks）：https://github.com/agent-substrate/claude-managed-agents
 *   Anthropic 关联文：Building effective agents、Claude Code auto mode、components of agent memory（记忆细读候选）
+*   **Building effective agent automations + daily-brief 参考实现**（2026-11-16 补充对照节；https://claude.dev/blog/building-effective-agent-automations/ 、anthropics/claude-quickstarts managed-agents/daily-brief）
 
 --------------------------------------------------------------------------------
 
