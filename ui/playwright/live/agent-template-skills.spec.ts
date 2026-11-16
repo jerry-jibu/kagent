@@ -32,14 +32,30 @@ const S3 = {
 };
 
 const RAW_CATALOG = process.env.KAGENT_UI_BUILTIN_SKILLS ?? "";
-const catalog = RAW_CATALOG
-  ? (JSON.parse(RAW_CATALOG) as { image: string; skills: { name: string; path: string }[] })
-  : undefined;
+
+/**
+ * Parsed under a guard rather than with a bare `JSON.parse` at module scope: a
+ * malformed value must reach `test.skip` as a reason, not error this file before
+ * any test exists to skip.
+ */
+let catalog: { image: string; skills: { name: string; path: string }[] } | undefined;
+try {
+  catalog = RAW_CATALOG
+    ? (JSON.parse(RAW_CATALOG) as { image: string; skills: { name: string; path: string }[] })
+    : undefined;
+} catch {
+  catalog = undefined;
+}
 
 const templates = new Set<string>();
 const agents = new Set<string>();
 
-test.skip(!catalog, "KAGENT_UI_BUILTIN_SKILLS is not set to the chart's skills catalog");
+test.skip(
+  !catalog,
+  RAW_CATALOG
+    ? "KAGENT_UI_BUILTIN_SKILLS is set but is not valid JSON, so the chart's skills catalog could not be read"
+    : "KAGENT_UI_BUILTIN_SKILLS is not set to the chart's skills catalog",
+);
 
 // Through the API, not the UI: teardown runs after failures, when the page may be anywhere.
 test.afterAll(async ({ baseURL }) => {

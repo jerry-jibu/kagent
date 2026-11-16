@@ -51,7 +51,6 @@ export async function navOrder(page: Page): Promise<string[]> {
   );
 }
 
-/** The nav entries the application itself ships, in the order it declares them. */
 /**
  * The sidebar entries a default build ships, in DOM order.
  *
