@@ -23,16 +23,18 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"io"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -42,6 +44,29 @@ const mcpProtocolVersion = "2024-11-05"
 
 // idleSessionTTL reaps sessions whose last request is older than this.
 const idleSessionTTL = 30 * time.Minute
+
+// upstreamDeadline bounds one upstream request. Var (not const) so the
+// watchdog tests can shorten it; production always sees the default. A
+// silently hung `agentfs mcp` used to block in Scanner.Scan() holding
+// s.mu until the idle TTL reaped the session (PR #11 review).
+var upstreamDeadline = 120 * time.Second
+
+// kill takes down the session's upstream process tree. A plain Kill() on the
+// direct child can leave grandchildren alive holding the stdout pipe's write
+// end — the parent's read (Scanner.Scan) then blocks until THEY exit, which
+// is exactly the hang the watchdog exists to break (observed in the tests
+// with a sh -c upstream whose sleep outlived the kill). startSession sets
+// Setpgid, so the child leads its own process group; signaling the negative
+// pid takes the whole tree out at once. Falls back to the direct kill when
+// the group is already gone (e.g. the leader exited first).
+func (s *session) kill() {
+	if s.cmd.Process == nil {
+		return
+	}
+	if err := syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		_ = s.cmd.Process.Kill()
+	}
+}
 
 // rpcRequest is one JSON-RPC request (client → bridge or bridge → upstream).
 type rpcRequest struct {
@@ -65,7 +90,7 @@ type rpcResponse struct {
 type session struct {
 	mu       sync.Mutex
 	cmd      *exec.Cmd
-	stdin    io.WriteCloser    // the cmd's stdin pipe writer
+	stdin    io.WriteCloser // the cmd's stdin pipe writer
 	stdout   *bufio.Scanner
 	nextID   int64
 	lastSeen time.Time
@@ -91,14 +116,24 @@ func (s *session) upstreamRequest(method string, params json.RawMessage) (json.R
 		return nil, fmt.Errorf("upstream stdin write: %w", err)
 	}
 
-	deadline := time.Now().Add(120 * time.Second)
+	// Watchdog: a silently hung `agentfs mcp` blocks inside Scanner.Scan()
+	// on the pipe read — the old zero-length-line deadline check never ran
+	// because no lines arrived at all, and s.mu stayed held until the idle
+	// TTL reaped the session. Kill the subprocess on deadline even mid-Scan:
+	// the closed pipe unblocks Scan() (EOF) and the call fails honestly.
+	// The empty-line skip below stays, but the deadline is owned here.
+	watchdogFired := make(chan struct{}, 1)
+	watchdog := time.AfterFunc(upstreamDeadline, func() {
+		watchdogFired <- struct{}{}
+		log.Printf("upstream watchdog: no answer in %s, killing session subprocess", upstreamDeadline)
+		s.kill()
+	})
+	defer watchdog.Stop()
+
 	for s.stdout.Scan() {
 		raw := s.stdout.Bytes()
 		if len(raw) == 0 {
-			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("upstream timeout waiting for id %d", id)
-			}
-			continue
+			continue // blank line (log noise) — keep scanning
 		}
 		var resp rpcResponse
 		if err := json.Unmarshal(raw, &resp); err != nil {
@@ -120,6 +155,13 @@ func (s *session) upstreamRequest(method string, params json.RawMessage) (json.R
 	}
 	if err := s.stdout.Err(); err != nil {
 		return nil, fmt.Errorf("upstream stdout: %w", err)
+	}
+	// The watchdog channel doubles as the synchronization edge: a receive
+	// here means our AfterFunc kill unblocked the (formerly hung) Scan.
+	select {
+	case <-watchdogFired:
+		return nil, fmt.Errorf("upstream timeout after %s waiting for id %d", upstreamDeadline, id)
+	default:
 	}
 	return nil, fmt.Errorf("upstream exited before answering id %d", id)
 }
@@ -149,6 +191,10 @@ func (b *bridge) newSessionID() string {
 // startSession spawns the real agentfs engine subprocess (stdio MCP).
 func (b *bridge) startSession() (string, *session, error) {
 	cmd := exec.Command(b.agentfsBin, "mcp", "--home", b.home)
+	// Own process group: session.kill() must take out the whole tree (git
+	// helpers etc. spawned by the engine inherit the stdout pipe — killing
+	// only the leader would leave the pipe open and Scan() still hung).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return "", nil, fmt.Errorf("upstream stdin pipe: %w", err)
@@ -179,7 +225,7 @@ func (b *bridge) startSession() (string, *session, error) {
 		"clientInfo":      map[string]any{"name": "kagent-bridge", "version": "0.1.0"},
 	})
 	if _, err := s.upstreamRequest("initialize", initParams); err != nil {
-		_ = cmd.Process.Kill()
+		s.kill()
 		return "", nil, fmt.Errorf("upstream initialize: %w", err)
 	}
 
@@ -206,7 +252,7 @@ func (b *bridge) endSession(id string) {
 	delete(b.sessions, id)
 	b.mu.Unlock()
 	if ok {
-		_ = s.cmd.Process.Kill()
+		s.kill()
 	}
 }
 
@@ -364,13 +410,30 @@ func (b *bridge) handlePost(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(out)
 }
 
+// workspaceNameRe is the conservative allow-list for blank-base workspace
+// names. Real names are orchestrator ticket ids: "ticket-" + 12 hex chars
+// (orchestrator/internal/store/ticket.go TicketIDForTrigger; workspace name
+// = ticket id per 0001 D3), so [A-Za-z0-9][A-Za-z0-9._-]{0,127} is strictly
+// wider than production traffic while still excluding everything dangerous.
+// validWorkspaceName additionally rejects any embedded "..": with the
+// allow-list there is no way to express a path separator at all, so ".."
+// could only ever be one flat (harmless) element — belt and braces.
+var workspaceNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func validWorkspaceName(name string) bool {
+	if strings.Contains(name, "..") {
+		return false
+	}
+	return workspaceNameRe.MatchString(name)
+}
+
 // withBlankBase rewrites an agenticfs_create_workspace call that carries no
 // sources: the bridge materializes an empty base directory under its data
 // root and passes it as the workspace's single source. Semantics per 0001
 // D3 (零 source 空白沙箱) on an engine whose overlay requires a base.
 func (b *bridge) withBlankBase(params json.RawMessage) json.RawMessage {
 	var call struct {
-		Name      string   `json:"name"`
+		Name      string `json:"name"`
 		Arguments struct {
 			Name    string   `json:"name"`
 			Sources []string `json:"sources"`
@@ -384,6 +447,13 @@ func (b *bridge) withBlankBase(params json.RawMessage) json.RawMessage {
 	}
 	if call.Arguments.Name == "" {
 		return params // let the engine refuse the missing name
+	}
+	if !validWorkspaceName(call.Arguments.Name) {
+		// Never Join an unsanitized name under the data root: "../x" used
+		// to escape basesDir (PR #11 review). Log-and-skip — the raw params
+		// go upstream unchanged and the engine refuses the name itself.
+		log.Printf("blank base: refusing invalid workspace name %q", call.Arguments.Name)
+		return params
 	}
 	base := filepath.Join(b.basesDir, call.Arguments.Name)
 	if err := os.MkdirAll(base, 0o755); err != nil {
