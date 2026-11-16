@@ -213,7 +213,7 @@ func applyState(dir string, state map[string][]byte) error {
 		if content == nil {
 			return fmt.Errorf("patch state for %s is nil; the read-back snapshot never yields nil content", rel)
 		}
-		if err := ensureWritableRegularPath(dir, rel); err != nil {
+		if err := ensureWritableRegularPath(dir, rel, state); err != nil {
 			return err
 		}
 		target := filepath.Join(dir, filepath.FromSlash(rel))
@@ -234,7 +234,16 @@ func applyState(dir string, state map[string][]byte) error {
 // is an error. A missing component ends the walk — nothing below a
 // not-yet-existing prefix can be a symlink, and MkdirAll creates the rest as
 // real directories.
-func ensureWritableRegularPath(dir, rel string) error {
+//
+// A regular FILE at a non-final component is the worker restructuring the
+// tree (a tracked file path became a directory path, e.g. baseline "notes"
+// with state "notes/idea.md"): the file is removed so the restructure can be
+// delivered instead of permanently failing the ticket (PR #11 review). The
+// state is consulted first — if the state still holds that component as a
+// file, the patch state is self-contradictory (one path cannot be both file
+// and directory) and is refused. Symlink checks above take precedence: a
+// symlinked component is refused exactly as before, never removed here.
+func ensureWritableRegularPath(dir, rel string, state map[string][]byte) error {
 	cur := dir
 	segs := strings.Split(rel, "/")
 	for i, seg := range segs {
@@ -263,7 +272,13 @@ func ensureWritableRegularPath(dir, rel string) error {
 			return nil
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("refusing to write %s: component %q is not a directory", rel, seg)
+			prefix := strings.Join(segs[:i+1], "/")
+			if _, held := state[prefix]; held {
+				return fmt.Errorf("refusing to write %s: component %q is a file the patch state still holds; the contradictory state cannot have the path as both file and directory", rel, seg)
+			}
+			if err := os.Remove(cur); err != nil {
+				return fmt.Errorf("failed to remove the baseline file at %s for the restructure under %s: %w", prefix, rel, err)
+			}
 		}
 	}
 	return nil

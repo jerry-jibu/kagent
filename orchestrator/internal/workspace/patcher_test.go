@@ -424,3 +424,105 @@ func keys(m map[string][]byte) []string {
 	}
 	return out
 }
+
+// Given the worker restructuring the tree (a tracked file path became a
+// directory path), when the patcher ships, assert the restructure is
+// delivered — the baseline file is replaced by the directory — while every
+// symlink refusal stays intact.
+func TestPatcherFileToDirTransition(t *testing.T) {
+	t.Run("Given a baseline tracking a regular file where state writes beneath it as a directory, when the patcher ships, assert the file→dir transition is delivered and the file is gone", func(t *testing.T) {
+		f := newGitFixture(t, map[string][]byte{
+			"notes":       []byte("old flat notes\n"),
+			"unmoved.txt": []byte("unchanged\n"),
+		})
+		state := map[string][]byte{
+			"notes/idea.md": []byte("restructured idea\n"),
+			"unmoved.txt":   []byte("unchanged\n"),
+		}
+
+		patcher := workspace.NewPatcher(workspace.PatcherOptions{})
+		if _, err := patcher.Patch(context.Background(), workspace.PatchRequest{
+			RepoURL:    f.remoteURL,
+			BaseCommit: f.baseSHA,
+			Branch:     "ticket-restructure",
+			Message:    "ticket-restructure: file became a directory",
+			State:      state,
+		}); err != nil {
+			t.Fatalf("Patch refused a legitimate restructure: %v", err)
+		}
+
+		tree := f.branchTree(t, "ticket-restructure")
+		want := map[string][]byte{
+			"notes/idea.md": []byte("restructured idea\n"),
+			"unmoved.txt":   []byte("unchanged\n"),
+		}
+		if len(tree) != len(want) {
+			t.Fatalf("pushed tree holds %d files (%v), want %d", len(tree), keys(tree), len(want))
+		}
+		for path, content := range want {
+			if got, ok := tree[path]; !ok || string(got) != string(content) {
+				t.Fatalf("tree[%s] = %q (present %v), want %q", path, got, ok, content)
+			}
+		}
+	})
+
+	t.Run("Given the same restructure where the path is a tracked symlink, when state writes beneath it, assert the patch is still refused and the symlink survives — the new removal path must never touch symlinks", func(t *testing.T) {
+		f := newGitFixtureWithSymlinks(t,
+			map[string][]byte{"unmoved.txt": []byte("unchanged\n")},
+			map[string]string{"notes": "../escape/notes-victim"},
+		)
+		victim := filepath.Join(f.root, "escape", "notes-victim")
+		if err := os.MkdirAll(filepath.Dir(victim), 0o755); err != nil {
+			t.Fatalf("mkdir escape dir: %v", err)
+		}
+		if err := os.WriteFile(victim, []byte("precious\n"), 0o644); err != nil {
+			t.Fatalf("seed escape target: %v", err)
+		}
+
+		patcher := workspace.NewPatcher(workspace.PatcherOptions{})
+		_, err := patcher.Patch(context.Background(), workspace.PatchRequest{
+			RepoURL:    f.remoteURL,
+			BaseCommit: f.baseSHA,
+			Branch:     "ticket-sym-restructure",
+			Message:    "ticket-sym-restructure: write beneath symlinked path",
+			State: map[string][]byte{
+				"notes/idea.md": []byte("escape attempt\n"),
+				"unmoved.txt":   []byte("unchanged\n"),
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("writing beneath a symlinked path must stay refused with a symlink error, got: %v", err)
+		}
+		if got, readErr := os.ReadFile(victim); readErr != nil || string(got) != "precious\n" {
+			t.Fatalf("symlink target must stay untouched, got %q (%v)", got, readErr)
+		}
+		if f.hasBranch(t, "ticket-sym-restructure") {
+			t.Fatalf("a refused patch must not push its branch")
+		}
+	})
+
+	t.Run("Given contradictory state holding both the file and a path beneath it, when the patcher ships, assert the patch is refused — one path cannot be file and directory", func(t *testing.T) {
+		f := newGitFixture(t, map[string][]byte{
+			"notes": []byte("old flat notes\n"),
+		})
+		state := map[string][]byte{
+			"notes":         []byte("still a file\n"),
+			"notes/idea.md": []byte("also a directory\n"),
+		}
+
+		patcher := workspace.NewPatcher(workspace.PatcherOptions{})
+		_, err := patcher.Patch(context.Background(), workspace.PatchRequest{
+			RepoURL:    f.remoteURL,
+			BaseCommit: f.baseSHA,
+			Branch:     "ticket-contradiction",
+			Message:    "ticket-contradiction",
+			State:      state,
+		})
+		if err == nil || !strings.Contains(err.Error(), "contradictory") {
+			t.Fatalf("contradictory state must be refused naming the contradiction, got: %v", err)
+		}
+		if f.hasBranch(t, "ticket-contradiction") {
+			t.Fatalf("a refused patch must not push its branch")
+		}
+	})
+}

@@ -270,6 +270,73 @@ func TestAgentfsBackendListAndMissing(t *testing.T) {
 			t.Fatalf("listing = %v, want empty", listing)
 		}
 	})
+
+	t.Run("Given a read refusal carrying the engine's absence format for ANOTHER path, when ReadFile runs on the requested path, assert it does NOT read as ErrFileNotFound — imprecise absence would feed the patcher deletions of baseline files", func(t *testing.T) {
+		fake, backend := newTestAgentfsBackend(t)
+		ctx := context.Background()
+		const ws = "ticket-absence-precision"
+		if err := backend.EnsureWorkspace(ctx, ws); err != nil {
+			t.Fatalf("EnsureWorkspace failed: %v", err)
+		}
+		fake.scriptReadFault(ws, "wanted.txt", "file not found: someone/else.txt")
+
+		_, err := backend.ReadFile(ctx, ws, "wanted.txt")
+		if err == nil {
+			t.Fatal("a path-mismatched file-not-found must not succeed")
+		}
+		if errors.Is(err, workspace.ErrFileNotFound) {
+			t.Fatalf("a file-not-found naming another path must classify as an outage, got %v", err)
+		}
+	})
+
+	t.Run("Given a listed file whose read answers the engine's exact path-precise absence, when the workspace state is read back, assert the path is treated as absent — vanished between listing and read, deletions may proceed", func(t *testing.T) {
+		fake, backend := newTestAgentfsBackend(t)
+		ctx := context.Background()
+		const ws = "ticket-absence-exact"
+		if err := backend.EnsureWorkspace(ctx, ws); err != nil {
+			t.Fatalf("EnsureWorkspace failed: %v", err)
+		}
+		if err := backend.WriteFile(ctx, ws, "keep.txt", []byte("kept\n")); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		// vanish.txt is listed (written), but its read answers the engine's
+		// exact absence format naming precisely that path: it vanished
+		// between the listing and its read-back.
+		if err := backend.WriteFile(ctx, ws, "vanish.txt", []byte("gone\n")); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		fake.scriptReadFault(ws, "vanish.txt", "tool agenticfs_read_file reported an error: file not found: vanish.txt")
+
+		state, err := workspace.ReadWorkspaceState(ctx, backend, ws)
+		if err != nil {
+			t.Fatalf("ReadWorkspaceState failed: %v", err)
+		}
+		if _, ok := state["vanish.txt"]; ok {
+			t.Fatalf("a path-precise absence must not appear in the state")
+		}
+		if _, ok := state["keep.txt"]; !ok {
+			t.Fatalf("kept path must appear in the state")
+		}
+	})
+
+	t.Run("Given a listed file whose read answers generic 'does not exist' wording without a path, when the workspace state is read back, assert the whole read-back fails loudly — a workspace-level failure must never read as a complete snapshot", func(t *testing.T) {
+		fake, backend := newTestAgentfsBackend(t)
+		ctx := context.Background()
+		const ws = "ticket-absence-outage"
+		if err := backend.EnsureWorkspace(ctx, ws); err != nil {
+			t.Fatalf("EnsureWorkspace failed: %v", err)
+		}
+		if err := backend.WriteFile(ctx, ws, "casualty.txt", []byte("listed but unreadable\n")); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		fake.scriptReadFault(ws, "casualty.txt", "tool agenticfs_read_file reported an error: engine overlay store does not exist")
+
+		if _, err := workspace.ReadWorkspaceState(ctx, backend, ws); err == nil {
+			t.Fatal("generic wording without a path must fail the read-back as an outage, not read as absence")
+		} else if errors.Is(err, workspace.ErrFileNotFound) {
+			t.Fatalf("an outage must not surface as ErrFileNotFound: %v", err)
+		}
+	})
 }
 
 func pathsOf(state map[string][]byte) []string {

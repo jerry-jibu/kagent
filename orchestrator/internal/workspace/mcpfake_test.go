@@ -29,13 +29,18 @@ type fakeAgentfs struct {
 	mu         sync.Mutex
 	session    string
 	workspaces map[string]map[string]string // workspace name -> path -> content
-	calls      []string                     // "name" per tools/call, in order
+	// readFaults scripts read_file failures: workspace -> path -> the exact
+	// error text the fake answers with over the isError channel, so the
+	// absence-classification tests can present adversarial engine messages.
+	readFaults map[string]map[string]string
+	calls      []string // "name" per tools/call, in order
 }
 
 func newFakeAgentfs() *fakeAgentfs {
 	f := &fakeAgentfs{
 		session:    fmt.Sprintf("fake-agentfs-%d", time.Now().UnixNano()),
 		workspaces: map[string]map[string]string{},
+		readFaults: map[string]map[string]string{},
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	return f
@@ -59,6 +64,17 @@ func (f *fakeAgentfs) workspaceFiles(name string) map[string]string {
 		out[p] = c
 	}
 	return out
+}
+
+// scriptReadFault makes read_file for ws/path answer the given error text
+// over the isError channel, overriding the real tool semantics.
+func (f *fakeAgentfs) scriptReadFault(ws, path, text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.readFaults[ws] == nil {
+		f.readFaults[ws] = map[string]string{}
+	}
+	f.readFaults[ws][path] = text
 }
 
 func (f *fakeAgentfs) handle(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +161,9 @@ func (f *fakeAgentfs) callTool(name string, args map[string]any) (text string, i
 		ws[str("path")] = str("content")
 		return "written", false
 	case "agenticfs_read_file":
+		if fault, scripted := f.readFaults[str("workspace")][str("path")]; scripted {
+			return fault, true
+		}
 		ws, ok := f.workspaces[str("workspace")]
 		if !ok {
 			return "workspace not found: " + str("workspace"), true

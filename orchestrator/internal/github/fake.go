@@ -156,6 +156,20 @@ func (f *Fake) OpenPullRequestCount(repo, head string) int {
 	return n
 }
 
+// ClosePullRequest marks every PR for a head branch closed, replaying the
+// human action between the orchestrator's lost-receipt create and its retry:
+// GitHub keeps refusing the duplicate with 422 while the open lookup no
+// longer lists the PR.
+func (f *Fake) ClosePullRequest(repo, head string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.pulls {
+		if f.pulls[i].Head == head {
+			f.pulls[i].State = "closed"
+		}
+	}
+}
+
 // handleCreatePullRequest mirrors POST /repos/{owner}/{repo}/pulls: 201 with
 // the created PR, 422 "A pull request already exists for ..." when the head
 // branch already carries an open PR.

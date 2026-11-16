@@ -139,10 +139,11 @@ func (b *AgentfsBackend) WriteFile(ctx context.Context, ws, path string, content
 }
 
 // ReadFile reads one file back by path. A path absent from the workspace
-// surfaces as ErrFileNotFound: the bridge reports missing files through its
-// isError channel ("file not found: <path>"), which is matched here — string
-// matching on the bridge's error text, hardened when the agentfs theme gives
-// the bridge typed errors.
+// surfaces as ErrFileNotFound — but ONLY when the bridge's error carries the
+// engine's exact absence format naming THIS path ("file not found: <path>",
+// see isAgentfsFileNotFound). Anything else, however much it smells like a
+// missing file, stays an outage: absence is what feeds the patcher's
+// deletions of baseline files, so imprecision there is destructive.
 func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte, error) {
 	if err := validateWorkspacePath(path); err != nil {
 		return nil, err
@@ -152,7 +153,7 @@ func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte,
 		"path":      path,
 	})
 	if err != nil {
-		if isAgentfsFileNotFound(err) {
+		if isAgentfsFileNotFound(err, path) {
 			return nil, fmt.Errorf("%w: %s", ErrFileNotFound, path)
 		}
 		if isAgentfsDirectory(err) {
@@ -163,10 +164,11 @@ func (b *AgentfsBackend) ReadFile(ctx context.Context, ws, path string) ([]byte,
 	return []byte(text), nil
 }
 
-// ListFiles lists the workspace-relative paths under prefix via the bridge's
-// agenticfs_list_files tool (newline-joined). The bridge reports an empty
-// listing as the literal "(empty)", which maps back to an empty slice. A
-// prefix filters by lexical prefix; "" lists the whole workspace.
+// ListFiles lists the IMMEDIATE children of prefix via the bridge's
+// agenticfs_list_files tool (newline-joined): directories as bare names,
+// files as their names, sorted lexically — the bridge does NOT recurse, and
+// "" lists the children of the workspace root. The bridge reports an empty
+// listing as the literal "(empty)", which maps back to an empty slice.
 func (b *AgentfsBackend) ListFiles(ctx context.Context, ws, prefix string) ([]string, error) {
 	text, err := b.call(ctx, "agenticfs_list_files", map[string]any{
 		"workspace": ws,
@@ -202,8 +204,6 @@ func isAgentfsAlreadyExists(err error) bool {
 		strings.Contains(msg, "already in use")
 }
 
-// isAgentfsFileNotFound recognizes the bridge's missing-file refusal so
-// read-backs can distinguish absence from outage.
 // isAgentfsDirectory reports the bridge's read_file refusal on a directory
 // (verified against the live bridge: read_file on a listed child directory
 // answers exactly "is a directory").
@@ -211,12 +211,32 @@ func isAgentfsDirectory(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "is a directory")
 }
 
-func isAgentfsFileNotFound(err error) bool {
+// agentfsFileNotFoundPrefix is the absence format the agentfs engine answers
+// a read_file refusal with ("file not found: <path>"; verified against the
+// engine and the deployed bridge, which forwards the text verbatim).
+const agentfsFileNotFoundPrefix = "file not found: "
+
+// isAgentfsFileNotFound recognizes the bridge's missing-file refusal at PATH
+// PRECISION (PR #11 review, Required): the message must carry the engine's
+// exact absence format AND name exactly the path that was requested. Absence
+// is authoritative for the read-back (readback.go turns ErrFileNotFound into
+// deletions of baseline files), so a loose classification is destructive: a
+// workspace-level failure whose text merely contains "does not exist" or
+// "no such file" mid-read-back would masquerade as absence and delete the
+// baseline tree. Those generic substrings therefore NEVER classify as
+// absence — without the exact format plus the path equality, the error is an
+// outage (transient, loud). The engine text arrives as the LAST segment of
+// the wrapped error chain (mcp.go and the callers prefix context onto it),
+// hence LastIndex of the marker; only that well-defined prefix is stripped.
+func isAgentfsFileNotFound(err error, path string) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "file not found") ||
-		strings.Contains(msg, "no such file") ||
-		strings.Contains(msg, "does not exist")
+	at := strings.LastIndex(msg, agentfsFileNotFoundPrefix)
+	if at < 0 {
+		return false
+	}
+	reported := strings.TrimSpace(msg[at+len(agentfsFileNotFoundPrefix):])
+	return reported == path
 }

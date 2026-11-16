@@ -62,6 +62,36 @@ func TestCreatePullRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("Given a replay whose existing PR was since merged (closed), when CreatePullRequest answers GitHub's 422 but the open lookup comes back empty, assert that the state=all fallback returns the closed PR instead of looping a permanent error", func(t *testing.T) {
+		fake := github.NewFake()
+		defer fake.Close()
+		transport := github.NewTransport(github.TransportConfig{BaseURL: fake.URL(), Token: "tok-1"})
+		ctx := context.Background()
+
+		in := github.PullRequestInput{Title: "t", Head: "ticket-merged", Base: "main", Body: "b"}
+		first, err := transport.CreatePullRequest(ctx, "acme/api", in)
+		if err != nil {
+			t.Fatalf("first create failed: %v", err)
+		}
+		// The PR was merged between the lost receipt and the replay: GitHub
+		// keeps answering 422 "already exists" while state=open lists nothing.
+		fake.ClosePullRequest("acme/api", "ticket-merged")
+
+		replayed, err := transport.CreatePullRequest(ctx, "acme/api", in)
+		if err != nil {
+			t.Fatalf("replay after merge must resolve the existing PR, got: %v", err)
+		}
+		if replayed.Number != first.Number || replayed.URL != first.URL {
+			t.Fatalf("replay returned %+v, want the existing %+v", replayed, first)
+		}
+		if replayed.State != "closed" {
+			t.Fatalf("replay State = %q, want the PR's real GitHub state \"closed\"", replayed.State)
+		}
+		if len(fake.PullRequests()) != 1 {
+			t.Fatalf("replay opened a duplicate PR: the fake holds %d PRs", len(fake.PullRequests()))
+		}
+	})
+
 	t.Run("Given a GitHub failure, when CreatePullRequest runs, assert that the error carries the status so the deliverer can retry", func(t *testing.T) {
 		fake := github.NewFake()
 		defer fake.Close()

@@ -35,8 +35,13 @@ type Backend interface {
 	// ReadFile reads one file by path inside the workspace. A path that
 	// does not exist reads back as ErrFileNotFound.
 	ReadFile(ctx context.Context, workspace, path string) ([]byte, error)
-	// ListFiles lists the workspace-relative paths under prefix, sorted
-	// lexically. An empty prefix lists the whole workspace; an empty
+	// ListFiles lists the IMMEDIATE children of prefix as workspace-relative
+	// single path segments, sorted lexically. It does NOT recurse: a child
+	// directory comes back as its bare name (no trailing slash, no paths
+	// beneath it), and callers descend by calling ListFiles again with that
+	// child as the prefix (the read-back does exactly that, driving the
+	// recursion off ErrIsDirectory from ReadFile). An empty prefix lists the
+	// children of the workspace ROOT — not the whole workspace; an empty
 	// workspace lists empty.
 	ListFiles(ctx context.Context, workspace, prefix string) ([]string, error)
 }
