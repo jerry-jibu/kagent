@@ -62,7 +62,9 @@ func main() {
 		}
 		if *expectToken != "" && f.LastAuthorization() != "" && !seen["auth"] {
 			seen["auth"] = true
-			logger.Info("last authorization", "value", f.LastAuthorization(),
+			// The bearer value must never land in the log — only whether it
+			// matched the expected token (PR #11 review, nit).
+			logger.Info("last authorization",
 				"matches", f.LastAuthorization() == "Bearer "+*expectToken)
 		}
 	}

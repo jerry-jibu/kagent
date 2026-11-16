@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -149,15 +150,20 @@ func parseLogLevel(flagValue string) (slog.Level, error) {
 }
 
 // startupState feeds the healthz readiness probe: it reports exactly which
-// startup steps completed, so a partially-started process probes 503.
+// startup steps completed, so a partially-started process probes 503. lockLost
+// is flipped by the instance-lock watchdog (atomic: the watchdog goroutine
+// writes, probe readers read).
 type startupState struct {
 	lockHeld     bool
 	migrated     bool
 	policyLoaded bool
+	lockLost     atomic.Bool
 }
 
 func (s *startupState) ready() error {
 	switch {
+	case s.lockLost.Load():
+		return fmt.Errorf("instance lock lost")
 	case !s.lockHeld:
 		return fmt.Errorf("instance lock not held")
 	case !s.migrated:
@@ -204,6 +210,22 @@ func main() {
 	}
 	state.lockHeld = true
 	log.Info("instance lock acquired", "schema", cfg.Schema)
+
+	// Instance-lock watchdog (PR #11 review, Required #2): the lock lives on
+	// a connection nothing else touches, so a dead connection releases the
+	// session lock invisibly — this process would stay ready while a second
+	// instance starts and double-runs. The store probes the lock connection
+	// every InstanceLockProbeInterval; the first not-verifiably-held probe
+	// flips readiness false, logs loudly, and drives the same graceful
+	// shutdown a signal does (the loss is delivered through lockLost below).
+	lockLost := make(chan string, 1)
+	watchCtx, cancelLockWatch := context.WithCancel(ctx)
+	go st.WatchInstanceLock(watchCtx, store.InstanceLockProbeInterval, func(why string) {
+		state.lockLost.Store(true)
+		log.Error("instance lock lost; refusing readiness and shutting down",
+			"reason", why, "schema", cfg.Schema)
+		lockLost <- why
+	})
 
 	if err := st.Migrate(ctx); err != nil {
 		log.Error("failed to apply migrations", "error", err)
@@ -252,16 +274,20 @@ func main() {
 	// loopDone is signalled once per background loop; shutdown drains it
 	// before closing the store — a beat racing a closed pool widens exactly
 	// the landed-but-unbound dispatch window the write-ahead intent exists
-	// to shrink (PR #11 C3). loopCount must match the number of runLoop
-	// spawns below.
-	loopCount := 4
-	loopDone := make(chan struct{}, loopCount)
+	// to shrink (PR #11 C3). loopsSpawned counts the runLoop goroutines
+	// actually started below (the set is conditional on the flags), so the
+	// drain waits for exactly what is running — a fixed count made every
+	// reduced startup pay the full shutdown timeout (PR #11 review,
+	// Required #4).
+	loopDone := make(chan struct{}, 4)
+	loopsSpawned := 0
 
 	// failStart tears the process down on a refused start (AC: 拒绝启动):
 	// every partially started subsystem is stopped and the process exits
 	// nonzero. One teardown sequence instead of one per refusal site.
 	failStart := func(msg string, cause error) {
 		log.Error(msg, "error", cause)
+		cancelLockWatch()
 		cancelPoller()
 		watcher.Stop()
 		st.Close()
@@ -304,6 +330,7 @@ func main() {
 			engine := eval.NewEngine(st, eval.NewEvaluator(
 				a2a.NewHTTPTransport(a2a.HTTPConfig{BaseURL: cfg.A2AGatewayURL}),
 				cfg.EvaluatorAgent))
+			loopsSpawned++
 			go runEvalLoop(pollerCtx, cfg.GitHubSource, engine, watcher, cfg.EvalInterval, materializeNotify, log, loopDone)
 			log.Info("eval loop started",
 				"agent", cfg.EvaluatorAgent,
@@ -366,6 +393,7 @@ func main() {
 			log.Info("startup recovery loaded the non-terminal manifest",
 				"tickets", recovered.Tickets, "pending", recovered.Pending, "running", recovered.Running)
 
+			loopsSpawned++
 			go runPassLoop(pollerCtx, pass, cfg.PassInterval, log, loopDone)
 			log.Info("pass beat started",
 				"worker", cfg.WorkerAgent,
@@ -396,6 +424,7 @@ func main() {
 				Token:      cfg.GitHubToken,
 				Log:        log,
 			})
+			loopsSpawned++
 			go runDeliveryLoop(pollerCtx, deliverer, cfg.PassInterval, log, loopDone)
 			log.Info("delivery loop started",
 				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
@@ -419,6 +448,7 @@ func main() {
 				Token:      cfg.GitHubToken,
 				Log:        log,
 			})
+			loopsSpawned++
 			go runMaterializeLoop(pollerCtx, materializer, cfg.PassInterval, materializeNotify, log, loopDone)
 			log.Info("materialize loop started",
 				"workspace_endpoint", cfg.WorkspaceMCPEndpoint,
@@ -452,23 +482,31 @@ func main() {
 		log.Info("shutting down", "signal", s.String())
 	case err := <-serveErr:
 		log.Error("http server failed", "error", err)
+	case why := <-lockLost:
+		log.Info("shutting down after instance-lock loss", "reason", why)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	cancelLockWatch()
 	cancelPoller()
 	watcher.Stop()
 	// Drain the background loops before closing the store: a beat racing a
 	// closed pool widens the landed-but-unbound dispatch window (PR #11 C3)
 	// and litters the log with pool errors. The drain shares the HTTP
-	// shutdown budget — a hung beat waits at most the remaining deadline.
-	for i := 0; i < loopCount; i++ {
+	// shutdown budget — a hung beat waits at most the remaining deadline —
+	// and waits for exactly the loops that were spawned (PR #11 review,
+	// Required #4: the old fixed count made reduced startups wait the full
+	// timeout, and the deadline case's break only left the select, looping
+	// on a spent context).
+	for drained := 0; drained < loopsSpawned; drained++ {
 		select {
 		case <-loopDone:
 		case <-shutdownCtx.Done():
-			log.Warn("shutdown deadline reached with loops still running", "drained", i, "of", loopCount)
-			break
+			log.Warn("shutdown deadline reached with loops still running",
+				"drained", drained, "of", loopsSpawned)
+			drained = loopsSpawned
 		}
 	}
 	st.Close()

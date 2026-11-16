@@ -46,7 +46,13 @@ type AdminService interface {
 // adminToken guards the MUTATING admin endpoints (retry/stop) when set —
 // Authorization: Bearer <token> required (PR #11 review, Required #12 /
 // design-R3-2: a forged in-cluster retry/stop drives the ticket machine).
-// Empty keeps the P0 dev behavior; reads stay open (ClusterIP-only).
+// Empty keeps the P0 dev behavior. The admin GET endpoints (healthz,
+// /admin/policy, /admin/needs-attention) are deliberately UNAUTHENTICATED in
+// P0: the port is reachable only inside the cluster boundary (ClusterIP,
+// no Ingress). That is a P0 scope decision, not an oversight — an operator
+// exposing this port beyond the cluster (Ingress, LoadBalancer, port-forward
+// to untrusted networks) MUST front it with authenticating proxy or enable
+// the admin token and treat reads as public.
 func NewHandler(ready Readiness, policy PolicyView, push http.Handler, admin AdminService, adminToken string) http.Handler {
 	mux := http.NewServeMux()
 	guard := func(next http.HandlerFunc) http.HandlerFunc {
