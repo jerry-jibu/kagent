@@ -739,6 +739,11 @@ providers:
 
 kagent-tools:
   enabled: true
+  # The deployed image tag follows the subchart's own appVersion (its image
+  # helper ignores a `digest` override, so the tool server cannot be pinned by
+  # digest from here). When you bump the kagent-tools dependency, the tool
+  # server image and the skills image pinned in files/builtin-skills.json can
+  # drift -- rerun `make builtin-skills-catalog` after every bump.
   nameOverride: tools
   replicaCount: 1
   # -- Node taints which will be tolerated for `Pod` [scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/).
@@ -783,17 +788,18 @@ kagent-tools:
 # ==============================================================================
 # BUILT-INS
 # ==============================================================================
-# Ready-made Agents and skills for a new install. Off in the chart; `kagent install`
-# turns them on.
+# The kagent-tools skills the UI offers out of the box. Off in the chart; set
+# builtins.enabled=true (a release the UI catalog is wanted for) to offer them.
 
 builtins:
-  # -- Create the built-in Agent and offer the kagent-tools skills in the UI.
-  # The Agent needs `harnesses.enabled`, `harnesses.kagent.enabled` and `kagent-tools.enabled`.
+  # -- Offer the kagent-tools skills in the UI. When true, the ui ConfigMap
+  # carries the chart's packaged skills catalog (files/builtin-skills.json,
+  # regenerate with `make builtin-skills-catalog`) as the KAGENT_UI_BUILTIN_SKILLS
+  # entry the ui container turns into env-config.js; when false, that key is
+  # left out of the rendered ConfigMap. The catalog image must be the kagent-tools
+  # image this chart deploys -- run `make builtin-skills-catalog` after bumping
+  # the kagent-tools dependency.
   enabled: false
-  platformAgent:
-    # -- Create platform-agent, which hands each task to a specialist subagent
-    # (Kubernetes, Helm, Istio, Argo Rollouts, Kubescape, Prometheus).
-    enabled: true
 
 # ==============================================================================
 # PROXY CONFIGURATION
