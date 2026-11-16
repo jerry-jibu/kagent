@@ -1,5 +1,6 @@
 import type { AppExtensionConfig } from "./types";
 import { exampleAppExtension } from "./example/exampleExtension";
+import { skillsCatalogExtension } from "./skillsCatalog/skillsCatalogExtension";
 
 /**
  * The extensions this build installs, in order.
@@ -23,5 +24,6 @@ import { exampleAppExtension } from "./example/exampleExtension";
  * the same reason installing one is an edit here rather than a setting.
  */
 export const activeAppExtensions: readonly AppExtensionConfig[] = [
+  skillsCatalogExtension,
   ...(import.meta.env.KAGENT_UI_VITE_EXAMPLE_EXTENSION === "true" ? [exampleAppExtension] : []),
 ];

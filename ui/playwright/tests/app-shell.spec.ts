@@ -252,7 +252,11 @@ test("app shell: collapsed, every nav icon is centred in its row", async ({
     "aria-expanded",
     "false",
   );
-  await expect(page.locator(".ant-menu-inline-collapsed")).toHaveCount(1);
+  // Collapsed-ness is the Sider's state, not a menu count: the sidebar groups
+  // consecutive core items into one Menu each and renders contributed entries
+  // (the skills catalog) between the groups, so several collapsed menus at once
+  // is the interleaving working, not the collapse failing.
+  await expect(page.locator('[data-testid="app-sidebar"].ant-layout-sider-collapsed')).toHaveCount(1);
 
   /*
    * Then wait out the collapse, asked of the animations rather than of the clock: the

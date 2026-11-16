@@ -23,8 +23,9 @@ global:
   # air-gap mirror knob: one value redirects all images. Repository and tag stay
   # per-image. For per-image control, leave this unset and set the per-image
   # registry keys. Covers this chart's own images: controller, sandbox guest, ui,
-  # substrateWorkerPool.workerImage, and built-in Harness images
-  # (both packaged defaults and config.harnessImages overrides). The vendored subcharts
+  # substrateWorkerPool.workerImage, built-in Harness images
+  # (both packaged defaults and config.harnessImages overrides), and the built-in
+  # skills image. The vendored subcharts
   # kagent-tools adopts it when its pinned version bumps.
   imageRegistry: ""
   # -- Pull secrets for every pod. The chart merges this list (union) into each
@@ -738,6 +739,11 @@ providers:
 
 kagent-tools:
   enabled: true
+  # The deployed image tag follows the subchart's own appVersion (its image
+  # helper ignores a `digest` override, so the tool server cannot be pinned by
+  # digest from here). When you bump the kagent-tools dependency, the tool
+  # server image and the skills image pinned in files/builtin-skills.json can
+  # drift -- rerun `make builtin-skills-catalog` after every bump.
   nameOverride: tools
   replicaCount: 1
   # -- Node taints which will be tolerated for `Pod` [scheduling](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/).
@@ -774,6 +780,26 @@ kagent-tools:
     loglevel: "debug"
     metrics:
       port: 8085 # Use a different port than the controller service port to avoid duplicate port definitions
+    prometheus:
+      # -- Prometheus URL for the tool server, with http:// or https://. Setting it
+      # also offers the Prometheus skill in the UI.
+      url: ""
+
+# ==============================================================================
+# BUILT-INS
+# ==============================================================================
+# The kagent-tools skills the UI offers out of the box. Off in the chart; set
+# builtins.enabled=true (a release the UI catalog is wanted for) to offer them.
+
+builtins:
+  # -- Offer the kagent-tools skills in the UI. When true, the ui ConfigMap
+  # carries the chart's packaged skills catalog (files/builtin-skills.json,
+  # regenerate with `make builtin-skills-catalog`) as the KAGENT_UI_BUILTIN_SKILLS
+  # entry the ui container turns into env-config.js; when false, that key is
+  # left out of the rendered ConfigMap. The catalog image must be the kagent-tools
+  # image this chart deploys -- run `make builtin-skills-catalog` after bumping
+  # the kagent-tools dependency.
+  enabled: false
 
 # ==============================================================================
 # PROXY CONFIGURATION
