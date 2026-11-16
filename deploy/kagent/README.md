@@ -12,16 +12,32 @@
 | `harness-dsh-byo.yaml` | Harness `dsh-byo` | BYO 契约；`${DSH_BYO_IMAGE}`、`${SNAPSHOT_LOCATION}` 需代入 |
 | `agent-worker.yaml` | Agent `superagent-worker` | inline template + agentfs MCP 绑定 + `deepseek-openai` |
 | `agent-evaluator.yaml` | Agent `superagent-evaluator` | 内置 `kagent-default` harness + `outputSchema` 结构化 Decision + `deepseek` |
-| `orchestrator.yaml` | Service + Deployment `superagent-orchestrator` + ConfigMap `superagent-policy` | push receiver 的集群内 Service（网关回调可达）+ 编排器单副本（实例锁）+ policy 热加载 + PG Pod 证书投影 + T9 全链路 flags |
+| `agentfs.yaml` | Deployment + Service `agentfs` + RemoteMCPServer `agenticfs-mcp` | 真 agentfs 引擎 + kagent-bridge 双二进制（bridge digest 由 scripts/image-build.sh 推送后钉死） |
+| `egresspolicy-agentfs.yaml` | EgressPolicy `agentfs-bridge` | worker 沙箱 → agentfs 出站授权 |
+| `networkpolicy-agentfs.yaml` | NetworkPolicy `agentfs` | agentfs 入站默认拒绝：只放行 kagent 同 ns + ate-system worker actor（PR #11 review） |
+| `orchestrator.yaml` | ServiceAccount + Service + Deployment `superagent-orchestrator` + ConfigMap `superagent-policy` + NetworkPolicy | push receiver 的集群内 Service（网关回调可达）+ 编排器单副本（实例锁）+ policy 热加载 + PG Pod 证书投影 + 入站默认拒绝 + T9 全链路 flags |
 | `e2e-v1.sh` | 验收脚本 | V1 全链路（fake GitHub 面可重复；见下） |
 
 ## 镜像构建台账（源 SHA → digest，显式重同步，不自动漂移）
 
+**两条 registry 并存，权威路径 = `localhost:5001/kagent-dev/*`**（PR #11 review 对账）：
+deploy-local.sh 的默认 `DSH_BYO_IMAGE`、agentfs.yaml 的钉死值、image-build.sh 的推送目标都在 5001。
+`localhost:5000/*` 为 T9 期旧路径，下表仅保留作历史记录；编排器集群镜像仍在 5000（无 5001 副本，
+e2e 不用镜像——编排器以本地进程跑，见 scripts/build.sh）。
+
+现状核对（2026-11-16）：宿主当前只有 `local-registry`@5000 在跑（catalog 只有 5000 路径的 T9 工件），
+5001 的 registry 容器当前不在运行。上表两行 5001 digest 是清单钉死且集群 Pod 正在跑的值
+（image-build.sh 推送时经 curl 校验落账；kind 节点的 containerd 没有 5001 的 certs.d 镜像配置，
+拉取当时由 5001 registry 直连完成）。重构建/重拉前需先把 5001 registry 起回来——image-build.sh
+的推送后校验会对 registry 缺位快速失败。
+
 | 镜像 | 源 | 记录 |
 |---|---|---|
-| `kagent-dsh-byo` | kagent-dev/byo-ext **PR #2**（未合入 main）分支 `pr-2` @ `19771c8` | `localhost:5000/kagent-dsh-byo@sha256:5a71928b0aaad081b06ee9600190d967857d22a209bae85a49a631dabe79b9eb`（T9 前基线，旧 env 契约） |
-| `kagent-dsh-byo`（T9） | 同 PR 分支 `pr-2` @ `8632d5e`（`7383f7b` bootstrap 契约 + `14af3d4` durable 子目录 + `8632d5e` chmod EPERM 容忍） | `localhost:5000/kagent-dsh-byo@sha256:6dd2a0076d306d14751a714d69fccec5b6dc85c46936888cbf60cea02ed841ac` |
-| `superagent-orchestrator` | 本仓库 `orchestrator/` 模块 | `localhost:5000/superagent-orchestrator@sha256:ef37c412ce04f2a347bd5afdf77fa99453d09a9126bd34bc7885006c302dea30` |
+| `kagent-dev/dsh-byo`（**当前部署**） | kagent-dev/byo-ext **PR #2**（未合入 main）分支 `pr-2`；产出 defb23dc 的具体源 SHA 未随构建记录在案——重同步时按下方构建配方重出并记新对 | `localhost:5001/kagent-dev/dsh-byo@sha256:defb23dcb798627bb37fe0ad2a4c3c20d6dbfb9ba9dc7a7804eb71b422a0882d`（deploy-local.sh 默认部署值） |
+| `kagent-dev/kagent-bridge` | jibudata/agent-data-workspace 引擎（`agentfs mcp`）+ 本仓库 `deploy/kagent-bridge` 双二进制；引擎源 SHA 未钉死（image-build.sh 取 `$AGENTFS_SRC` 当前 checkout），重同步 = 重跑该脚本 | `localhost:5001/kagent-dev/kagent-bridge@sha256:026bbc2348b64c79759711d583fd2ed93d98c23a72ced5a0e24d6361db5e1176`（agentfs.yaml 钉死；image-build.sh 推送校验后自动重钉） |
+| `kagent-dsh-byo`（T9 前基线，历史） | kagent-dev/byo-ext PR #2 分支 `pr-2` @ `19771c8` | `localhost:5000/kagent-dsh-byo@sha256:5a71928b0aaad081b06ee9600190d967857d22a209bae85a49a631dabe79b9eb`（旧 env 契约） |
+| `kagent-dsh-byo`（T9，历史） | 同 PR 分支 `pr-2` @ `8632d5e`（`7383f7b` bootstrap 契约 + `14af3d4` durable 子目录 + `8632d5e` chmod EPERM 容忍） | `localhost:5000/kagent-dsh-byo@sha256:6dd2a0076d306d14751a714d69fccec5b6dc85c46936888cbf60cea02ed841ac` |
+| `superagent-orchestrator` | 本仓库 `orchestrator/` 模块 | `localhost:5000/superagent-orchestrator@sha256:ef37c412ce04f2a347bd5afdf77fa99453d09a9126bd34bc7885006c302dea30`（集群部署形态用；e2e 本地进程免镜像） |
 
 台账纪律（0002 风险表）：镜像重构建/上游重同步时，先记录 源SHA → digest 对应关系，再改 Harness/Deployment 的 digest；升级 kagent 时按 0009 upgrade 契约重验（本 T9 已验证：bridge 升级跟进 bootstrap-bundle 契约 = 预测的升级契约风险的实做）。
 
@@ -34,9 +50,9 @@ cd /path/to/byo-ext/harnesses/deepseek
 export PATH=$HOME/sdk/go1.27.3/bin:$PATH
 go mod tidy && go mod vendor   # 本地 replace 的 kagent 树打入 vendor/，容器内零网络构建
 # 构建文件（CN 网络镜像 + vendor 构建）：kagent-dev/.superagent-notes/build/Dockerfile.dsh
-docker build -f /path/to/Dockerfile.dsh --target production -t localhost:5000/kagent-dsh-byo:bootstrap .
-docker push localhost:5000/kagent-dsh-byo:bootstrap
-curl -sI http://localhost:5000/v2/kagent-dsh-byo/manifests/bootstrap \
+docker build -f /path/to/Dockerfile.dsh --target production -t localhost:5001/kagent-dev/dsh-byo:bootstrap .
+docker push localhost:5001/kagent-dev/dsh-byo:bootstrap
+curl -sI http://localhost:5001/v2/kagent-dev/dsh-byo/manifests/bootstrap \
   -H 'Accept: application/vnd.oci.image.index.v1+json' | grep -i docker-content-digest   # 记入台账
 ```
 
@@ -49,6 +65,11 @@ docker push localhost:5000/superagent-orchestrator:t9   # 运行时含系统 git
 ```
 
 ## kind ↔ 本地 registry（本机 e2e 前置）
+
+> 注（PR #11 review 对账）：本节打通步骤是 5000 路径的——kind 节点的 containerd certs.d
+> 只配了 `localhost:5000`（已核对在位）。当前清单引用的 `localhost:5001/kagent-dev/*`
+> 没有节点侧镜像配置，拉取靠 5001 registry 对节点直连可达（部署当时成立；现该容器不在
+> 运行，重拉前先起回来——见台账节的现状核对）。
 
 本地 registry 容器 `local-registry`（registry:2 @ localhost:5000）需两条打通：
 
@@ -69,7 +90,7 @@ docker push localhost:5000/superagent-orchestrator:t9   # 运行时含系统 git
    # 172.18.0.3 = registry 容器在 kind 网络上的 IP（docker inspect 可查）；Pod 均可达
    ```
 
-   两者都就绪后 `crictl pull` 与 golden build 均可取 `localhost:5000/kagent-dsh-byo@sha256:<digest>`。
+   两者都就绪后 `crictl pull` 与 golden build 均可取 `localhost:5001/kagent-dev/dsh-byo@sha256:<digest>`。
 
 3. **kind 网关 push 回调（本机 e2e）**：编排器 push-base-url 指向宿主时，网关默认拒绝
    http/私网 push URL——kind 环境需在 `kagent-controller` ConfigMap 置
@@ -103,7 +124,7 @@ kubectl -n kagent create secret generic kagent-deepseek \
 ```
 
 ```bash
-export DSH_BYO_IMAGE='localhost:5000/kagent-dsh-byo@sha256:<64hex>'   # 台账 digest
+export DSH_BYO_IMAGE='localhost:5001/kagent-dev/dsh-byo@sha256:<64hex>'   # 台账 digest（权威 registry 路径，见台账节）
 export SNAPSHOT_LOCATION='s3://ate-snapshots/kagent/'                 # 与集群既有 Harness 一致
 export POLICY_REPO='example/repo'          # Gate 仓库名单
 export POLICY_SENDER='maintainer-login'    # Gate admission 名单
@@ -158,6 +179,7 @@ sed -e "s|\${ORCH_IMAGE}|$ORCH_IMAGE|" \
 ## P0 已接受边界（审查收口记录）
 
 - **入站面已硬化（2026-11-15，批次 #12）**：push 接收器支持 Gateway push JWT 验证（钉死公钥 = `--push-jwt-public-key`+`--push-jwt-issuer`，manifest 经 Secret 注入；token 绑定 taskId，claim/事件不匹配 403）；admin 变更端点（retry/stop）守 `--admin-token`；NetworkPolicy 默认拒绝入站、只放行同 namespace。三个开关空缺时保持 dev 模式（本地 e2e/fake 网关可用），**非 dev 集群部署前必须全部设置**——清单里以 optional SecretKeyRef 注入，缺 Secret 即 dev 模式（编排器启动日志有 WARNING）。
+- **agentfs 入站面已硬化（2026-11-16，PR #11 review）**：`networkpolicy-agentfs.yaml` 默认拒绝入站，只放行 kagent 同 namespace（编排器/controller/gateway）与 ate-system（atelet 拉起的 worker actor 沙箱 Pod）——此前 agentfs 只有出站 EgressPolicy，任何 namespace 的 Pod 都能碰工单工作区数据。
 - **Session 身份与 share（Stories 23/24）——本轮不写码**：编排器经 Gateway mTLS 以自身 ServiceAccount 身份调用，session 创建者=编排器 SA 是构造事实（`tickets.session_id` 只记录 contextId，归属无需额外字段）。**share 链接目前由用户在 UI 手动创建**（SessionService share），编排器自动签发并回贴 issue 归 **P1**。
 - **e2e 形态偏离已接受**：V1 全链路验收是独立 bash 脚本（`deploy/kagent/e2e-v1.sh`，fake GitHub 面 + 真集群组件），而非 `go/core/test/e2e` 套件内的 Go 测试。链路覆盖达意（store/g fake GitHub/bare git/egress 四处留证据）；集成形态的偏离已审查接受，go 套件内沉淀归后续票。
 
@@ -218,8 +240,9 @@ deploy/kagent/e2e-v1.sh /tmp/kagent-v1-e2e
 | `scripts/env-setup.sh` | 环境体检+准备：kind 集群、t1-pg 测试 PG、DeepSeek Secret、controller `push.allowHttp` 补丁、DeepSeek API 余额连通性 | 每次 e2e 前（幂等） |
 | `scripts/build.sh` | 构建编排器与 fake GitHub 二进制 | e2e 前 |
 | `scripts/image-build.sh` | 构建 kagent-bridge 镜像（真 agentfs 引擎+桥双二进制）、推送、校验 registry、digest 钉死 agentfs.yaml | 桥/引擎代码变更后 |
-| `scripts/deploy-local.sh` | 部署全套 manifest：agentfs → EgressPolicy → modelconfigs → harness×2 → agents（等 Ready） | 首次/manifest 变更后 |
-| `scripts/e2e.sh` | e2e 运行器：清理陈旧编排器（实例锁）与端口转发 → 起 8083/9765 转发 → 跑 `e2e-v1.sh` | 每次 e2e |
+| `scripts/validate-manifests.sh` | manifest 校验冒烟：YAML 全文档解析 + kubectl dry-run（集群可达走 server，不可达降级 client/解析层）；防 `---` 分隔符切坏文档这类错复发（PR #11 review） | manifest 变更后；deploy-local.sh 部署前自动先跑（含未部署的 orchestrator.yaml） |
+| `scripts/deploy-local.sh` | 部署全套 manifest：校验冒烟 → agentfs → 入站/出站策略 → modelconfigs → harness×2 → agents（等 Ready） | 首次/manifest 变更后 |
+| `scripts/e2e.sh` | e2e 运行器：清理陈旧编排器（实例锁）+ 定向清理本套件端口的陈旧转发（只杀监听 8083/9765 的 kubectl port-forward，不全机 pkill）→ 起 8083/9765 转发（PID 跟踪，只杀自己的）→ 跑 `e2e-v1.sh` | 每次 e2e |
 
 踩坑记录（脚本注释里有细节）：buildx COPY 内容缓存旧二进制、digest 拉取校验需 OCI Accept 头、
 `:tag` 引用被节点 containerd IfNotPresent 缓存、`egressPolicyRefs` 在 Agent spec 级、

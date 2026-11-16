@@ -1,0 +1,27 @@
+# agentfs 入站默认拒绝（PR #11 review：此前 agentfs 只有出站 EgressPolicy，
+# 入站零策略——集群里任何 Pod 都能碰工单工作区数据）。合法调用方只有：
+#   - 同 namespace（kagent）：编排器（物化/交付读写）、controller/gateway；
+#   - ate-system：worker actor（atelet 拉起的沙箱 Pod，经 agentfs.kagent.svc
+#     的 MCP 改工单文件，agent-worker.yaml 的 agenticfs-mcp 绑定）。
+# 探针来自 kubelet（节点侧），不入 Ingress 白名单语义；e2e 的宿主 port-forward
+# 走 kubelet 隧道，同样不受影响。egress 由 egresspolicy-agentfs.yaml（worker
+# 出站授权）与本 Pod 自身的出站需求另行约束，此处只管 ingress。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentfs
+  namespace: kagent
+  labels:
+    app.kubernetes.io/name: agentfs
+    app.kubernetes.io/part-of: superagent-on-kagent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agentfs
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}          # 同 namespace（编排器/controller/gateway）
+        - namespaceSelector:       # worker actor（atelet 沙箱 Pod 所在 ns）
+            matchLabels:
+              kubernetes.io/metadata.name: ate-system
