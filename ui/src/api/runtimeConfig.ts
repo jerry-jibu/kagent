@@ -11,6 +11,7 @@
  */
 
 import { ENV_DEFAULTS, env, withBasePath } from "@/env";
+import { OCI_DIGEST_REF } from "@/components/skills/catalogIdentity";
 
 export interface BuiltinSkill {
   name: string;
@@ -167,6 +168,3 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function isText(value: unknown): value is string {
   return typeof value === "string" && value !== "";
 }
-
-/** The digest pin a skill source must carry; the same shape the CRD's CEL accepts. */
-const OCI_DIGEST_REF = /^[^\s@]+@sha256:[0-9a-f]{64}$/;

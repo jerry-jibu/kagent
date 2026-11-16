@@ -25,6 +25,7 @@ import type {
   ObjectReference,
 } from "@/api/domain/agentTemplates";
 import type { BuiltinSkill, BuiltinSkillsCatalog } from "@/api/runtimeConfig";
+import { OCI_DIGEST_REF, imageRepository, sameImageRepository } from "@/components/skills/catalogIdentity";
 
 /** One MCP tool selection, flattened for a form to hold. */
 export interface McpToolDraft {
@@ -164,17 +165,13 @@ export function matchBuiltinSkill(
 ): { skill: BuiltinSkill; current: boolean } | undefined {
   if (!catalog || draft.sourceKind !== "oci") return undefined;
   const image = draft.oci.trim();
-  if (imageRepository(image) !== imageRepository(catalog.image)) return undefined;
+  if (!sameImageRepository(image, catalog.image)) return undefined;
   // The name must match too: a user may point their own skill at a catalog path under
   // another name, and that row must keep its editable name and source.
   const skill = catalog.skills.find(
     (entry) => entry.path === draft.path.trim() && entry.name === draft.name.trim(),
   );
   return skill && { skill, current: image === catalog.image };
-}
-
-function imageRepository(image: string): string {
-  return image.split("@")[0];
 }
 
 /** The draft a form opens with when editing an existing template. */
@@ -407,13 +404,12 @@ export function draftProblems(
 /** Mirrors the CRD's `AgentTemplateSkill` and `ArtifactSource` validation. */
 const MAX_SKILLS = 50;
 const MAX_PATH_LENGTH = 1024;
-const OCI_DIGEST_REF = /^[^\s@]+@sha256:[0-9a-f]{64}$/;
 const HTTP_URL = /^https?:\/\/\S+$/;
 const GIT_COMMIT = /^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/;
 
 /** The repository part of an image reference, split from the host as go-containerregistry's `name.NewRepository` does. */
 function ociRepository(ref: string): string {
-  const name = ref.split("@")[0];
+  const name = imageRepository(ref);
   const [host, ...rest] = name.split("/");
   return rest.length > 0 && (host === "localhost" || /[.:]/.test(host)) ? rest.join("/") : name;
 }
